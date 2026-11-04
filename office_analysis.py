@@ -74,6 +74,9 @@ def inspect_project(data):
             raise ValueError('未能提取宏模块，不能将空结果判为安全。')
         source = '\n'.join(sources)
         pcode = output.getvalue()
+        from local_rules import scan_bytes
+        rule_source = scan_bytes(source.encode('utf-8'))
+        rule_pcode = scan_bytes(pcode.encode('utf-8'))
         mr = MacroRaptor(source)
         mr.scan()
         indicators = []
@@ -89,6 +92,7 @@ def inspect_project(data):
                 'source_sha256': hashlib.sha256(source.encode('utf-8')).hexdigest(),
                 'pcode_sha256': hashlib.sha256(pcode.encode('utf-8')).hexdigest(),
                 'pcode_indicators': indicators, 'source_behavior_flags': mr.get_flags(),
+                'content_rules': {'source': rule_source, 'pcode': rule_pcode},
                 'source_behavior_suspicious': bool(mr.suspicious),
                 'analysis_method': 'olevba + MacroRaptor + pcodedmp; offline static analysis',
                 'analysis_limit': '源码与返回的编译指令仅作静态证据；未返回指令时不授权自动清理，未证明完整运行行为或所有威胁不存在。'}
@@ -114,6 +118,7 @@ def analyze_project(data, timeout=ANALYSIS_TIMEOUT):
         command = [str(executable)]
     result = subprocess.run(command, input=base64.b64encode(data), stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=timeout,
+                            env=__import__('engine_assets').subprocess_environment(),
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     if result.returncode or len(result.stdout) > 1024 * 1024:
         raise ValueError('宏分析进程未正常完成：' + result.stderr.decode('utf-8', 'replace')[:350])
@@ -130,11 +135,15 @@ def analyze_project(data, timeout=ANALYSIS_TIMEOUT):
 
 
 def worker_main():
-    """Private stdin transport; no file path, command or executable is accepted."""
+    """Private transport for VBA bytes or a selected static-parser task."""
     try:
         encoded = sys.stdin.buffer.read((MAX_PROJECT_BYTES * 4 // 3) + 8)
-        data = base64.b64decode(encoded, validate=True)
-        response = {'ok': True, 'result': inspect_project(data)}
+        if encoded.startswith(b'{'):
+            from secondary_analysis import worker_request
+            response = {'ok': True, 'result': worker_request(json.loads(encoded.decode('utf-8')))}
+        else:
+            data = base64.b64decode(encoded, validate=True)
+            response = {'ok': True, 'result': inspect_project(data)}
     except Exception as ex:
         response = {'ok': False, 'error': str(ex)[:1200]}
     sys.stdout.buffer.write(json.dumps(response, ensure_ascii=False).encode('utf-8'))

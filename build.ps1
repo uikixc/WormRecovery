@@ -8,11 +8,13 @@ function Invoke-Python {
 }
 $privateDist = Join-Path $PSScriptRoot 'build/embedded'
 New-Item -ItemType Directory -Path $privateDist -Force | Out-Null
-$collect = @('--collect-all', 'oletools', '--collect-all', 'pcodedmp')
+$collect = @('--collect-all', 'oletools', '--collect-all', 'pcodedmp', '--collect-all', 'yara_x', '--collect-all', 'autoit_ripper', '--collect-all', 'XLMMacroDeobfuscator', '--collect-all', 'defusedxml')
 $base = @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile', '--noupx')
 Invoke-Python -Arguments ($base + @('--console', '--name', 'WormRecovery-Analysis', '--distpath', $privateDist) + $collect + @('analysis_entry.py'))
 Invoke-Python -Arguments ($base + @('--console', '--uac-admin', '--name', 'WormRecovery-CLI', '--distpath', $privateDist) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'cli_entry.py'))
 $analysis = Join-Path $privateDist 'WormRecovery-Analysis.exe'
 $cli = Join-Path $privateDist 'WormRecovery-CLI.exe'
-Invoke-Python -Arguments ($base + @('--windowed', '--uac-admin', '--name', 'WormRecovery', '--add-binary', ($analysis + ':engines'), '--add-binary', ($cli + ':engines')) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'worm_recovery.py'))
+$engineAssets = Join-Path $PSScriptRoot 'build/engine-assets/engines'
+if (-not (Test-Path -LiteralPath (Join-Path $engineAssets 'manifest.json'))) { throw 'Prepare verified offline engine assets before building.' }
+Invoke-Python -Arguments ($base + @('--windowed', '--uac-admin', '--name', 'WormRecovery', '--add-binary', ($analysis + ':engines'), '--add-binary', ($cli + ':engines'), '--add-data', ($engineAssets + ':engines')) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'worm_recovery.py'))
 Write-Host "Build completed: $PSScriptRoot/dist/WormRecovery.exe (single-file distribution)"

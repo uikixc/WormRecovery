@@ -20,8 +20,18 @@ LABELS={
     'infected_office':'Excel 宏感染', 'infected_executable':'程序被包裹',
     'malicious_shortcut':'恶意快捷方式', 'worm_payload':'病毒载荷',
     'worm_script':'恶意 AutoIt 脚本', 'worm_runtime':'病毒缓存',
-    'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'宏文件未确认', 'info_office':'已核对的 Office 组件',
-    'review_autoit':'脚本待核查'}
+    'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'Office 活动内容', 'info_office':'已核对的 Office 组件',
+    'review_autoit':'AutoIt 脚本','review_script':'脚本行为','review_binary':'程序行为'}
+
+
+def review_state(record):
+    secondary=record.get('secondary_analysis',{})
+    if secondary.get('status')=='detected':return '引擎检出'
+    if record.get('analysis_error'):return '解析失败'
+    if secondary.get('status')=='incomplete':return '分析未完成'
+    if secondary.get('status')=='suspicious':return '规则命中'
+    if secondary.get('status')=='no_known_match':return '无已知匹配'
+    return '未确认感染'
 
 
 class ModernWindow:
@@ -262,6 +272,16 @@ class ModernWindow:
             text=record['path']
             for key in ('reason','action','assessment_limit'):
                 if record.get(key):text+='\n'+record[key]
+            secondary=record.get('secondary_analysis',{})
+            if secondary:
+                names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA'}
+                statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持'}
+                text+='\n离线复核：'+'；'.join(names[k]+' '+statuses.get(v.get('status'), '已执行规则检查') for k,v in secondary.items() if k in names and isinstance(v,dict))
+                if secondary.get('clamav',{}).get('detections'):text+='\n检出名称：'+'、'.join(secondary['clamav']['detections'])
+                if record.get('analysis_incomplete_engines'):text+='\n未完成引擎：'+ '、'.join(record['analysis_incomplete_engines'])
+                for key in ('autoit','xlm','capa','rea'):
+                    result=secondary.get(key,{})
+                    if result.get('reason'):text+='\n'+names[key]+'：'+result['reason'][:220]
             self.selected_path.set(text)
 
     def set_busy(self,busy):
@@ -346,7 +366,7 @@ class ModernWindow:
             review=r['kind'].startswith('review_')
             informational=r['kind'].startswith('info_')
             if self.filter=='review' and not review or self.filter=='confirmed' and not is_confirmed(r) or self.filter=='info' and not informational:continue
-            state='保留，无需处理' if informational else ('解析失败' if r.get('analysis_error') else '未确认感染') if review else '待修复'
+            state='保留，无需处理' if informational else review_state(r) if review else '待修复'
             category=LABELS.get(r['kind'],r['kind'])
             if review and r.get('reason'):category+='：'+r['reason']
             if informational:category=r.get('component',category)

@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.3.7'
+VERSION = '1.4.0'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -371,9 +371,17 @@ def inspect_file_content(path,st):
             add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None)
         elif st.st_size==15360 and digest_file(path)==HOOK_SHA256:add('worm_hook',path,sha256=HOOK_SHA256)
         elif name.startswith('._cache_') and st.st_size==750320 and digest_file(path)==AUTOIT_EXE_SHA256:add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
+        elif st.st_size<=16*1024*1024:
+            from local_rules import scan_file
+            rules=scan_file(path)
+            if rules['matches']:add('review_binary',path,reason='程序内容命中家族组合规则，正在执行离线复核。',content_rules=rules)
     elif ext=='.a3x':
         if digest_file(path)==AUTOIT_A3X_SHA256:add('worm_script',path,sha256=AUTOIT_A3X_SHA256)
         else:add('review_autoit',path,reason='未识别脚本已保留，需进一步核查。')
+    elif ext in ('.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf') and st.st_size<=4*1024*1024:
+        from local_rules import scan_bytes
+        with open(path,'rb') as stream:rules=scan_bytes(stream.read())
+        if rules['matches']:add('review_script',path,reason='本地组合规则命中，正在执行离线复核。',content_rules=rules)
     elif ext=='.lnk' and st.st_size<1024*1024:
         link=shortcut(path)
         if link and link.get('malicious'):add('malicious_shortcut',path,shortcut=link)
@@ -403,6 +411,9 @@ class Cleaner:
         self.quarantine=self.run/'quarantine';self.quarantine.mkdir();self.events=[];self.findings=[];self.errors=[]
         tool_scope=pathlib.Path(sys.executable) if getattr(sys,'frozen',False) else HERE
         self.protected=[tool_scope,self.run.parent,*map(pathlib.Path,protected)]
+        if getattr(sys,'_MEIPASS',None):self.protected.append(pathlib.Path(sys._MEIPASS))
+        from engine_assets import engine_root
+        self.protected.append(engine_root())
         self.cancel=threading.Event();self.count=0;self.dircount=0;self.scanned_office=0;self.started=time.monotonic()
         self.scan_roots=[];self.initial_findings=None;self.verification=None
         self.skipped=[];self.reparse_points=[];self.inspection_failed=False
@@ -778,6 +789,10 @@ class Cleaner:
                 if record['status']=='unverified':
                     record['reason']='scan_cancelled_or_target_unavailable';self.skipped.append({'path':record['path'],'target':target,'reason':record['reason']})
         self.scan_seconds=time.monotonic()-start;self.scan_active=False
+        if not self.cancel.is_set():
+            from secondary_analysis import enrich_reviews
+            enrich_reviews(self)
+        self.scan_seconds=time.monotonic()-start
         self.log('scan_complete',files=self.count,directories=self.dircount,seconds=self.scan_seconds,cancelled=self.cancel.is_set(),findings=len(self.findings),skipped_count=len(self.skipped))
         self.save();return self.findings
     def payload_path(self,path):
@@ -941,6 +956,10 @@ class Cleaner:
     def save(self):
         summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
         summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
+        from engine_assets import manifest
+        from local_rules import RULESET_VERSION
+        assets=manifest()
+        summary['offline_analysis']={'versions':assets.get('versions',{}),'ruleset_version':RULESET_VERSION,'assets_available':bool(assets),'scope':'Content screening plus second-opinion analysis of unresolved candidates; no universal safety verdict'}
         json_save(self.run/'report.json',summary);return summary
 
 def resolve_scan_scope(mode='internal',manual=None):
@@ -955,7 +974,8 @@ def cli_main():
         from bundled_components import component_path
         result=subprocess.run([str(component_path('WormRecovery-CLI.exe')),*sys.argv[1:]],
                               stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                              creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                              creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),
+                              env=__import__('engine_assets').subprocess_environment())
         for stream,data in ((sys.stdout,result.stdout),(sys.stderr,result.stderr)):
             if data:stream.write(data.decode('utf-8','replace'));stream.flush()
         return result.returncode

@@ -1,10 +1,12 @@
 # WormRecovery
 
-Windows 蠕虫检测与原位恢复工具，当前版本为 **1.3.7**。针对已分析的 AutoIt / Synaptics 感染特征，提供文件检测、确认感染项修复和复核。
+Windows 蠕虫检测与原位恢复工具，当前版本为 **1.4.0**。针对已分析的 AutoIt / Synaptics 感染特征，提供文件检测、确认感染项修复和复核。
 
-1.3.7 改为单文件交付：只需复制 WormRecovery.exe，宏分析和命令行组件已嵌入其中，启动时由程序自动管理内部工作目录，不要求用户安装 Python 或复制配套 EXE。单文件交付不改变检测覆盖范围；完整多引擎方案仍按下述实际实现状态说明。
+只需复制 WormRecovery.exe。宏分析、命令行、ClamAV 病毒库、capa 和 REA 本地运行组件已嵌入，目标电脑不需要 Python、Node、Codex 或网络连接。运行时自动解包内部组件，因此启动速度和临时磁盘占用与原来的轻量版本不同。
 
-1.3.6 首批离线分析增强已接入：未知 OOXML VBA 项目由独立子进程提取源码、MacroRaptor 行为标记和 pcodedmp 编译指令特征；按内容缓存成功结果，单次分析默认超时 25 秒。无 VBA 项目的文档仍检查 XLM 宏表、自动运行名称、DDE、嵌入对象、ActiveX 和非普通超链接的外部关系；发现额外活动内容时不自动进行仅移除 VBA 的修复。计划任务、服务和两类 WMI 消费者先枚举再核对已知感染内容，并增加 Winlogon、AppInit 和 Command Processor 的注册表检查。共享系统启动值只报告，不整体删除。尚未接入 YARA-X、ClamAV、capa、REA/Ghidra 的自动分析、离线用户配置单元和 XLM 深度模拟；本版本不代表整套规划已经完成。
+离线分析现已实际接入 YARA-X 内容组合规则、AutoIt 静态提取、XLMMacroDeobfuscator 有界模拟、ClamAV 批量复核、capa 程序能力分析和 REA PE 导入分析。VBA 继续提取源码、MacroRaptor 标记及 pcodedmp 编译指令。复杂分析只针对筛选后的未解决候选文件，不逐文件启动全部引擎。
+
+每项复核记录文件 SHA-256、实际引擎、病毒库版本、命中及失败原因。ClamAV 一批候选只加载一次病毒库；分析子进程有超时和 Windows 作业对象内存限制，超时结束其子进程。当前内置 REA 静态 PE 分析，不包含 Ghidra/JDK 深度反编译。未知宏和分析失败不会直接转为安全，也不会据此删除整份文档。
 
 ## 功能
 
@@ -22,8 +24,8 @@ Windows 蠕虫检测与原位恢复工具，当前版本为 **1.3.7**。针对�
 
 线程数更多并不保证更快，实际效果取决于文件数量、磁盘延迟、系统缓存和解析开销。停止后取消尚未开始的工作，等待正在执行的读取返回，不将未完成扫描报告为完成。
 
-- Windows 10 / 11，建议使用 64 位系统。
-- Python 3.12 或更新版本，需包含 Tcl/Tk。
+- 集成发行版需要 Windows 10 / 11 64 位系统。
+- 从源码运行或构建时需要 Python 3.12、Tcl/Tk 和离线组件；使用发行版无需自行安装。
 - 修复操作需要管理员权限。
 
 在项目目录中执行：
@@ -73,6 +75,12 @@ python -m unittest discover -s tests -v
 
 ## 构建
 
+先从上游官方发行版准备固定版本的 capa 10.0.0、ClamAV 1.5.4 Windows 便携包、REA 6.8.0 与 Node 26.13.0，以及经 FreshClam 校验的 main.cvd、daily.cvd、bytecode.cvd。按实际准备位置执行：
+
+    python prepare_engine_assets.py --tool-root C:/Build/offline-engines --rea-root C:/Build/rea --database-root C:/Build/clamdb --destination build/engine-assets/engines
+
+运行时不下载依赖。新增源码包括 secondary_analysis.py（候选复核）、local_rules.py（内容规则）、engine_assets.py（引擎定位）、engine_process.py（进程生命周期）、prepare_engine_assets.py（组件准备）和 validate_offline_engines.py（真实引擎无害验证）。
+
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\python.exe
@@ -105,4 +113,4 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\pyt
 
 检测与自动修复依据已分析家族的指纹和结构，无法覆盖全部恶意软件或保证恢复已被覆盖、加密、删除的历史内容。未匹配的感染变种、混合合法宏、损坏或加密文档、无法访问的位置需要进一步核查。重要系统文件若无法安全恢复，应使用可信安装介质和 Windows 官方修复机制处理。
 
-离线分析能力的差距、候选组件及分阶段验收要求见 [离线检测与恢复集成评估](docs/OFFLINE_ANALYSIS_INTEGRATION.md)。该文档是规划与调研结果，不表示所列引擎已接入当前版本。
+当前集成状态见 [1.4.0 说明](docs/RELEASE_1.4.0.md)。完整规划及尚未实现的恢复环境、离线用户配置单元、Ghidra 深度分析等见 [离线检测与恢复集成评估](docs/OFFLINE_ANALYSIS_INTEGRATION.md)。

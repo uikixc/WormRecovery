@@ -37,6 +37,11 @@ class FakeCleaner:
 
 
 class ModernUITests(unittest.TestCase):
+    def test_secondary_results_have_distinct_visible_states(self):
+        for result,state in (('detected','引擎检出'),('incomplete','分析未完成'),('suspicious','规则命中'),('no_known_match','无已知匹配')):
+            with self.subTest(result=result):
+                self.assertEqual(modern_ui.review_state({'secondary_analysis':{'status':result}}),state)
+
     def setUp(self):
         self.app=modern_ui.ModernWindow(types.SimpleNamespace(VERSION='test',Cleaner=FakeCleaner,resolve_scan_scope=lambda **kwargs:{'roots':['C:/test'],'external_volumes':{},'excluded_roots':[]}))
         self.app.root.update()

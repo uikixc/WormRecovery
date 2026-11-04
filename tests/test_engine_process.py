@@ -1,0 +1,43 @@
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+
+import psutil
+from engine_process import run
+
+
+class EngineProcessTests(unittest.TestCase):
+    def test_json_transport_and_stdin(self):
+        result = run([sys.executable, '-c', 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read().upper())'], input=b'inert transport', timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b'INERT TRANSPORT')
+
+    def test_cancelled_request_stops_worker(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaises(InterruptedError):
+            run([sys.executable, '-c', 'import time; time.sleep(10)'], timeout=5, cancel=cancelled)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows job-object lifecycle')
+    def test_timeout_closes_grandchild_process(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pidfile = Path(temp) / 'child.pid'
+            code = 'import subprocess,sys,time; from pathlib import Path; child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"]); Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(30)'
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run([sys.executable, '-c', code, str(pidfile)], timeout=1)
+            self.assertTrue(pidfile.exists())
+            pid = int(pidfile.read_text())
+            if psutil.pid_exists(pid):
+                try:
+                    psutil.Process(pid).wait(timeout=3)
+                except psutil.NoSuchProcess:
+                    pass
+            self.assertFalse(psutil.pid_exists(pid))
+
+
+if __name__ == '__main__':
+    unittest.main()
