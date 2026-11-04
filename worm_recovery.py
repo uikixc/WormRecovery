@@ -10,9 +10,11 @@ import time, uuid, winreg, zipfile, xml.etree.ElementTree as ET
 from ctypes import wintypes as W
 import psutil
 from office_triage import assess_office,is_confirmed
+from office_structure import inspect_package, attach_evidence
+from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.3.5'
+VERSION = '1.3.6'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -249,25 +251,21 @@ def _office_check(path):
             if len(entries)>20000 or sum(x.file_size for x in entries)>1024*1024*1024:return {'status':'review','reason':'文档超过检查资源上限，需进一步核查。'}
             names=[x.filename for x in entries]
             if len(set(names))!=len(names):return {'status':'review','reason':'文档包含重复压缩成员，需进一步核查。'}
+            structure=inspect_package(z)
             macro=[x for x in entries if x.filename.casefold().endswith('vbaproject.bin')]
-            if not macro:return {'status':'clean','macro':False}
+            if not macro:return attach_evidence({'status':'clean','macro':False},structure)
             if len(macro)!=1 or macro[0].file_size>16*1024*1024:return {'status':'review','reason':'宏项目结构异常，需进一步核查。'}
             data=z.read(macro[0]);h=hashlib.sha256(data).hexdigest()
             if h in BAD_VBA_HASHES:
                 if macro[0].filename!='xl/vbaProject.bin' or 'xl/workbook.xml' not in names:return {'status':'review','reason':'已知宏位于非预期文档结构中，需人工核查。'}
-                return {'status':'infected','family':'Synaptics-Excel','vba_hash':h,'vba_part':macro[0].filename}
-            from oletools.olevba import VBA_Parser
-            v=VBA_Parser('vbaProject.bin',data=data)
-            try:mods=list(v.extract_macros())
-            finally:v.close()
-            matches=[];others=[]
-            for _,stream,name,code in mods:
-                low=code.casefold()
-                bad=all(x in low for x in ('synaptics','~$cache1','regkeysave','workbook_open'))
-                if bad:matches.append(name)
-                elif any(line.strip() and not line.strip().casefold().startswith(('attribute ','option ','private sub','end sub',"'")) for line in code.splitlines()):others.append(name)
-            if matches and not others and macro[0].filename=='xl/vbaProject.bin':return {'status':'infected','family':'Synaptics-Excel','vba_hash':h,'vba_part':macro[0].filename}
-            return {'status':'review','reason':'未识别或合法宏已保留，需进一步核查。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h}
+                return attach_evidence({'status':'infected','family':'Synaptics-Excel','vba_hash':h,'vba_part':macro[0].filename},structure)
+            from office_analysis import analyze_project
+            analysis=analyze_project(data)
+            matches=analysis['family_modules'];others=analysis['other_modules']
+            result={'status':'review','reason':'未识别宏已完成源码及编译指令特征检查，尚未确认感染。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h,'macro_analysis':analysis}
+            if matches and not others and analysis.get('pcode_family_match') and macro[0].filename=='xl/vbaProject.bin':
+                result.update(status='infected',family='Synaptics-Excel',vba_part=macro[0].filename)
+            return attach_evidence(result,structure)
     except zipfile.BadZipFile:
         if p.name.startswith('~$'):return {'status':'lock_file'}
         try:
@@ -283,6 +281,7 @@ def _office_check(path):
 def sanitized_xlsx(source,dest):
     """Copy original parts verbatim except VBA relationships/types and visibility."""
     with zipfile.ZipFile(source) as src:
+        if inspect_package(src):raise ValueError('文档存在额外活动内容，不能仅移除 VBA 后自动恢复。')
         names=src.namelist();removed={n for n in names if re.search(r'(?i)(^|/)vba(project(signature)?\.bin|data\.xml)$',n)}
         removed.update(n for n in names if re.search(r'(?i)(^|/)_rels/vba(project(signature)?\.bin|data\.xml)\.rels$',n))
         changes={};before={}
@@ -549,7 +548,7 @@ class Cleaner:
             except OSError:break
             if sid.startswith('S-1-5-') and not sid.endswith('_Classes'):
                 hives.append(('HKU\\'+sid,(winreg.HKEY_USERS,sid)))
-        paths=[r'Software\Microsoft\Windows\CurrentVersion\Run',r'Software\Microsoft\Windows\CurrentVersion\RunOnce',r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run']
+        paths=registry_paths()
         for label,hive in hives:
             for view in (winreg.KEY_WOW64_64KEY,winreg.KEY_WOW64_32KEY):
                 for sub in paths:
@@ -563,31 +562,33 @@ class Cleaner:
                                 except OSError:break
                             for name,value,typ in values:
                                 text=str(value).casefold()
-                                bad=('googlechrome.a3x' in text or exact_startup_root(value) is not None)
+                                confirmed=self.confirmed_command(value)
+                                bad=confirmed or ('googlechrome.a3x' in text or exact_startup_root(value) is not None)
                                 if 'synaptics' in text:
                                     target=str(value).strip('"').split('"')[0]
                                     bad=bad or (os.path.isfile(target) and is_stub(target))
                                 if bad:
                                     rec={'hive':label,'key':sub,'view':view,'name':name,'value':value,'type':typ};hits.append(rec)
-                                    rec['confirmed']=self.confirmed_command(value)
+                                    rec['confirmed']=confirmed
                                     if apply and rec['confirmed']:
                                         self.log('registry_backup',**rec)
                                         if winreg.QueryValueEx(key,name)!=(value,typ):raise RuntimeError('启动项已改变，请重新检测。')
-                                        winreg.DeleteValue(key,name);self.log('registry_removed',**rec)
-                                        self.startup_approved(base,prefix,name,('Run','Run32'),value)
+                                        if sub in paths[:3]:
+                                            winreg.DeleteValue(key,name);self.log('registry_removed',**rec)
+                                            self.startup_approved(base,prefix,name,('Run','Run32'),value)
+                                        else:
+                                            # Shared Shell/Userinit/AppInit values can contain legitimate commands.
+                                            self.inspection_failed=True
+                                            self.log('registry_manual_repair_required',**rec)
                     except FileNotFoundError:pass
                     except OSError as ex:self.error(label+'\\'+sub,ex)
         self.log('registry_inspection',apply=apply,hits=hits);return hits
     def system_persistence(self,apply=False):
-        script=r"""
-        $rx='GoogleChrome\.a3x|AutoIt3ExecuteScript.*MozillaFirefox|[\\/]GoogleChrome[\\/].*(WindowsUpdate|GoogleUpdate)\.lnk|[\\/]Synaptics[\\/]Synaptics\.exe';
-        $tasks=@();foreach($t in Get-ScheduledTask){foreach($a in $t.Actions){if(($a.Execute+' '+$a.Arguments)-match $rx){$tasks += @{name=$t.TaskName;path=$t.TaskPath;execute=$a.Execute;arguments=$a.Arguments;xml=(Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath)}}}};
-        $services=@(Get-CimInstance Win32_Service|Where-Object {$_.PathName -match $rx}|Select-Object Name,PathName,State,StartMode);
-        $wmi=@(Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer|Where-Object {$_.CommandLineTemplate -match $rx}|Select-Object Name,CommandLineTemplate);
-        @{tasks=$tasks;services=$services;wmi=$wmi}|ConvertTo-Json -Depth 7 -Compress
-        """
         try:
-            d=powershell(script);self.log('system_persistence',apply=apply,result=d)
+            inventory=powershell(INVENTORY_SCRIPT)
+            d=select_confirmed(inventory,self.confirmed_command)
+            self.log('persistence_inventory',counts=d['inventory_counts'],filters=inventory.get('filters',[]),bindings=inventory.get('bindings',[]))
+            self.log('system_persistence',apply=apply,result=d)
             if apply:
                 for t in d.get('tasks',[]):
                     if self.confirmed_command(str(t.get('execute',''))+' '+str(t.get('arguments',''))):
@@ -596,8 +597,9 @@ class Cleaner:
                     # Require the real engine fingerprint before changing a service.
                     if self.confirmed_command(s['PathName']):powershell('Stop-Service -Name '+psquote(s['Name'])+' -Force; Set-Service -Name '+psquote(s['Name'])+' -StartupType Disabled');self.log('service_disabled',service=s)
                 for x in d.get('wmi',[]):
-                    if self.confirmed_command(x['CommandLineTemplate']):
-                        powershell('$n='+psquote(x['Name'])+r'; Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer | Where-Object {$_.Name -eq $n} | Remove-CimInstance');self.log('wmi_consumer_removed',consumer=x)
+                    self.log('wmi_subscription_backup',consumer=x,filters=inventory.get('filters',[]),bindings=inventory.get('bindings',[]))
+                    from persistence_inventory import remove_consumer_script
+                    powershell(remove_consumer_script(x));self.log('wmi_consumer_removed',consumer=x)
             return d
         except Exception as ex:self.inspection_failed=True;self.error('system_persistence',ex);return {}
     def firewall(self,apply=False):
@@ -946,6 +948,9 @@ def resolve_scan_scope(mode='internal',manual=None):
     return resolve_scope(powershell,mode,manual)
 
 def cli_main():
+    if sys.argv[1:]==['--office-analysis-worker']:
+        from office_analysis import worker_main
+        return worker_main()
     parser=argparse.ArgumentParser(description='WormRecovery 文件安全检测与原位恢复')
     parser.add_argument('--scan',action='store_true',help='只扫描，不修复')
     parser.add_argument('--clean',action='store_true',help='扫描并修复确认感染项')

@@ -39,7 +39,7 @@ def content_hash(path):
 def assess_office(path,result):
     result=dict(result)
     if result.get('status')!='review':return result
-    if not result.get('analysis_error') and not result.get('has_family_macro') and installation_component(path):
+    if not result.get('analysis_error') and not result.get('has_family_macro') and not result.get('active_content_unresolved') and installation_component(path):
         digest=content_hash(path);known=REVIEWED_COMPONENTS.get(digest)
         if known and ntpath.basename(str(path)).casefold()==known[0].casefold():
             result.update(status='info',component=known[1],file_sha256=digest,assessment='reviewed_office_component',
@@ -50,6 +50,10 @@ def assess_office(path,result):
             return result
     if result.get('analysis_error'):
         result.update(assessment='analysis_incomplete',action='暂勿打开或启用宏；保留原件，查看解析错误并使用已更新的安全软件检查。')
+    elif result.get('active_content_unresolved'):
+        names={'xlm_macro_sheet':'Excel 4.0 宏表','auto_macro_name':'自动运行宏名称','embedded_object':'嵌入对象','activex':'ActiveX 控件','external_data':'外部数据连接','external_relationship':'外部内容关系','dde_field':'DDE 字段'}
+        types=list(dict.fromkeys(names.get(row['kind'],row['kind']) for row in result.get('structural_evidence',[])))
+        result.update(assessment='active_content_unresolved',reason='检测到'+ '、'.join(types)+'；存在此类内容不等于已感染，但当前检查不能证明其安全。',action='保留原件，暂勿启用宏、外部内容或嵌入对象；需要针对列出的活动内容进一步检查，不自动删除或转换格式。')
     elif result.get('has_family_macro'):
         result.update(assessment='mixed_family_macro',action='发现家族宏与其他内容混合，暂勿打开或启用宏；保留原件并交由技术人员分析，不能直接删除全部宏。')
     else:

@@ -36,7 +36,7 @@ output.write_text(json.dumps({'windowless': w.WINDOWLESS, 'parser': VBA_Parser._
             with zipfile.ZipFile(path, 'w') as package:
                 package.writestr('xl/workbook.xml', '<workbook/>')
                 package.writestr('xl/vbaProject.bin', b'Inert invalid parser fixture')
-            with patch('oletools.olevba.VBA_Parser', side_effect=RuntimeError('fixture parser failure')):
+            with patch('office_analysis.analyze_project', side_effect=RuntimeError('fixture parser failure')):
                 result = w.office_check(path)
             self.assertEqual(result['status'], 'review')
             self.assertTrue(result['analysis_error'])

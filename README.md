@@ -1,6 +1,8 @@
 # WormRecovery
 
-Windows 蠕虫检测与原位恢复工具，当前版本为 **1.3.5**。针对已分析的 AutoIt / Synaptics 感染特征，提供文件检测、确认感染项修复和复核。
+Windows 蠕虫检测与原位恢复工具，当前版本为 **1.3.6**。针对已分析的 AutoIt / Synaptics 感染特征，提供文件检测、确认感染项修复和复核。
+
+1.3.6 首批离线分析增强已接入：未知 OOXML VBA 项目由独立子进程提取源码、MacroRaptor 行为标记和 pcodedmp 编译指令特征；按内容缓存成功结果，单次分析默认超时 25 秒。无 VBA 项目的文档仍检查 XLM 宏表、自动运行名称、DDE、嵌入对象、ActiveX 和非普通超链接的外部关系；发现额外活动内容时不自动进行仅移除 VBA 的修复。计划任务、服务和两类 WMI 消费者先枚举再核对已知感染内容，并增加 Winlogon、AppInit 和 Command Processor 的注册表检查。共享系统启动值只报告，不整体删除。尚未接入 YARA-X、ClamAV、capa、REA/Ghidra 的自动分析、离线用户配置单元和 XLM 深度模拟；本版本不代表整套规划已经完成。
 
 ## 功能
 
@@ -74,7 +76,7 @@ python -m unittest discover -s tests -v
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\python.exe
 ```
 
-生成 `dist\WormRecovery.exe`（图形界面）和 `dist\WormRecovery-CLI.exe`（命令行）。分发构建需要在干净 Windows 环境中验证。
+生成 `dist\WormRecovery.exe`（图形界面）、`dist\WormRecovery-CLI.exe`（命令行）和 `dist\WormRecovery-Analysis.exe`（离线宏分析子进程）。分发时保留三个程序在同一目录；分析组件不请求管理员权限。分发构建需要在干净 Windows 环境中验证。
 
 ## 源码结构
 
@@ -87,6 +89,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\pyt
 | `worm_residue.py` | 已确认家族残留指纹和精确路径匹配 |
 | `scan_concurrency.py` | 有界扫描队列、物理磁盘识别与并发限制 |
 | `office_triage.py` | 精确 Office 组件核对、未确认文件分类与处理建议 |
+| `office_structure.py` | OOXML 活动内容与结构检查 |
+| `office_analysis.py`、`analysis_entry.py` | 离线宏源码和编译指令分析及受限输出子进程 |
+| `persistence_inventory.py` | 计划任务、服务与 WMI 枚举和身份核验 |
 | `cli_entry.py` | 命令行入口 |
 | `tests/` | 无害回归测试 |
 | `build.ps1` | Windows 可执行程序构建 |
@@ -96,3 +101,5 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\pyt
 ## 检测与恢复边界
 
 检测与自动修复依据已分析家族的指纹和结构，无法覆盖全部恶意软件或保证恢复已被覆盖、加密、删除的历史内容。未匹配的感染变种、混合合法宏、损坏或加密文档、无法访问的位置需要进一步核查。重要系统文件若无法安全恢复，应使用可信安装介质和 Windows 官方修复机制处理。
+
+离线分析能力的差距、候选组件及分阶段验收要求见 [离线检测与恢复集成评估](docs/OFFLINE_ANALYSIS_INTEGRATION.md)。该文档是规划与调研结果，不表示所列引擎已接入当前版本。
