@@ -126,7 +126,7 @@ class AnalysisTransportTests(unittest.TestCase):
     def test_graphical_build_missing_companion_is_explicit_error(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.object(analysis.sys, 'frozen', True, create=True), patch.object(analysis.sys, 'executable', str(Path(temp) / 'WormRecovery.exe')):
-                with self.assertRaisesRegex(ValueError, '缺少离线宏分析组件'):
+                with self.assertRaisesRegex(FileNotFoundError, '内部分析组件缺失'):
                     analysis.analyze_project(b'missing helper fixture')
 
     def test_worker_reports_invalid_project_without_executing_content(self):

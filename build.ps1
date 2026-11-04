@@ -6,7 +6,13 @@ function Invoke-Python {
     & $Python @Arguments
     if ($LASTEXITCODE -ne 0) { throw "Python command failed with exit code $LASTEXITCODE" }
 }
-Invoke-Python -Arguments @("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed", "--uac-admin", "--noupx", "--name", "WormRecovery", "--collect-all", "oletools", "--collect-all", "pcodedmp", "--hidden-import", "olefile", "--hidden-import", "psutil", "--hidden-import", "winreg", "worm_recovery.py")
-Invoke-Python -Arguments @("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console", "--uac-admin", "--noupx", "--name", "WormRecovery-CLI", "--collect-all", "oletools", "--collect-all", "pcodedmp", "--hidden-import", "olefile", "--hidden-import", "psutil", "--hidden-import", "winreg", "cli_entry.py")
-Invoke-Python -Arguments @("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console", "--noupx", "--name", "WormRecovery-Analysis", "--collect-all", "oletools", "--collect-all", "pcodedmp", "analysis_entry.py")
-Write-Host "Build completed: $PSScriptRoot/dist"
+$privateDist = Join-Path $PSScriptRoot 'build/embedded'
+New-Item -ItemType Directory -Path $privateDist -Force | Out-Null
+$collect = @('--collect-all', 'oletools', '--collect-all', 'pcodedmp')
+$base = @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile', '--noupx')
+Invoke-Python -Arguments ($base + @('--console', '--name', 'WormRecovery-Analysis', '--distpath', $privateDist) + $collect + @('analysis_entry.py'))
+Invoke-Python -Arguments ($base + @('--console', '--uac-admin', '--name', 'WormRecovery-CLI', '--distpath', $privateDist) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'cli_entry.py'))
+$analysis = Join-Path $privateDist 'WormRecovery-Analysis.exe'
+$cli = Join-Path $privateDist 'WormRecovery-CLI.exe'
+Invoke-Python -Arguments ($base + @('--windowed', '--uac-admin', '--name', 'WormRecovery', '--add-binary', ($analysis + ':engines'), '--add-binary', ($cli + ':engines')) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'worm_recovery.py'))
+Write-Host "Build completed: $PSScriptRoot/dist/WormRecovery.exe (single-file distribution)"

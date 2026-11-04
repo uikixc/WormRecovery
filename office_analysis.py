@@ -106,10 +106,8 @@ def analyze_project(data, timeout=ANALYSIS_TIMEOUT):
     frozen = getattr(sys, 'frozen', False)
     executable = pathlib.Path(sys.executable)
     if frozen and not executable.name.casefold().endswith('-cli.exe'):
-        candidate = executable.with_name('WormRecovery-Analysis.exe')
-        if not candidate.is_file():
-            raise ValueError('缺少离线宏分析组件 WormRecovery-Analysis.exe，请保留完整分发目录。')
-        executable = candidate
+        from bundled_components import component_path
+        executable = component_path('WormRecovery-Analysis.exe')
     command = [str(executable)] if frozen else [sys.executable, str(entry)]
     command.append('--office-analysis-worker')
     if frozen and executable.name.casefold().endswith('-analysis.exe'):

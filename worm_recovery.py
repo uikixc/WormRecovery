@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.3.6'
+VERSION = '1.3.7'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -951,6 +951,14 @@ def cli_main():
     if sys.argv[1:]==['--office-analysis-worker']:
         from office_analysis import worker_main
         return worker_main()
+    if getattr(sys,'frozen',False) and WINDOWLESS and sys.argv[1:]:
+        from bundled_components import component_path
+        result=subprocess.run([str(component_path('WormRecovery-CLI.exe')),*sys.argv[1:]],
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                              creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        for stream,data in ((sys.stdout,result.stdout),(sys.stderr,result.stderr)):
+            if data:stream.write(data.decode('utf-8','replace'));stream.flush()
+        return result.returncode
     parser=argparse.ArgumentParser(description='WormRecovery 文件安全检测与原位恢复')
     parser.add_argument('--scan',action='store_true',help='只扫描，不修复')
     parser.add_argument('--clean',action='store_true',help='扫描并修复确认感染项')
