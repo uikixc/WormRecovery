@@ -37,6 +37,19 @@ class FakeCleaner:
 
 
 class ModernUITests(unittest.TestCase):
+    def test_read_limit_is_visible_without_becoming_infection(self):
+        record={'kind':'coverage_error','_coverage_error':True,'path':'C:/pagefile.sys',
+                'category':'active_pagefile_unreadable','reason':'活动分页文件无法在线读取。',
+                'action':'内容未检查。','error':'Permission denied'}
+        self.app.result_records=[record]
+        self.app.select_filter('errors')
+        self.assertEqual(self.app.tree.item('0','values')[0],'读取受限')
+        self.app.tree.selection_set('0');self.app.selected()
+        self.assertIn('内容未检查',self.app.selected_path.get())
+        self.assertIn('Permission denied',self.app.selected_path.get())
+        self.app.select_filter('confirmed')
+        self.assertEqual(self.app.tree.get_children(),())
+
     def test_secondary_results_have_distinct_visible_states(self):
         for result,state in (('detected','引擎检出'),('incomplete','分析未完成'),('suspicious','规则命中'),('no_known_match','无已知匹配')):
             with self.subTest(result=result):

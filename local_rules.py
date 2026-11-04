@@ -35,7 +35,7 @@ _lock = threading.Lock()
 _local = threading.local()
 
 
-def scan_bytes(data):
+def _scanner():
     global _rules
     import yara_x
     if _rules is None:
@@ -45,17 +45,20 @@ def scan_bytes(data):
     if not hasattr(_local, 'scanner'):
         _local.scanner = yara_x.Scanner(_rules)
         _local.scanner.set_timeout(3)
-    result = _local.scanner.scan(data)
+    return _local.scanner
+
+
+def _result(result):
     return {'engine': 'YARA-X', 'ruleset_version': RULESET_VERSION,
             'scope': 'WormRecovery family rules; not a universal antivirus database',
             'matches': [rule.identifier for rule in result.matching_rules]}
+
+
+def scan_bytes(data):
+    return _result(_scanner().scan(data))
 
 
 def scan_file(path):
     # Initialize the per-thread scanner once; scan_file avoids copying a whole
     # executable into a second Python bytes allocation.
-    scan_bytes(b'')
-    result = _local.scanner.scan_file(str(path))
-    return {'engine': 'YARA-X', 'ruleset_version': RULESET_VERSION,
-            'scope': 'WormRecovery family rules; not a universal antivirus database',
-            'matches': [rule.identifier for rule in result.matching_rules]}
+    return _result(_scanner().scan_file(str(path)))

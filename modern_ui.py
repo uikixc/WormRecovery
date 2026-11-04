@@ -180,7 +180,7 @@ class ModernWindow:
         self.panel_title=self.label(toolbar,'扫描结果',font=(FONT,11,'bold'))
         self.panel_title.pack(side='left')
         self.filters={}
-        for key,title in [('info','组件说明'),('review','需进一步检查'),('confirmed','确认感染'),('all','全部')]:
+        for key,title in [('errors','检查异常'),('info','组件说明'),('review','需进一步检查'),('confirmed','确认感染'),('all','全部')]:
             b=tk.Button(toolbar,text=title,command=lambda k=key:self.select_filter(k),bg='white',fg=MUTED,
                         activebackground='#E9F3F4',activeforeground=ACCENT,relief='flat',bd=0,padx=10,pady=3,cursor='hand2')
             b.pack(side='right',padx=2)
@@ -250,7 +250,7 @@ class ModernWindow:
         for b in self.filters.values():
             if name=='log':b.pack_forget()
         if name!='log':
-            for key in ('info','review','confirmed','all'):self.filters[key].pack(side='right',padx=2)
+            for key in ('errors','info','review','confirmed','all'):self.filters[key].pack(side='right',padx=2)
 
     def select_filter(self,key):
         self.filter=key
@@ -270,7 +270,7 @@ class ModernWindow:
         if selected:
             record=self.result_records[int(selected[0])]
             text=record['path']
-            for key in ('reason','action','assessment_limit'):
+            for key in ('reason','action','assessment_limit','error'):
                 if record.get(key):text+='\n'+record[key]
             secondary=record.get('secondary_analysis',{})
             if secondary:
@@ -365,6 +365,12 @@ class ModernWindow:
         for i,r in enumerate(self.result_records):
             review=r['kind'].startswith('review_')
             informational=r['kind'].startswith('info_')
+            if r.get('_coverage_error'):
+                if self.filter not in ('all','errors'):continue
+                self.tree.insert('',tk.END,iid=str(i),values=('读取受限' if r.get('category') else '检查异常',r.get('reason','文件读取或检查未完成。'),r['path']),tags=('review',))
+                visible+=1
+                continue
+            if self.filter=='errors':continue
             if self.filter=='review' and not review or self.filter=='confirmed' and not is_confirmed(r) or self.filter=='info' and not informational:continue
             state='保留，无需处理' if informational else review_state(r) if review else '待修复'
             category=LABELS.get(r['kind'],r['kind'])
@@ -394,7 +400,7 @@ class ModernWindow:
                 elif kind=='done':
                     c=self.cleaner
                     self.scan_ready=payload=='scan' and not c.cancel.is_set()
-                    self.result_records=list(c.findings)
+                    self.result_records=list(c.findings)+[dict(row,kind='coverage_error',_coverage_error=True) for row in c.errors]
                     self.render_results()
                     self.set_busy(False)
                     self.report_button.configure(state='normal')

@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.4.1'
+VERSION = '1.4.2'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -202,9 +202,9 @@ class PEView:
                 out.write(b);remaining-=len(b)
             out.flush();os.fsync(out.fileno())
 
-def is_stub(path,strict=False):
+def is_stub(path,strict=False,data=None):
     try:
-        with open(path,'rb') as f:
+        with (io.BytesIO(data) if data is not None else open(path,'rb')) as f:
             h=f.read(4096)
             if len(h)<64 or h[:2]!=b'MZ':return False
             off=struct.unpack_from('<I',h,60)[0]
@@ -366,14 +366,18 @@ def inspect_file_content(path,st):
     name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
     if name.startswith('~$') and not name.startswith('~$cache'):return result
     if ext in EXE_EXTS or name.startswith(('~$cache','._cache_')):
-        if is_stub(path,strict=True):
+        data=None
+        if st.st_size<=16*1024*1024:
+            with open(path,'rb') as stream:data=stream.read(st.st_size+1)
+            if len(data)!=st.st_size:raise ValueError('检查时文件大小发生变化，请重新扫描。')
+        if is_stub(path,strict=True,data=data):
             with PEView(path) as pe:original=pe.resource('EXERESX')
             add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None)
-        elif st.st_size==15360 and digest_file(path)==HOOK_SHA256:add('worm_hook',path,sha256=HOOK_SHA256)
-        elif name.startswith('._cache_') and st.st_size==750320 and digest_file(path)==AUTOIT_EXE_SHA256:add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
+        elif st.st_size==15360 and (hashlib.sha256(data).hexdigest() if data is not None else digest_file(path))==HOOK_SHA256:add('worm_hook',path,sha256=HOOK_SHA256)
+        elif name.startswith('._cache_') and st.st_size==750320 and (hashlib.sha256(data).hexdigest() if data is not None else digest_file(path))==AUTOIT_EXE_SHA256:add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
         elif st.st_size<=16*1024*1024:
-            from local_rules import scan_file
-            rules=scan_file(path)
+            from local_rules import scan_bytes
+            rules=scan_bytes(data)
             if rules['matches']:add('review_binary',path,reason='程序内容命中家族组合规则，正在执行离线复核。',content_rules=rules)
     elif ext=='.a3x':
         if digest_file(path)==AUTOIT_A3X_SHA256:add('worm_script',path,sha256=AUTOIT_A3X_SHA256)
@@ -476,7 +480,15 @@ class Cleaner:
         elif norm(p.parent)==norm(user):base=winreg.HKEY_CURRENT_USER
         else:return
         self.startup_approved(base,'',p.name,('StartupFolder',),str(p))
-    def error(self,path,ex):self.errors.append({'path':str(path),'error':str(ex)});self.log('error',path=str(path),error=str(ex))
+    def error(self,path,ex):
+        record={'path':str(path),'error':str(ex)}
+        from coverage_errors import active_pagefiles,describe_read_error
+        if 'permission denied' in str(ex).casefold() or isinstance(ex,PermissionError):
+            if not hasattr(self,'_active_pagefiles'):
+                try:self._active_pagefiles=active_pagefiles()
+                except OSError:self._active_pagefiles=set()
+            record.update(describe_read_error(path,ex,self._active_pagefiles))
+        self.errors.append(record);self.log('error',**record)
     def add(self,kind,path,**detail):
         record={'kind':kind,'path':str(path),**detail};self.findings.append(record)
         labels={'infected_office':'受感染文档','infected_executable':'受感染程序','worm_payload':'恶意载荷','worm_hook':'恶意组件','worm_runtime':'恶意缓存','worm_script':'恶意脚本','malicious_shortcut':'恶意快捷方式','worm_residue':'已确认家族残留','review_office':'待核查文档','review_autoit':'待核查脚本'}
@@ -790,10 +802,12 @@ class Cleaner:
                 if record['status']=='unverified':
                     record['reason']='scan_cancelled_or_target_unavailable';self.skipped.append({'path':record['path'],'target':target,'reason':record['reason']})
         self.scan_seconds=time.monotonic()-start;self.scan_active=False
+        self.file_scan_seconds=self.scan_seconds
         if not self.cancel.is_set():
             from secondary_analysis import enrich_reviews
             enrich_reviews(self)
         self.scan_seconds=time.monotonic()-start
+        self.review_seconds=max(0,self.scan_seconds-self.file_scan_seconds)
         self.log('scan_complete',files=self.count,directories=self.dircount,seconds=self.scan_seconds,cancelled=self.cancel.is_set(),findings=len(self.findings),skipped_count=len(self.skipped))
         self.save();return self.findings
     def payload_path(self,path):
@@ -957,6 +971,7 @@ class Cleaner:
     def save(self):
         summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
         summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
+        summary['scan_timing']={'file_scan_seconds':getattr(self,'file_scan_seconds',None),'secondary_analysis_seconds':getattr(self,'review_seconds',None)}
         from engine_assets import manifest
         from local_rules import RULESET_VERSION
         assets=manifest()

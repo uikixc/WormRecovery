@@ -8,6 +8,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+import builtins
 from unittest.mock import patch
 import zipfile
 
@@ -29,6 +30,29 @@ def write_xlm_fixture(path):
 
 
 class ContentRuleTests(unittest.TestCase):
+    def test_binary_detector_reads_exact_size_once_and_preserves_match(self):
+        content=b'Harmless fixture Synaptics ~$cache1 RegKeySave Workbook_Open'
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'fixture.exe';path.write_bytes(content)
+            with patch('builtins.open',wraps=builtins.open) as opening:
+                result=recovery.inspect_file_content(str(path),path.stat())
+            self.assertEqual(opening.call_count,1)
+            self.assertEqual(result['findings'][0]['kind'],'review_binary')
+            self.assertEqual(path.read_bytes(),content)
+
+    def test_binary_size_change_cannot_return_clean(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'changed.exe';path.write_bytes(b'inert')
+            fake=SimpleNamespace(st_size=2)
+            with self.assertRaisesRegex(ValueError,'文件大小发生变化'):
+                recovery.inspect_file_content(str(path),fake)
+
+    def test_file_scan_does_not_perform_extra_empty_content_scan(self):
+        with patch.object(local_rules,'scan_bytes',side_effect=AssertionError('redundant scan')):
+            with tempfile.TemporaryDirectory() as temp:
+                path=Path(temp)/'inert.txt';path.write_bytes(b'inert text')
+                self.assertEqual(local_rules.scan_file(path)['matches'],[])
+
     def test_name_alone_never_matches_family_rule(self):
         self.assertEqual(local_rules.scan_bytes(b'GoogleChrome MozillaFirefox Synaptics')['matches'], [])
 

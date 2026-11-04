@@ -89,7 +89,7 @@ class FileScanner:
         for path,result,error in rows:self.accept(path,result,error)
     def poll(self,block=False):
         if not self.pending:return
-        done,_=wait(self.pending,timeout=.1 if block else 0,return_when=FIRST_COMPLETED)
+        done,_=wait(self.pending,timeout=.1,return_when=FIRST_COMPLETED) if block else ({future for future in self.pending if future.done()},None)
         for future in done:
             self.pending.remove(future);self._accept(future.result())
     def finish(self):

@@ -13,6 +13,15 @@ import worm_recovery as w
 
 
 class ConcurrentQueueTests(unittest.TestCase):
+    def test_nonblocking_poll_does_not_allocate_waiter(self):
+        from concurrent.futures import Future
+        future=Future()
+        scanner=FileScanner(None,None,threading.Event(),self.profiles(),workers=2)
+        scanner.pending.add(future)
+        with patch('scan_concurrency.wait',side_effect=AssertionError('nonblocking wait allocation')):
+            scanner.poll()
+        self.assertIn(future,scanner.pending)
+
     def profiles(self,readers=4):return {'C:/':{'device':'disk-0','readers':readers}}
     def test_workers_overlap_but_results_are_collected_on_caller(self):
         barrier=threading.Barrier(2);caller=threading.get_ident();workers=set();accepted=[]
