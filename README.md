@@ -1,6 +1,6 @@
 # WormRecovery
 
-Windows 蠕虫检测与原位恢复工具，当前版本为 **1.3.3**。针对已分析的 AutoIt / Synaptics 感染特征，提供文件检测、确认感染项修复和复核。
+Windows 蠕虫检测与原位恢复工具，当前版本为 **1.3.4**。针对已分析的 AutoIt / Synaptics 感染特征，提供文件检测、确认感染项修复和复核。
 
 ## 功能
 
@@ -13,6 +13,10 @@ Windows 蠕虫检测与原位恢复工具，当前版本为 **1.3.3**。针对�
 活动病毒进程的遏制与磁盘文件处理范围分别判断；保护设备文件不会放任经指纹确认的病毒进程继续运行。关联清理已确认启动项的状态记录、已知家族残留快捷方式和处理后为空的家族目录；有未分类文件的目录予以保留。界面显示当前扫描路径、文件处理速度和当前项目耗时。
 
 ## 环境要求
+
+只读文件检测采用有界线程池：识别为无寻道惩罚的设备默认最多 4 个读取线程，机械盘及类型未知的设备限制为单个读取任务；同一物理设备的多个盘符共享读取限额，总线程数不超过 8。文件内容检测结果由单一协调线程汇总，修复和文档写回仍逐项执行。Office 宏解析器受独立锁保护。
+
+线程数更多并不保证更快，实际效果取决于文件数量、磁盘延迟、系统缓存和解析开销。停止后取消尚未开始的工作，等待正在执行的读取返回，不将未完成扫描报告为完成。
 
 - Windows 10 / 11，建议使用 64 位系统。
 - Python 3.12 或更新版本，需包含 Tcl/Tk。
@@ -37,6 +41,9 @@ python cli_entry.py --scan --scope removable
 
 # 扫描指定位置
 python cli_entry.py --scan --root "C:\Data"
+
+# 如需手动限制扫描线程，可设置 1 至 8；默认自动选择
+python cli_entry.py --scan --scope internal --workers 4
 
 # 扫描并修复确认感染项（管理员终端）
 python cli_entry.py --clean --scope internal
@@ -76,6 +83,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\pyt
 | `device_scope.py` | 物理设备识别和扫描范围管理 |
 | `reparse_scan.py` | 重解析点解析和目标检查 |
 | `worm_residue.py` | 已确认家族残留指纹和精确路径匹配 |
+| `scan_concurrency.py` | 有界扫描队列、物理磁盘识别与并发限制 |
 | `cli_entry.py` | 命令行入口 |
 | `tests/` | 无害回归测试 |
 | `build.ps1` | Windows 可执行程序构建 |

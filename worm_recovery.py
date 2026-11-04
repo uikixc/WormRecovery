@@ -11,7 +11,7 @@ from ctypes import wintypes as W
 import psutil
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.3.3'
+VERSION = '1.3.4'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -234,7 +234,13 @@ def shortcut(path):
     if 'qmquarantine' in text or '/openquarantine?' in text:return {'malicious':False,'av_placeholder':True,**strings}
     return {'malicious':('googlechrome.a3x' in text and ('autoit3executescript' in text or 'googlechrome.exe' in text)),**strings}
 
+_OFFICE_PARSE_LOCK=threading.Lock()
+
 def office_check(path):
+    # oletools/pyparsing initialization and parser state are not shared concurrently.
+    with _OFFICE_PARSE_LOCK:return _office_check(path)
+
+def _office_check(path):
     p=pathlib.Path(path)
     try:
         with zipfile.ZipFile(p) as z:
@@ -352,6 +358,36 @@ def lock_holders(path):
         if rm.RmGetList(session,ctypes.byref(needed),ctypes.byref(count),rows,ctypes.byref(reasons)):return []
         return [x.process.pid for x in rows[:count.value]]
     finally:rm.RmEndSession(session)
+
+def inspect_file_content(path,st):
+    """Read-only detector; return data without mutating Cleaner or UI state."""
+    result={'office':0,'findings':[]}
+    def add(kind,path,**detail):result['findings'].append({'kind':kind,'path':str(path),**detail})
+    name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
+    if name.startswith('~$') and not name.startswith('~$cache'):return result
+    if ext in EXE_EXTS or name.startswith(('~$cache','._cache_')):
+        if is_stub(path,strict=True):
+            with PEView(path) as pe:original=pe.resource('EXERESX')
+            add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None)
+        elif st.st_size==15360 and digest_file(path)==HOOK_SHA256:add('worm_hook',path,sha256=HOOK_SHA256)
+        elif name.startswith('._cache_') and st.st_size==750320 and digest_file(path)==AUTOIT_EXE_SHA256:add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
+    elif ext=='.a3x':
+        if digest_file(path)==AUTOIT_A3X_SHA256:add('worm_script',path,sha256=AUTOIT_A3X_SHA256)
+        else:add('review_autoit',path,reason='未识别脚本已保留，需进一步核查。')
+    elif ext=='.lnk' and st.st_size<1024*1024:
+        link=shortcut(path)
+        if link and link.get('malicious'):add('malicious_shortcut',path,shortcut=link)
+        elif link and link.get('av_placeholder') and payload_root(path) and norm(os.path.dirname(path))==norm(payload_root(path)):
+            fingerprint=digest_file(path)
+            if fingerprint in QUARANTINE_LINK_HASHES:add('worm_residue',path,sha256=fingerprint,reason='已确认家族目录内的已知隔离提示快捷方式。')
+    elif ext in OFFICE_EXTS:
+        result['office']=1;info=office_check(path)
+        if info['status']=='infected':add('infected_office',path,**info)
+        elif info['status']=='review':
+            add('review_office',path,**info)
+            if info.get('analysis_error'):
+                result['error']=info['reason']
+    return result
 
 class Cleaner:
     def __init__(self,report_dir=None,emit=print,force_close=True,protected=(),restore_history=True,external_volumes=None,excluded_roots=()):
@@ -608,33 +644,17 @@ class Cleaner:
             except FileNotFoundError:continue
             except OSError as ex:self.log('snapshot_unavailable',source=source,error=str(ex))
         return None
+    def record_file_result(self,path,result):
+        self.count+=1;self.scanned_office+=result.get('office',0)
+        for row in result.get('findings',[]):
+            row=dict(row);kind=row.pop('kind');target=row.pop('path')
+            self.add(kind,target,**row)
+        if result.get('error'):
+            self.inspection_failed=True;self.error(path,result['error'])
     def scan_file(self,path,st):
-        self.count+=1;name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
-        if name.startswith('~$') and not name.startswith('~$cache'):return
-        if ext in EXE_EXTS or name.startswith(('~$cache','._cache_')):
-            if is_stub(path,strict=True):
-                with PEView(path) as pe:original=pe.resource('EXERESX')
-                self.add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None)
-            elif st.st_size==15360 and digest_file(path)==HOOK_SHA256:self.add('worm_hook',path,sha256=HOOK_SHA256)
-            elif name.startswith('._cache_') and st.st_size==750320 and digest_file(path)==AUTOIT_EXE_SHA256:self.add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
-        elif ext=='.a3x':
-            if digest_file(path)==AUTOIT_A3X_SHA256:self.add('worm_script',path,sha256=AUTOIT_A3X_SHA256)
-            else:self.add('review_autoit',path,reason='未识别脚本已保留，需进一步核查。')
-        elif ext=='.lnk' and st.st_size<1024*1024:
-            result=shortcut(path)
-            if result and result.get('malicious'):self.add('malicious_shortcut',path,shortcut=result)
-            elif result and result.get('av_placeholder') and payload_root(path) and norm(os.path.dirname(path))==norm(payload_root(path)):
-                fingerprint=digest_file(path)
-                if fingerprint in QUARANTINE_LINK_HASHES:self.add('worm_residue',path,sha256=fingerprint,reason='已确认家族目录内的已知隔离提示快捷方式。')
-        elif ext in OFFICE_EXTS:
-            self.scanned_office+=1;info=office_check(path)
-            if info['status']=='infected':self.add('infected_office',path,**info)
-            elif info['status']=='review':
-                self.add('review_office',path,**info)
-                if info.get('analysis_error'):
-                    self.inspection_failed=True
-                    self.error(path,info['reason'])
-    def scan(self,roots=None):
+        self.record_file_result(path,inspect_file_content(path,st))
+    def scan(self,roots=None,workers=None):
+        from scan_concurrency import FileScanner,storage_profile
         from reparse_scan import inspect_reparse,resolve_target,CoverageLimit
         roots=self.policy.fixed_roots() if roots is None else roots
         if not roots:raise ValueError('未指定有效扫描范围。')
@@ -649,11 +669,37 @@ class Cleaner:
         def directory_id(path,st=None):
             st=st or os.stat(path)
             return ('id',st.st_dev,st.st_ino) if st.st_ino else ('path',norm(path))
+        failed_files=set()
+        def accept_file(path,result,error):
+            if error:
+                failed_files.add(norm(path));self.count+=1;self.error(path,error)
+            else:self.record_file_result(path,result)
+            self.last_completed=time.monotonic()
+        profiles={};root_infos={}
+        for selected in roots:
+            info=self.policy.check(selected);root=info['root'];root_infos[norm(selected)]=info
+            if root not in profiles:profiles[root]=storage_profile(root)
+        def validate_volume(root):
+            if norm(root) in self.policy.external_volumes and volume_identity(root)!=self.policy.external_volumes[norm(root)]:
+                raise PermissionError('设备连接状态已变化。请重新扫描。')
+        scanner=FileScanner(inspect_file_content,accept_file,self.cancel,profiles,workers,validate_volume)
+        self.file_scanner=scanner;self.scan_workers=scanner.workers
+        self.log('scan_concurrency',workers=scanner.workers,devices=list(profiles.values()),queue_limit=scanner.queue_limit)
         def inspect_file(path,st):
             key=norm(path)
             if key in files_seen:return 'target_already_checked'
-            self.current_path=path
-            self.scan_file(path,st);self.last_completed=time.monotonic();files_seen.add(key);return 'target_checked'
+            files_seen.add(key);self.current_path=path
+            name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
+            if ext not in EXE_EXTS|OFFICE_EXTS|{'.a3x','.lnk'} and not name.startswith(('~$cache','._cache_')):
+                accept_file(path,{'office':0,'findings':[]},None);return 'target_checked'
+            root=directory_volumes.get(norm(os.path.dirname(path)))
+            if root is None:root=self.policy.check(path)['root']
+            if root not in profiles:
+                # A reparse target on a newly encountered volume is checked serially.
+                try:accept_file(path,inspect_file_content(path,st),None)
+                except Exception as ex:accept_file(path,None,str(ex))
+            else:scanner.submit(path,st,root)
+            return 'target_checked'
         def inspect_link(path):
             record={'path':path,'status':'pending'};self.reparse_points.append(record)
             try:
@@ -672,46 +718,53 @@ class Cleaner:
                 self.skipped.append({'path':path,'reason':ex.reason,'target':ex.target})
             except Exception as ex:
                 record['status']='error';record['error']=str(ex);self.error(path,ex)
-        for root in roots:
-            info=self.policy.check(root)
-            removed={norm(e['path']) for e in self.events if e['kind']=='empty_payload_directory_removed'}
-            if norm(root) in removed and not os.path.exists(root):
-                self.log('verified_removed_scan_root',path=str(root));continue
-            if not os.path.isdir(root):raise ValueError('扫描位置不存在或不是目录：'+str(root))
-            if self.protected_path(root):raise ValueError('所选位置已列入排除范围。')
-            if file_attributes(root)&0x400:inspect_link(os.path.abspath(root))
-            else:
-                directory_volumes[norm(root)]=info['root'];stack.append(os.path.abspath(root))
-        while stack and not self.cancel.is_set():
-            directory=stack.pop()
-            if self.protected_path(directory):
-                self.skipped.append({'path':directory,'reason':'excluded_path'});continue
-            try:
-                # Reparse targets are resolved separately; ordinary entries
-                # inherit the verified parent volume without a Win32 query.
-                root=directory_volumes[norm(directory)]
-                self.policy.check_volume(root);self.current_path=directory
-                identity=directory_id(directory)
-                if identity in visited:continue
-                with os.scandir(directory) as entries:
-                    visited.add(identity)
-                    self.dircount+=1
-                    for e in entries:
-                        if self.cancel.is_set():break
-                        try:
-                            st=e.stat(follow_symlinks=False)
-                            if st.st_file_attributes&0x400:
-                                inspect_link(e.path);continue
-                            if e.is_dir(follow_symlinks=False):
-                                directory_volumes[norm(e.path)]=root;stack.append(e.path);continue
-                            inspect_file(e.path,st)
-                        except Exception as ex:self.error(e.path,ex)
-                self.last_completed=time.monotonic()
-                if self.last_completed-self.last_progress>=1:
-                    self.last_progress=self.last_completed
-                    self.emit('已扫描 %s 文件 / %s 目录；平均 %s 文件/秒'%(self.count,self.dircount,int(self.count/max(.001,self.last_completed-start))))
-            except OSError as ex:failed_directories.add(norm(directory));self.error(directory,ex)
+        try:
+            with scanner:
+                for root in roots:
+                    info=root_infos[norm(root)]
+                    removed={norm(e['path']) for e in self.events if e['kind']=='empty_payload_directory_removed'}
+                    if norm(root) in removed and not os.path.exists(root):
+                        self.log('verified_removed_scan_root',path=str(root));continue
+                    if not os.path.isdir(root):raise ValueError('扫描位置不存在或不是目录：'+str(root))
+                    if self.protected_path(root):raise ValueError('所选位置已列入排除范围。')
+                    if file_attributes(root)&0x400:inspect_link(os.path.abspath(root))
+                    else:
+                        directory_volumes[norm(root)]=info['root'];stack.append(os.path.abspath(root))
+                while stack and not self.cancel.is_set():
+                    scanner.poll()
+                    directory=stack.pop()
+                    if self.protected_path(directory):
+                        self.skipped.append({'path':directory,'reason':'excluded_path'});continue
+                    try:
+                        # Reparse targets are resolved separately; ordinary entries
+                        # inherit the verified parent volume without a Win32 query.
+                        root=directory_volumes[norm(directory)]
+                        self.policy.check_volume(root);self.current_path=directory
+                        identity=directory_id(directory)
+                        if identity in visited:continue
+                        with os.scandir(directory) as entries:
+                            visited.add(identity)
+                            self.dircount+=1
+                            for e in entries:
+                                if self.cancel.is_set():break
+                                try:
+                                    st=e.stat(follow_symlinks=False)
+                                    if st.st_file_attributes&0x400:
+                                        inspect_link(e.path);continue
+                                    if e.is_dir(follow_symlinks=False):
+                                        directory_volumes[norm(e.path)]=root;stack.append(e.path);continue
+                                    inspect_file(e.path,st)
+                                except Exception as ex:self.error(e.path,ex)
+                        self.last_completed=time.monotonic()
+                        if self.last_completed-self.last_progress>=1:
+                            self.last_progress=self.last_completed
+                            self.emit('已扫描 %s 文件 / %s 目录；平均 %s 文件/秒'%(self.count,self.dircount,int(self.count/max(.001,self.last_completed-start))))
+                    except OSError as ex:failed_directories.add(norm(directory));self.error(directory,ex)
+        finally:
+            self.scan_active=False;self.file_scanner=None
         for record in self.reparse_points:
+            if record.get('resolved_target') and norm(record['resolved_target']) in failed_files:
+                record['status']='error';record['error']='链接目标读取失败，详见异常记录。'
             identity=record.pop('directory_id',None)
             if identity is not None:
                 target=record['resolved_target']
@@ -856,7 +909,8 @@ class Cleaner:
         self.save()
     def verify(self):
         before_errors=len(self.errors);roots=list(self.scan_roots)
-        remaining=self.scan(roots)
+        workers=getattr(self,'scan_workers',None)
+        remaining=self.scan(roots,workers=workers) if workers is not None else self.scan(roots)
         processes=self.contain(False);registry=self.registry(False);system=self.system_persistence(False);firewall=[x for x in self.firewall(False) if x['enabled']=='True']
         active_tasks=[]
         for x in system.get('tasks',[]):
@@ -876,7 +930,7 @@ class Cleaner:
         self.verification['unverified_areas']=['压缩档内部文件','离线用户配置单元','未分配盘符或未挂载的卷','排除目录与未解析或范围外的链接目标','未识别的恶意软件家族']
         self.log('verification_complete',result=self.verification);self.save();return self.verification
     def save(self):
-        summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
+        summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
         summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
         json_save(self.run/'report.json',summary);return summary
 
@@ -890,6 +944,7 @@ def cli_main():
     parser.add_argument('--clean',action='store_true',help='扫描并修复确认感染项')
     parser.add_argument('--root',action='append',help='手动指定扫描位置；选择外接设备中的位置时包含同设备全部盘符')
     parser.add_argument('--scope',choices=['internal','removable'],default='internal',help='internal：本机全盘；removable：可移动设备')
+    parser.add_argument('--workers',type=int,choices=range(1,9),metavar='1-8',help='只读文件扫描线程数；默认按物理磁盘自动选择')
     parser.add_argument('--report-dir',help='固定磁盘上的报告/隔离根目录')
     parser.add_argument('--force-close',action='store_true',default=True,help=argparse.SUPPRESS)
     parser.add_argument('--restore-history',action='store_true',default=True,help=argparse.SUPPRESS)
@@ -900,7 +955,9 @@ def cli_main():
     scope=resolve_scan_scope(args.scope,args.root)
     cleaner=Cleaner(args.report_dir,force_close=True,protected=args.exclude,restore_history=True,external_volumes=scope['external_volumes'],excluded_roots=scope['excluded_roots'])
     cleaner.scope_summary=scope
-    cleaner.contain(args.clean);cleaner.registry(args.clean);cleaner.system_persistence(args.clean);cleaner.scan(scope['roots'])
+    cleaner.contain(args.clean);cleaner.registry(args.clean);cleaner.system_persistence(args.clean)
+    if args.workers is None:cleaner.scan(scope['roots'])
+    else:cleaner.scan(scope['roots'],workers=args.workers)
     if args.clean:cleaner.repair();cleaner.verify()
     failed=bool(cleaner.errors or cleaner.cancel.is_set() or cleaner.inspection_failed or any(x.get('status') in ('unverified','error','pending') for x in getattr(cleaner,'reparse_points',[])) or args.clean and not (cleaner.verification or {}).get('known_family_clear'))
     status=1 if failed else 2 if any(not x['kind'].startswith('review_') for x in cleaner.findings) else 0

@@ -389,8 +389,11 @@ class ModernWindow:
                 duration=max(.001,time.monotonic()-c.scan_started)
                 pending=max(0,int(time.monotonic()-c.last_completed))
                 text='已检查 %s 个文件 · 平均 %s 文件/秒'%(format(c.count,','),format(int(c.count/duration),','))
+                workers=getattr(c,'scan_workers',1)
+                if workers>1:text+=' · %s 个扫描线程'%workers
                 if pending>=5:text+=' · 当前项目处理已用 %s 秒'%pending
-                path=getattr(c,'current_path','')
+                scanner=getattr(c,'file_scanner',None)
+                path=(scanner.current() if scanner else '') or getattr(c,'current_path','')
                 self.detail.set(text+' · '+(path if len(path)<=85 else '…'+path[-84:]))
         elif self.started:
             value=self.elapsed.get().replace(' 已用时','')

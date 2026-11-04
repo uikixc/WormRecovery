@@ -17,6 +17,11 @@ class VerificationTests(unittest.TestCase):
     def test_prior_error_blocks_clean_result(self):
         c=self.cleaner();c.errors=[{'path':'C:/locked.exe','error':'access denied'}]
         self.assertFalse(c.verify()['known_family_clear'])
+    def test_verification_preserves_selected_worker_count(self):
+        c=self.cleaner();c.scan_workers=2;calls=[]
+        c.scan=lambda roots,**kwargs:calls.append(kwargs) or []
+        c.verify()
+        self.assertEqual(calls,[{'workers':2}])
     def test_persistence_failure_cannot_report_clean(self):
         c=self.cleaner();c.inspection_failed=True
         self.assertFalse(c.verify()['known_family_clear'])
