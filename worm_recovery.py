@@ -9,9 +9,10 @@ import os, pathlib, re, shutil, struct, subprocess, sys, tempfile, threading
 import time, uuid, winreg, zipfile, xml.etree.ElementTree as ET
 from ctypes import wintypes as W
 import psutil
+from office_triage import assess_office,is_confirmed
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.3.4'
+VERSION = '1.3.5'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -238,7 +239,7 @@ _OFFICE_PARSE_LOCK=threading.Lock()
 
 def office_check(path):
     # oletools/pyparsing initialization and parser state are not shared concurrently.
-    with _OFFICE_PARSE_LOCK:return _office_check(path)
+    with _OFFICE_PARSE_LOCK:return assess_office(path,_office_check(path))
 
 def _office_check(path):
     p=pathlib.Path(path)
@@ -383,6 +384,7 @@ def inspect_file_content(path,st):
     elif ext in OFFICE_EXTS:
         result['office']=1;info=office_check(path)
         if info['status']=='infected':add('infected_office',path,**info)
+        elif info['status']=='info':add('info_office',path,**info)
         elif info['status']=='review':
             add('review_office',path,**info)
             if info.get('analysis_error'):
@@ -467,7 +469,9 @@ class Cleaner:
     def add(self,kind,path,**detail):
         record={'kind':kind,'path':str(path),**detail};self.findings.append(record)
         labels={'infected_office':'受感染文档','infected_executable':'受感染程序','worm_payload':'恶意载荷','worm_hook':'恶意组件','worm_runtime':'恶意缓存','worm_script':'恶意脚本','malicious_shortcut':'恶意快捷方式','worm_residue':'已确认家族残留','review_office':'待核查文档','review_autoit':'待核查脚本'}
-        self.emit('检测到'+labels.get(kind,'风险项目')+'：'+str(path));return record
+        if kind=='info_office':self.emit('已核对 Office 组件：'+str(path))
+        else:self.emit('检测到'+labels.get(kind,'风险项目')+'：'+str(path))
+        return record
     def backup(self,path):
         self.policy.mutation(path);p=pathlib.Path(path)
         if self.protected_path(p):raise PermissionError('所选路径已列入排除范围。')
@@ -867,7 +871,7 @@ class Cleaner:
         for rec in list(self.findings):
             if self.cancel.is_set():break
             kind,p=rec['kind'],pathlib.Path(rec['path'])
-            if kind.startswith('review_'):continue
+            if not is_confirmed(rec):continue
             try:
                 if not p.exists():continue
                 self.policy.mutation(p)
@@ -919,13 +923,16 @@ class Cleaner:
                 if enabled is None or (enabled.text or '').strip().casefold()!='false':active_tasks.append(x)
             except ET.ParseError:active_tasks.append(x)
         active_services=[x for x in system.get('services',[]) if x.get('StartMode')!='Disabled' or x.get('State')=='Running']
-        confirmed=[x for x in remaining if not x['kind'].startswith('review_')]
+        confirmed=[x for x in remaining if is_confirmed(x)]
         self.verification={'roots':roots,'remaining_confirmed':confirmed,'review_count':sum(x['kind'].startswith('review_') for x in remaining),'processes':processes,'registry':registry,'active_tasks':active_tasks,'active_services':active_services,'wmi':system.get('wmi',[]),'enabled_worm_firewall_rules':firewall,'new_errors':len(self.errors)-before_errors,'known_family_clear':not (confirmed or processes or registry or active_tasks or active_services or system.get('wmi',[]) or firewall or len(self.errors)>before_errors or self.cancel.is_set()),'coverage':'USB, research paths, and inaccessible locations excluded; no universal clean certification'}
         self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.errors and not self.inspection_failed
         self.verification['unverified_links']=[r for r in getattr(self,'reparse_points',[]) if r.get('status') in ('unverified','error','pending')]
         self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.verification['unverified_links']
         self.verification['coverage']='Selected mounted volumes only; exclusions, reparse points, archives, offline hives and other malware families are not certified.'
         self.verification['skipped_count']=len(self.skipped)
+        self.verification['informational_count']=sum(x['kind'].startswith('info_') for x in remaining)
+        self.verification['unresolved_review_count']=self.verification['review_count']
+        self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.verification['review_count']
         self.verification['assessment']='未检出已知威胁，检测覆盖范围存在限制。' if self.verification['known_family_clear'] else '存在未解决项目或未完成检查，不能判定清理完成。'
         self.verification['unverified_areas']=['压缩档内部文件','离线用户配置单元','未分配盘符或未挂载的卷','排除目录与未解析或范围外的链接目标','未识别的恶意软件家族']
         self.log('verification_complete',result=self.verification);self.save();return self.verification
@@ -960,7 +967,7 @@ def cli_main():
     else:cleaner.scan(scope['roots'],workers=args.workers)
     if args.clean:cleaner.repair();cleaner.verify()
     failed=bool(cleaner.errors or cleaner.cancel.is_set() or cleaner.inspection_failed or any(x.get('status') in ('unverified','error','pending') for x in getattr(cleaner,'reparse_points',[])) or args.clean and not (cleaner.verification or {}).get('known_family_clear'))
-    status=1 if failed else 2 if any(not x['kind'].startswith('review_') for x in cleaner.findings) else 0
+    status=1 if failed else 2 if any(is_confirmed(x) for x in cleaner.findings) else 3 if any(x['kind'].startswith('review_') for x in cleaner.findings) else 0
     print(json.dumps({'report':str(cleaner.run/'report.json'),'files':cleaner.count,'findings':dict(collections.Counter(x['kind'] for x in cleaner.findings)),'errors':len(cleaner.errors),'skipped':len(cleaner.skipped),'exit_code':status},ensure_ascii=False))
     return status
 

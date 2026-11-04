@@ -7,6 +7,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from office_triage import is_confirmed
 
 BG='#F3F6FA'
 NAV='#101C30'
@@ -19,7 +20,7 @@ LABELS={
     'infected_office':'Excel 宏感染', 'infected_executable':'程序被包裹',
     'malicious_shortcut':'恶意快捷方式', 'worm_payload':'病毒载荷',
     'worm_script':'恶意 AutoIt 脚本', 'worm_runtime':'病毒缓存',
-    'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'宏文件待核查',
+    'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'宏文件未确认', 'info_office':'已核对的 Office 组件',
     'review_autoit':'脚本待核查'}
 
 
@@ -169,7 +170,7 @@ class ModernWindow:
         self.panel_title=self.label(toolbar,'扫描结果',font=(FONT,11,'bold'))
         self.panel_title.pack(side='left')
         self.filters={}
-        for key,title in [('review','待核查'),('confirmed','确认感染'),('all','全部')]:
+        for key,title in [('info','组件说明'),('review','需进一步检查'),('confirmed','确认感染'),('all','全部')]:
             b=tk.Button(toolbar,text=title,command=lambda k=key:self.select_filter(k),bg='white',fg=MUTED,
                         activebackground='#E9F3F4',activeforeground=ACCENT,relief='flat',bd=0,padx=10,pady=3,cursor='hand2')
             b.pack(side='right',padx=2)
@@ -191,12 +192,13 @@ class ModernWindow:
         self.tree.pack(fill='both',expand=True)
         self.tree.tag_configure('review',foreground='#927020')
         self.tree.tag_configure('confirmed',foreground='#AA453B')
+        self.tree.tag_configure('info',foreground='#267268')
         self.tree.bind('<<TreeviewSelect>>',self.selected)
         self.empty=self.label(self.tree,'等待开始检测\n确认感染、待核查项会分别列出',fg=MUTED,font=(FONT,10),justify='center')
         self.empty.place(relx=.5,rely=.5,anchor='center')
         self.selected_path=tk.StringVar(value='选择结果可查看完整路径。')
         tk.Label(self.results_frame,textvariable=self.selected_path,bg='#F8FAFC',fg=MUTED,
-                 anchor='w',padx=14,pady=8,font=(FONT,8)).pack(fill='x')
+                 anchor='w',justify='left',wraplength=820,padx=14,pady=8,font=(FONT,8)).pack(fill='x')
         self.log_frame=tk.Frame(self.body,bg='white')
         self.log=tk.Text(self.log_frame,wrap='word',relief='flat',bd=0,bg='white',fg='#43536A',
                          insertbackground=ACCENT,font=('Consolas',9),padx=16,pady=10,state='disabled')
@@ -238,7 +240,7 @@ class ModernWindow:
         for b in self.filters.values():
             if name=='log':b.pack_forget()
         if name!='log':
-            for key in ('review','confirmed','all'):self.filters[key].pack(side='right',padx=2)
+            for key in ('info','review','confirmed','all'):self.filters[key].pack(side='right',padx=2)
 
     def select_filter(self,key):
         self.filter=key
@@ -255,7 +257,12 @@ class ModernWindow:
 
     def selected(self,*_):
         selected=self.tree.selection()
-        if selected:self.selected_path.set(self.tree.item(selected[0],'values')[2])
+        if selected:
+            record=self.result_records[int(selected[0])]
+            text=record['path']
+            for key in ('reason','action','assessment_limit'):
+                if record.get(key):text+='\n'+record[key]
+            self.selected_path.set(text)
 
     def set_busy(self,busy):
         self.busy=busy
@@ -268,7 +275,7 @@ class ModernWindow:
 
     def has_confirmed(self):
         if not self.cleaner:return False
-        if any(not r['kind'].startswith('review_') for r in self.cleaner.findings):return True
+        if any(is_confirmed(r) for r in self.cleaner.findings):return True
         for event in self.cleaner.events:
             if event['kind']=='process_inspection' and event.get('processes'):return True
             if event['kind']=='registry_inspection' and event.get('hits'):return True
@@ -326,7 +333,7 @@ class ModernWindow:
         if not c:return
         findings=list(c.findings)
         self.metrics['files'].set(format(c.count,','))
-        self.metrics['confirmed'].set(str(sum(not x['kind'].startswith('review_') for x in findings)))
+        self.metrics['confirmed'].set(str(sum(is_confirmed(x) for x in findings)))
         self.metrics['review'].set(str(sum(x['kind'].startswith('review_') for x in findings)))
         restored=sum(e['kind'] in ('office_recovered','executable_recovered') for e in list(c.events))
         self.metrics['restored'].set(str(restored))
@@ -337,11 +344,13 @@ class ModernWindow:
         visible=0
         for i,r in enumerate(self.result_records):
             review=r['kind'].startswith('review_')
-            if self.filter=='review' and not review or self.filter=='confirmed' and review:continue
-            state=('解析失败' if r.get('analysis_error') else '保留待核查') if review else '待修复'
+            informational=r['kind'].startswith('info_')
+            if self.filter=='review' and not review or self.filter=='confirmed' and not is_confirmed(r) or self.filter=='info' and not informational:continue
+            state='保留，无需处理' if informational else ('解析失败' if r.get('analysis_error') else '未确认感染') if review else '待修复'
             category=LABELS.get(r['kind'],r['kind'])
             if review and r.get('reason'):category+='：'+r['reason']
-            self.tree.insert('',tk.END,iid=str(i),values=(state,category,r['path']),tags=('review' if review else 'confirmed',))
+            if informational:category=r.get('component',category)
+            self.tree.insert('',tk.END,iid=str(i),values=(state,category,r['path']),tags=('info' if informational else 'review' if review else 'confirmed',))
             visible+=1
         if visible:self.empty.place_forget()
         else:
@@ -369,15 +378,17 @@ class ModernWindow:
                     self.render_results()
                     self.set_busy(False)
                     self.report_button.configure(state='normal')
-                    confirmed=sum(not r['kind'].startswith('review_') for r in c.findings)
+                    confirmed=sum(is_confirmed(r) for r in c.findings)
+                    review_count=sum(r['kind'].startswith('review_') for r in c.findings)
+                    info_count=sum(r['kind'].startswith('info_') for r in c.findings)
                     if c.cancel.is_set():self.status.set('已停止');self.detail.set('已完成的文件事务已保存；重新扫描后再修复。')
                     elif payload=='scan':
                         self.status.set('检测完成')
-                        self.detail.set('确认感染 %s 项，待核查 %s 项，异常记录 %s 项。'%(confirmed,len(c.findings)-confirmed,len(c.errors)))
+                        self.detail.set('确认感染 %s 项，未确认文件 %s 项，已核对组件 %s 项，检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     else:
                         complete=(getattr(c,'verification',None) or {}).get('known_family_clear',False)
-                        self.status.set('修复与复核完成' if complete else '修复完成，存在待处理项目')
-                        self.detail.set('确认残留 %s 项；异常记录 %s 项。请查阅报告中的检测范围与处理结论。'%(confirmed,len(c.errors)))
+                        self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
+                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；已核对组件 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     self.append_log('报告：'+str(c.run/'report.json'))
         except queue.Empty:pass
         self.update_metrics()

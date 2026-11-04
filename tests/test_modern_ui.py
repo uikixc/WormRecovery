@@ -56,7 +56,7 @@ class ModernUITests(unittest.TestCase):
         self.assertNotIn('disabled',a.clean_button.state())
         a.select_filter('review')
         self.assertEqual(len(a.tree.get_children()),1)
-        self.assertEqual(a.tree.item(a.tree.get_children()[0],'values')[0],'保留待核查')
+        self.assertEqual(a.tree.item(a.tree.get_children()[0],'values')[0],'未确认感染')
         with patch.object(modern_ui.messagebox,'askokcancel',return_value=True),patch.object(modern_ui.ctypes.windll.shell32,'IsUserAnAdmin',return_value=True):
             a.launch('clean');self.wait()
         self.assertEqual(a.metrics['restored'].get(),'1')
@@ -108,6 +108,19 @@ class ModernUITests(unittest.TestCase):
         values=self.app.tree.item(self.app.tree.get_children()[0],'values')
         self.assertEqual(values[0],'解析失败')
         self.assertIn('测试异常',values[1])
+    def test_component_has_separate_filter_and_action_without_repair(self):
+        c=FakeCleaner(emit=lambda s:None)
+        item={'kind':'info_office','path':'C:/Office/SOLVER.XLAM','component':'规划求解加载项','reason':'已核对组件','action':'保留，无需删除。'}
+        c.findings=[item];self.app.cleaner=c;self.app.result_records=[item]
+        self.app.update_metrics()
+        self.assertEqual(self.app.metrics['confirmed'].get(),'0')
+        self.assertEqual(self.app.metrics['review'].get(),'0')
+        self.assertFalse(self.app.has_confirmed())
+        self.app.select_filter('review');self.assertEqual(len(self.app.tree.get_children()),0)
+        self.app.select_filter('info');self.assertEqual(len(self.app.tree.get_children()),1)
+        self.assertEqual(self.app.tree.item('0','values')[0],'保留，无需处理')
+        self.app.tree.selection_set('0');self.app.selected()
+        self.assertIn('无需删除',self.app.selected_path.get())
     def test_live_progress_shows_current_path_and_file_rate(self):
         c=FakeCleaner(emit=lambda s:None)
         c.count=500;c.scan_active=True;c.scan_started=time.monotonic()-5

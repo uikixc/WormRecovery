@@ -17,6 +17,8 @@ class CLIStatusTests(unittest.TestCase):
     def test_incomplete_scan_returns_failure(self):self.assertEqual(self.run_case(errors=[{'error':'access denied'}]),1)
     def test_detected_threat_returns_attention_code(self):self.assertEqual(self.run_case(findings=[{'kind':'worm_payload'}]),2)
     def test_completed_scan_returns_zero(self):self.assertEqual(self.run_case(),0)
+    def test_informational_components_are_not_reported_as_infection(self):self.assertEqual(self.run_case(findings=[{'kind':'info_office'}]),0)
+    def test_unknown_macros_return_distinct_review_status(self):self.assertEqual(self.run_case(findings=[{'kind':'review_office'}]),3)
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

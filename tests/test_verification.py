@@ -35,6 +35,15 @@ class VerificationTests(unittest.TestCase):
     def test_active_process_blocks_completion(self):
         c=self.cleaner();c.contain=lambda apply:[{'pid':123,'family':'test'}]
         self.assertFalse(c.verify()['known_family_clear'])
+    def test_informational_components_do_not_block_family_verification(self):
+        c=self.cleaner();c.scan=lambda roots:[{'kind':'info_office','path':'C:/Office/SOLVER.XLAM'}]
+        result=c.verify()
+        self.assertTrue(result['known_family_clear']);self.assertEqual(result['informational_count'],1)
+        self.assertEqual(result['remaining_confirmed'],[])
+    def test_unknown_macro_prevents_completed_verification(self):
+        c=self.cleaner();c.scan=lambda roots:[{'kind':'review_office','path':'C:/unknown.xlsm'}]
+        result=c.verify()
+        self.assertFalse(result['known_family_clear']);self.assertEqual(result['unresolved_review_count'],1)
     def test_stop_does_not_report_clean(self):
         c=self.cleaner();c.cancel.set()
         self.assertFalse(c.verify()['known_family_clear'])
