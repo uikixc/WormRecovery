@@ -8,11 +8,12 @@ import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 
 from tests.test_secondary_engines import write_xlm_fixture
 
 
-def validate(executable, output):
+def validate(executable, output, vba_fixture=None):
     with tempfile.TemporaryDirectory(prefix='WormRecoveryPortable-') as temp:
         root = Path(temp)
         program, inputs, reports = (root / name for name in ('program', 'inputs', 'reports'))
@@ -26,6 +27,15 @@ def validate(executable, output):
         shutil.copy2('C:/Windows/System32/where.exe', binary)
         with binary.open('ab') as stream:
             stream.write(b'\nSynaptics ~$cache1 RegKeySave Workbook_Open\n')
+        if vba_fixture:
+            # Preserve only a caller-selected, nonexecuted VBA project inside a
+            # private test container. No Office application opens this file.
+            with zipfile.ZipFile(vba_fixture) as archive:
+                project=archive.read('xl/vbaProject.bin')
+            with zipfile.ZipFile(inputs/'static-vba-regression.xlsm','w') as archive:
+                archive.writestr('[Content_Types].xml','<Types/>')
+                archive.writestr('xl/workbook.xml','<workbook/>')
+                archive.writestr('xl/vbaProject.bin',project)
         before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs.iterdir()}
         env = os.environ.copy()
         for key in ('WORMRECOVERY_ENGINE_ROOT', 'PYTHONPATH', 'PYTHONHOME'):
@@ -46,7 +56,7 @@ def validate(executable, output):
         autoit = findings.get('inert-unknown.a3x', {}).get('secondary_analysis', {})
         checks = {'single_exe_only': sorted(p.name for p in program.iterdir()) == ['WormRecovery.exe'],
                   'originals_unchanged': before == after,
-                  'version': scan['version'] == '1.4.0',
+                  'version': scan['version'] == __import__('worm_recovery').VERSION,
                   'clamav_ran': all(row.get('secondary_analysis', {}).get('clamav', {}).get('status') == 'no_match' for row in findings.values()),
                   'xlm_ran': xlm.get('xlm', {}).get('status') == 'analyzed',
                   'capa_ran': pe.get('capa', {}).get('status') == 'analyzed',
@@ -55,6 +65,9 @@ def validate(executable, output):
                   'unknowns_preserved': all(row['kind'].startswith('review_') for row in findings.values()),
                   'no_scan_errors': not scan['errors'],
                   'uncompleted_is_failure': scan['inspection_failed'] and result.returncode == 1}
+        if vba_fixture:
+            macro=findings.get('static-vba-regression.xlsm',{})
+            checks['real_vba_json_transport']=not macro.get('analysis_error') and macro.get('macro_analysis',{}).get('pcode_status')=='instructions_read'
         record = {'passed': all(checks.values()), 'checks': checks,
                   'elapsed_seconds': round(time.monotonic() - started, 2), 'exit_code': result.returncode,
                   'source_exe': str(Path(executable).resolve()), 'exe_bytes': portable.stat().st_size,
@@ -68,5 +81,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--exe', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--vba-fixture', help='Optional caller-selected known benign OOXML VBA fixture')
     args = parser.parse_args()
-    raise SystemExit(validate(args.exe, args.output))
+    raise SystemExit(validate(args.exe, args.output, args.vba_fixture))

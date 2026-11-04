@@ -31,4 +31,12 @@ def subprocess_environment():
     environment = os.environ.copy()
     environment['WORMRECOVERY_ENGINE_ROOT'] = str(engine_root())
     environment['PYTHONIOENCODING'] = 'utf-8'
+    work_root = environment.get('WORMRECOVERY_WORK_ROOT')
+    if not work_root and getattr(sys, '_MEIPASS', None):
+        work_root = str(Path(sys._MEIPASS) / 'worker-temp')
+    if work_root:
+        Path(work_root).mkdir(parents=True, exist_ok=True)
+        environment['WORMRECOVERY_WORK_ROOT'] = work_root
+        environment['TEMP'] = work_root
+        environment['TMP'] = work_root
     return environment

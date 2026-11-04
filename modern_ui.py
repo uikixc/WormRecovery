@@ -274,12 +274,12 @@ class ModernWindow:
                 if record.get(key):text+='\n'+record[key]
             secondary=record.get('secondary_analysis',{})
             if secondary:
-                names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA'}
+                names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA','office_parser':'Office 解析'}
                 statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持'}
                 text+='\n离线复核：'+'；'.join(names[k]+' '+statuses.get(v.get('status'), '已执行规则检查') for k,v in secondary.items() if k in names and isinstance(v,dict))
                 if secondary.get('clamav',{}).get('detections'):text+='\n检出名称：'+'、'.join(secondary['clamav']['detections'])
                 if record.get('analysis_incomplete_engines'):text+='\n未完成引擎：'+ '、'.join(record['analysis_incomplete_engines'])
-                for key in ('autoit','xlm','capa','rea'):
+                for key in ('office_parser','autoit','xlm','capa','rea'):
                     result=secondary.get(key,{})
                     if result.get('reason'):text+='\n'+names[key]+'：'+result['reason'][:220]
             self.selected_path.set(text)

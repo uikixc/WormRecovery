@@ -5,9 +5,20 @@ import unittest
 from unittest.mock import patch
 
 import bundled_components as bundle
+import engine_assets
 
 
 class BundledComponentTests(unittest.TestCase):
+    def test_nested_worker_temp_is_contained_in_parent_work_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(bundle.sys, '_MEIPASS', temp, create=True), patch.dict(engine_assets.os.environ, {}, clear=True):
+                environment=engine_assets.subprocess_environment()
+            expected=str(Path(temp)/'worker-temp')
+            self.assertEqual(environment['TEMP'],expected)
+            self.assertEqual(environment['TMP'],expected)
+            self.assertEqual(environment['WORMRECOVERY_WORK_ROOT'],expected)
+            self.assertTrue(Path(expected).is_dir())
+
     def test_embedded_component_takes_priority_over_sibling(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

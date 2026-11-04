@@ -1,5 +1,7 @@
 """Offline analysis regressions; synthetic packages and mocked content only."""
 import hashlib
+import base64
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -111,6 +113,33 @@ class OfficeActiveContentTests(unittest.TestCase):
 
 
 class AnalysisTransportTests(unittest.TestCase):
+    def test_import_notices_cannot_corrupt_json_transport(self):
+        incoming = SimpleNamespace(buffer=io.BytesIO(base64.b64encode(b'inert fixture')))
+        outgoing = SimpleNamespace(buffer=io.BytesIO())
+        def inspect(data):
+            print('Optional dependency is unavailable; static mode continues.')
+            print('Diagnostic from stderr', file=analysis.sys.stderr)
+            return {'modules': ['inert'], 'pcode_status': 'instructions_read'}
+        with patch.object(analysis.sys, 'stdin', incoming), patch.object(analysis.sys, 'stdout', outgoing), patch.object(analysis, 'inspect_project', side_effect=inspect):
+            self.assertEqual(analysis.worker_main(), 0)
+        response = json.loads(outgoing.buffer.getvalue().decode('utf-8'))
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['result']['pcode_status'], 'instructions_read')
+        self.assertIn('Optional dependency', response['parser_diagnostics'])
+        self.assertIn('Diagnostic from stderr', response['parser_diagnostics'])
+
+    def test_import_notice_on_parser_failure_is_still_valid_json(self):
+        incoming = SimpleNamespace(buffer=io.BytesIO(base64.b64encode(b'inert invalid')))
+        outgoing = SimpleNamespace(buffer=io.BytesIO())
+        def inspect(data):
+            print('Optional parser startup notice')
+            raise ValueError('inert malformed project')
+        with patch.object(analysis.sys, 'stdin', incoming), patch.object(analysis.sys, 'stdout', outgoing), patch.object(analysis, 'inspect_project', side_effect=inspect):
+            analysis.worker_main()
+        response = json.loads(outgoing.buffer.getvalue().decode('utf-8'))
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error'], 'inert malformed project')
+
     def test_graphical_build_uses_companion_with_pipes(self):
         response = {'ok': True, 'result': {'family_modules': [], 'other_modules': []}}
         data = b'isolated graphical transport fixture'

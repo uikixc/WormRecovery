@@ -136,16 +136,22 @@ def analyze_project(data, timeout=ANALYSIS_TIMEOUT):
 
 def worker_main():
     """Private transport for VBA bytes or a selected static-parser task."""
+    diagnostics = LimitedText(65536)
     try:
         encoded = sys.stdin.buffer.read((MAX_PROJECT_BYTES * 4 // 3) + 8)
-        if encoded.startswith(b'{'):
-            from secondary_analysis import worker_request
-            response = {'ok': True, 'result': worker_request(json.loads(encoded.decode('utf-8')))}
-        else:
-            data = base64.b64decode(encoded, validate=True)
-            response = {'ok': True, 'result': inspect_project(data)}
+        # Optional parsers print import notices. Keep stdout JSON-only for all
+        # imports and parsing, including the VBA path that loads XLM support.
+        with contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
+            if encoded.startswith(b'{'):
+                from secondary_analysis import worker_request
+                response = {'ok': True, 'result': worker_request(json.loads(encoded.decode('utf-8')))}
+            else:
+                data = base64.b64decode(encoded, validate=True)
+                response = {'ok': True, 'result': inspect_project(data)}
     except Exception as ex:
         response = {'ok': False, 'error': str(ex)[:1200]}
+    if diagnostics.getvalue():
+        response['parser_diagnostics'] = diagnostics.getvalue()[:4096]
     sys.stdout.buffer.write(json.dumps(response, ensure_ascii=False).encode('utf-8'))
     sys.stdout.buffer.flush()
     return 0

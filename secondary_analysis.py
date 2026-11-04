@@ -235,6 +235,9 @@ def enrich_reviews(cleaner):
                 break
             cleaner.emit('正在复核：' + str(row['path']))
             evidence = {'clamav': clam.get(str(snapshot), {'status': 'incomplete'}), 'database': database}
+            if row.get('kind') == 'review_office':
+                evidence['office_parser'] = {'status': 'incomplete' if row.get('analysis_error') else 'analyzed',
+                    'reason': row.get('reason') if row.get('analysis_error') else None}
             try:
                 evidence['yara_x'] = __import__('local_rules').scan_bytes(snapshot.read_bytes())
             except Exception as ex:

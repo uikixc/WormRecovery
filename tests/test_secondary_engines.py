@@ -132,6 +132,24 @@ class EngineResultTests(unittest.TestCase):
             self.assertEqual(document.read_bytes(), original)
             self.assertFalse(any(root.glob('engine-review-*')))
 
+    def test_clam_no_match_does_not_hide_office_parser_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            document = root / 'inert-invalid.xlsm'
+            document.write_bytes(b'inert malformed document')
+            row = {'kind': 'review_office', 'path': str(document), 'reason': 'parser failure', 'analysis_error': True}
+            cleaner = SimpleNamespace(findings=[row], cancel=threading.Event(), run=root,
+                policy=SimpleNamespace(check=lambda _: None), protected_path=lambda _: False,
+                emit=lambda _: None, log=lambda *a, **kw: None, error=lambda *a: None,
+                inspection_failed=False)
+            def scan(paths, work, **kwargs):
+                return {str(p): {'status': 'no_match', 'detections': []} for p in paths}, {}
+            with patch.object(engines, 'clam_batch', side_effect=scan):
+                engines.enrich_reviews(cleaner)
+            self.assertEqual(row['secondary_analysis']['status'], 'incomplete')
+            self.assertIn('office_parser', row['analysis_incomplete_engines'])
+            self.assertTrue(cleaner.inspection_failed)
+
 
 if __name__ == '__main__':
     unittest.main()

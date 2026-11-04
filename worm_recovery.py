@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -412,6 +412,7 @@ class Cleaner:
         tool_scope=pathlib.Path(sys.executable) if getattr(sys,'frozen',False) else HERE
         self.protected=[tool_scope,self.run.parent,*map(pathlib.Path,protected)]
         if getattr(sys,'_MEIPASS',None):self.protected.append(pathlib.Path(sys._MEIPASS))
+        if os.environ.get('WORMRECOVERY_WORK_ROOT'):self.protected.append(pathlib.Path(os.environ['WORMRECOVERY_WORK_ROOT']))
         from engine_assets import engine_root
         self.protected.append(engine_root())
         self.cancel=threading.Event();self.count=0;self.dircount=0;self.scanned_office=0;self.started=time.monotonic()
@@ -707,7 +708,7 @@ class Cleaner:
             if key in files_seen:return 'target_already_checked'
             files_seen.add(key);self.current_path=path
             name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
-            if ext not in EXE_EXTS|OFFICE_EXTS|{'.a3x','.lnk'} and not name.startswith(('~$cache','._cache_')):
+            if ext not in EXE_EXTS|OFFICE_EXTS|{'.a3x','.lnk','.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf'} and not name.startswith(('~$cache','._cache_')):
                 accept_file(path,{'office':0,'findings':[]},None);return 'target_checked'
             root=directory_volumes.get(norm(os.path.dirname(path)))
             if root is None:root=self.policy.check(path)['root']

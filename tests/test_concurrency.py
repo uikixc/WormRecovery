@@ -74,6 +74,20 @@ class ConcurrentQueueTests(unittest.TestCase):
 
 
 class ScannerEquivalenceTests(unittest.TestCase):
+    def test_script_extensions_reach_content_detector_through_full_scan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)/'scan';root.mkdir()
+            for extension in ('.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf'):
+                (root/('inert'+extension)).write_bytes(b'AutoIt3ExecuteScript GoogleChrome.a3x cmd.exe')
+            c=w.Cleaner(emit=lambda _:None)
+            def enrich(cleaner):
+                self.assertEqual(len(cleaner.findings),7)
+            with patch('secondary_analysis.enrich_reviews',side_effect=enrich):
+                c.scan([str(root)],workers=2)
+            self.assertEqual(c.errors,[])
+            self.assertEqual({Path(row['path']).suffix for row in c.findings},{'.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf'})
+            self.assertTrue(all(row['kind']=='review_script' for row in c.findings))
+
     def test_serial_and_parallel_detection_match_without_file_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)/'scan';root.mkdir();fixture=b'Inert hash fixture; not executable'
