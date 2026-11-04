@@ -1,0 +1,815 @@
+"""Evidence-based local repair for the observed AutoIt/Synaptics outbreak.
+
+Never executes specimens or contacts their endpoints. Selected device volumes
+are validated before changes; Office repair never starts Office applications.
+"""
+from __future__ import annotations
+import argparse, base64, collections, copy, ctypes, datetime, hashlib, io, json
+import os, pathlib, re, shutil, struct, subprocess, sys, tempfile, threading
+import time, uuid, winreg, zipfile, xml.etree.ElementTree as ET
+from ctypes import wintypes as W
+import psutil
+
+VERSION = '1.3.1'
+STUB_CODE_SHA256 = '9251b16208e38d5de48130230d5f51036c979843ac33bc52cd31c298dd9cb105'
+AUTOIT_A3X_SHA256 = '6cb8bd1ec21353f2a48f0f37c4125ebd04023153f70a00ceaf9787dd035868fa'
+AUTOIT_EXE_SHA256 = 'fb73a819b37523126c7708a1d06f3b8825fa60c926154ab2d511ba668f49dc4b'
+HOOK_SHA256 = 'b9eae90f8e942cc4586d31dc484f29079651ad64c49f90d99f86932630c66af2'
+BAD_VBA_HASHES = {
+    '177b0f70870d9a5874044ea4eb7985c4ece470be5bb5e4680c58d4fb329ef732',
+    '4fef3df248f7d18a419883b4999f9d592df705460e7559c0168847de72ff43d7'}
+EXE_EXTS = {'.exe', '.dll', '.scr', '.cpl', '.com', '.ocx', '.sys'}
+OFFICE_EXTS = {'.xlsx','.xlsm','.xlam','.xlsb','.xltm','.docx','.docm','.dotm','.pptx','.pptm','.ppam','.xls','.doc','.ppt'}
+CRITICAL_PROCESSES = {'system','registry','smss.exe','csrss.exe','wininit.exe','winlogon.exe',
+    'services.exe','lsass.exe','svchost.exe','msmpeng.exe','mssense.exe','codex.exe','openai.exe'}
+HERE = pathlib.Path(sys.executable if getattr(sys,'frozen',False) else __file__).resolve().parent
+kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+kernel.GetCurrentProcess.argtypes=[];kernel.GetCurrentProcess.restype=W.HANDLE
+kernel.GetFileAttributesW.argtypes=[W.LPCWSTR];kernel.GetFileAttributesW.restype=W.DWORD
+kernel.SetFileAttributesW.argtypes=[W.LPCWSTR,W.DWORD];kernel.SetFileAttributesW.restype=W.BOOL
+kernel.GetDriveTypeW.argtypes=[W.LPCWSTR];kernel.GetDriveTypeW.restype=W.UINT
+kernel.GetVolumePathNameW.argtypes=[W.LPCWSTR,W.LPWSTR,W.DWORD];kernel.GetVolumePathNameW.restype=W.BOOL
+kernel.CreateFileW.argtypes=[W.LPCWSTR,W.DWORD,W.DWORD,ctypes.c_void_p,W.DWORD,W.DWORD,W.HANDLE]
+kernel.CreateFileW.restype=W.HANDLE
+kernel.DeviceIoControl.argtypes=[W.HANDLE,W.DWORD,ctypes.c_void_p,W.DWORD,ctypes.c_void_p,W.DWORD,ctypes.POINTER(W.DWORD),ctypes.c_void_p]
+kernel.DeviceIoControl.restype=W.BOOL
+kernel.CloseHandle.argtypes=[W.HANDLE]
+kernel.GetVolumeNameForVolumeMountPointW.argtypes=[W.LPCWSTR,W.LPWSTR,W.DWORD]
+kernel.GetVolumeNameForVolumeMountPointW.restype=W.BOOL
+kernel.ReplaceFileW.argtypes=[W.LPCWSTR,W.LPCWSTR,W.LPCWSTR,W.DWORD,ctypes.c_void_p,ctypes.c_void_p]
+kernel.ReplaceFileW.restype=W.BOOL
+
+def digest_file(path):
+    h=hashlib.sha256()
+    with open(path,'rb') as f:
+        while b:=f.read(4*1024*1024):h.update(b)
+    return h.hexdigest()
+
+def json_save(path,value):
+    pathlib.Path(path).write_text(json.dumps(value,ensure_ascii=False,indent=2),encoding='utf-8')
+
+def norm(path):return os.path.normcase(os.path.abspath(path)).rstrip('\\/')
+def beneath(path,root):return norm(path)==norm(root) or norm(path).startswith(norm(root)+os.sep)
+
+def file_attributes(path):
+    a=kernel.GetFileAttributesW(str(path))
+    if a==0xffffffff:raise ctypes.WinError(ctypes.get_last_error())
+    return a
+
+def volume(path):
+    buf=ctypes.create_unicode_buffer(32768)
+    if not kernel.GetVolumePathNameW(os.path.abspath(path),buf,len(buf)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buf.value
+
+def storage_info(root):
+    """Reject fixed-type USB enclosures as well as DRIVE_REMOVABLE sticks."""
+    device='\\\\.\\'+root[:2]
+    h=kernel.CreateFileW(device,0,3,None,3,0,None)
+    if h==ctypes.c_void_p(-1).value:return {'bus':None,'removable':None}
+    try:
+        query=ctypes.create_string_buffer(12);answer=ctypes.create_string_buffer(4096);n=W.DWORD()
+        if kernel.DeviceIoControl(h,0x2d1400,query,len(query),answer,len(answer),ctypes.byref(n),None) and n.value>=36:
+            return {'bus':struct.unpack_from('<I',answer.raw,28)[0], 'removable':bool(answer.raw[10])}
+        return {'bus':None,'removable':None}
+    finally:kernel.CloseHandle(h)
+
+def volume_identity(root):
+    buf=ctypes.create_unicode_buffer(1024)
+    if not kernel.GetVolumeNameForVolumeMountPointW(root,buf,len(buf)):raise ctypes.WinError(ctypes.get_last_error())
+    return buf.value.casefold()
+
+class VolumePolicy:
+    def __init__(self,external_volumes=None,excluded_roots=()):
+        self.cache={}
+        self.external_volumes={norm(k):v.casefold() for k,v in (external_volumes or {}).items()}
+        self.excluded_roots={norm(k) for k in excluded_roots}
+    def check(self,path):
+        root=volume(path)
+        if norm(root) in self.excluded_roots:raise PermissionError('该卷已列入本机排除列表。')
+        if root not in self.cache:
+            kind=kernel.GetDriveTypeW(root); info=storage_info(root) if kind in (2,3) else {'bus':None,'removable':None}
+            # Unknown buses are permitted only for a fixed system volume.
+            allowed=kind==3 and info['bus'] not in (7,12,13) and info['removable'] is not True
+            if info['bus'] is None and root[:2].lower()!=os.environ.get('SystemDrive','C:').lower():allowed=False
+            if norm(root) in self.external_volumes:
+                allowed=kind in (2,3) and volume_identity(root)==self.external_volumes[norm(root)]
+            self.cache[root]={'root':root,'drive_type':kind,**info,'allowed':allowed}
+        if norm(root) in self.external_volumes and volume_identity(root)!=self.external_volumes[norm(root)]:
+            raise PermissionError('设备连接状态已变化。请重新扫描。')
+        if not self.cache[root]['allowed']:raise PermissionError('该卷不在本次可处理范围内：'+root)
+        return self.cache[root]
+    def fixed_roots(self):
+        result=[]
+        for i in range(26):
+            root=chr(65+i)+':\\'
+            if kernel.GetDriveTypeW(root)==3:
+                try:self.check(root);result.append(root)
+                except OSError:pass
+        return result
+    def mutation(self,path):
+        self.check(path)
+        p=pathlib.Path(os.path.abspath(path))
+        for part in [p,*p.parents]:
+            if part.exists() and file_attributes(part)&0x400:
+                raise PermissionError('拒绝通过重解析点改动文件: '+str(part))
+
+class PEView:
+    """Small read-only PE header/resource reader; streams large original payloads."""
+    def __init__(self,path):
+        self.path=pathlib.Path(path); self.f=open(path,'rb');self.size=os.fstat(self.f.fileno()).st_size
+        try:
+            h=self.read(0,64)
+            if h[:2]!=b'MZ':raise ValueError('not PE')
+            peoff=struct.unpack_from('<I',h,60)[0]
+            if peoff<64 or peoff>1024*1024:raise ValueError('invalid PE offset')
+            h=self.read(peoff,24)
+            if h[:4]!=bytes.fromhex('50450000'):raise ValueError('not PE')
+            self.machine,self.n=struct.unpack_from('<HH',h,4);optlen=struct.unpack_from('<H',h,20)[0]
+            if not 1<=self.n<=96 or not 96<=optlen<=4096:raise ValueError('invalid PE headers')
+            opt=self.read(peoff+24,optlen);self.magic=struct.unpack_from('<H',opt)[0]
+            self.entry=struct.unpack_from('<I',opt,16)[0]
+            self.headers_size=struct.unpack_from('<I',opt,60)[0]
+            diroff=96 if self.magic==0x10b else 112 if self.magic==0x20b else -1
+            if diroff<0:raise ValueError('unknown optional header')
+            self.res_rva,self.res_size=struct.unpack_from('<II',opt,diroff+16)
+            sec=self.read(peoff+24+optlen,40*self.n);self.sections=[]
+            for i in range(self.n):
+                s=sec[i*40:i*40+40];vs,va,rs,rp=struct.unpack_from('<IIII',s,8)
+                if rs and rp+rs>self.size:raise ValueError('truncated PE section')
+                self.sections.append((s[:8].rstrip(bytes([0])),vs,va,rs,rp))
+        except BaseException:self.f.close();raise
+    def __enter__(self):return self
+    def __exit__(self,*args):self.f.close()
+    def read(self,offset,n):
+        if offset<0 or n<0 or offset+n>self.size:raise ValueError('PE read outside file')
+        self.f.seek(offset);b=self.f.read(n)
+        if len(b)!=n:raise ValueError('short PE read')
+        return b
+    def rva(self,rva,n=1):
+        if rva<self.headers_size and rva+n<=self.headers_size:return rva
+        for name,vs,va,rs,rp in self.sections:
+            if va<=rva and rva+n<=va+rs:return rp+rva-va
+        raise ValueError('unmapped PE RVA')
+    def known_stub(self):
+        s=self.sections[0]
+        return self.machine==0x14c and self.n==8 and self.entry==0x9ab80 and s[0]==b'CODE' and s[3]==629760 and hashlib.sha256(self.read(s[4],s[3])).hexdigest()==STUB_CODE_SHA256
+    def resource(self,wanted):
+        if not self.res_rva or not self.res_size:return None
+        base=self.rva(self.res_rva);found=[];budget=[0]
+        def rd(off,n):
+            if off<0 or off+n>self.res_size:raise ValueError('resource outside directory')
+            return self.read(base+off,n)
+        def walk(off,parts):
+            budget[0]+=1
+            if budget[0]>4096 or len(parts)>3:raise ValueError('resource tree budget exceeded')
+            h=rd(off,16);a,b=struct.unpack_from('<HH',h,12);entries=rd(off+16,(a+b)*8)
+            for i in range(a+b):
+                key,child=struct.unpack_from('<II',entries,i*8)
+                if key&0x80000000:
+                    z=key&0x7fffffff;length=struct.unpack('<H',rd(z,2))[0]
+                    if length>256:raise ValueError('resource name too long')
+                    name=rd(z+2,length*2).decode('utf-16le')
+                else:name=str(key)
+                seq=parts+[name]
+                if child&0x80000000:walk(child&0x7fffffff,seq)
+                else:
+                    addr,size,cp,res=struct.unpack('<IIII',rd(child,16));fo=self.rva(addr,size)
+                    if wanted in seq:found.append((fo,size,seq))
+        walk(0,[])
+        if len(found)>1:raise ValueError('ambiguous original resource')
+        return found[0] if found else None
+    def extract_resource(self,res,dest):
+        offset,size,_=res;self.f.seek(offset);remaining=size
+        with open(dest,'xb') as out:
+            while remaining:
+                b=self.f.read(min(4*1024*1024,remaining))
+                if not b:raise ValueError('truncated embedded original')
+                out.write(b);remaining-=len(b)
+            out.flush();os.fsync(out.fileno())
+
+def is_stub(path,strict=False):
+    try:
+        with open(path,'rb') as f:
+            h=f.read(4096)
+            if len(h)<64 or h[:2]!=b'MZ':return False
+            off=struct.unpack_from('<I',h,60)[0]
+            if off>1024*1024:return False
+            f.seek(off);h=f.read(512)
+            if h[:4]!=bytes.fromhex('50450000') or len(h)<256:return False
+            if struct.unpack_from('<H',h,4)[0]!=0x14c or struct.unpack_from('<H',h,6)[0]!=8 or struct.unpack_from('<I',h,40)[0]!=0x9ab80:return False
+        with PEView(path) as pe:return pe.known_stub()
+    except OSError:
+        if strict:raise
+        return False
+    except (ValueError,struct.error):return False
+
+def shortcut(path):
+    b=pathlib.Path(path).read_bytes()
+    if len(b)<76 or b[:4]!=bytes.fromhex('4c000000') or b[4:20]!=bytes.fromhex('0114020000000000c000000000000046'):return None
+    flags=struct.unpack_from('<I',b,20)[0];pos=76;strings={}
+    if flags&1:
+        n=struct.unpack_from('<H',b,pos)[0];pos+=n+2
+    if flags&2:
+        n=struct.unpack_from('<I',b,pos)[0]
+        if n<28 or pos+n>len(b):raise ValueError('invalid shell link info')
+        strings['link_info']=b[pos:pos+n].decode('utf-16le','ignore')+' '+b[pos:pos+n].decode('latin1','ignore');pos+=n
+    for bit,name in [(4,'name'),(8,'relative'),(16,'working_dir'),(32,'arguments'),(64,'icon')]:
+        if flags&bit:
+            n=struct.unpack_from('<H',b,pos)[0];pos+=2;size=n*(2 if flags&128 else 1)
+            if pos+size>len(b):raise ValueError('truncated shell link')
+            strings[name]=b[pos:pos+size].decode('utf-16le' if flags&128 else 'mbcs','replace');pos+=size
+    text=' '.join(strings.values()).casefold()
+    if 'qmquarantine' in text or '/openquarantine?' in text:return {'malicious':False,'av_placeholder':True,**strings}
+    return {'malicious':('googlechrome.a3x' in text and ('autoit3executescript' in text or 'googlechrome.exe' in text)),**strings}
+
+def office_check(path):
+    p=pathlib.Path(path)
+    try:
+        with zipfile.ZipFile(p) as z:
+            entries=z.infolist()
+            if len(entries)>20000 or sum(x.file_size for x in entries)>1024*1024*1024:return {'status':'review','reason':'文档超过检查资源上限，需进一步核查。'}
+            names=[x.filename for x in entries]
+            if len(set(names))!=len(names):return {'status':'review','reason':'文档包含重复压缩成员，需进一步核查。'}
+            macro=[x for x in entries if x.filename.casefold().endswith('vbaproject.bin')]
+            if not macro:return {'status':'clean','macro':False}
+            if len(macro)!=1 or macro[0].file_size>16*1024*1024:return {'status':'review','reason':'宏项目结构异常，需进一步核查。'}
+            data=z.read(macro[0]);h=hashlib.sha256(data).hexdigest()
+            if h in BAD_VBA_HASHES:
+                if macro[0].filename!='xl/vbaProject.bin' or 'xl/workbook.xml' not in names:return {'status':'review','reason':'已知宏位于非预期文档结构中，需人工核查。'}
+                return {'status':'infected','family':'Synaptics-Excel','vba_hash':h,'vba_part':macro[0].filename}
+            from oletools.olevba import VBA_Parser
+            v=VBA_Parser('vbaProject.bin',data=data);mods=list(v.extract_macros());v.close()
+            matches=[];others=[]
+            for _,stream,name,code in mods:
+                low=code.casefold()
+                bad=all(x in low for x in ('synaptics','~$cache1','regkeysave','workbook_open'))
+                if bad:matches.append(name)
+                elif any(line.strip() and not line.strip().casefold().startswith(('attribute ','option ','private sub','end sub',"'")) for line in code.splitlines()):others.append(name)
+            if matches and not others and macro[0].filename=='xl/vbaProject.bin':return {'status':'infected','family':'Synaptics-Excel','vba_hash':h,'vba_part':macro[0].filename}
+            return {'status':'review','reason':'未识别或合法宏已保留，需进一步核查。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h}
+    except zipfile.BadZipFile:
+        if p.name.startswith('~$'):return {'status':'lock_file'}
+        try:
+            from oletools.olevba import VBA_Parser
+            v=VBA_Parser(str(p));has=v.detect_vba_macros();v.close()
+            return {'status':'review' if has else 'clean','reason':'旧版二进制文档中的宏需单独核查。' if has else None}
+        except Exception as ex:return {'status':'review','reason':str(ex)}
+
+def sanitized_xlsx(source,dest):
+    """Copy original parts verbatim except VBA relationships/types and visibility."""
+    with zipfile.ZipFile(source) as src:
+        names=src.namelist();removed={n for n in names if re.search(r'(?i)(^|/)vba(project(signature)?\.bin|data\.xml)$',n)}
+        removed.update(n for n in names if re.search(r'(?i)(^|/)_rels/vba(project(signature)?\.bin|data\.xml)\.rels$',n))
+        changes={};before={}
+        for name in names:
+            if name in removed:continue
+            b=src.read(name)
+            if name=='[Content_Types].xml':
+                b=re.sub(rb'<(?:\w+:)?Override\b[^>]*\bPartName="/?(?:xl/)?vba[^\"]*"[^>]*/>',b'',b,flags=re.I)
+                b=b.replace(b'application/vnd.ms-excel.sheet.macroEnabled.main+xml',b'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml')
+            elif name.endswith('.rels'):
+                b=re.sub(rb'<(?:\w+:)?Relationship\b(?=[^>]*\bType="[^\"]*/vba(?:Project|ProjectSignature|Data)")[^>]*/>',b'',b,flags=re.I)
+            elif name=='xl/workbook.xml':
+                b=re.sub(rb'(<(?:\w+:)?sheet\b[^>]*?)\s+state="(?:hidden|veryHidden)"',rb'\1',b)
+                b=re.sub(rb'\b(?:activeTab|firstSheet)="\d+"',lambda m:m[0].split(b'=')[0]+b'="0"',b)
+            changes[name]=b
+            if b==src.read(name):before[name]=hashlib.sha256(b).hexdigest()
+        with zipfile.ZipFile(dest,'x',compression=zipfile.ZIP_DEFLATED) as out:
+            for item in src.infolist():
+                if item.filename not in removed:out.writestr(copy.copy(item),changes[item.filename])
+        with zipfile.ZipFile(dest) as check:
+            if check.testzip():raise ValueError('修复文档的完整性校验失败。')
+            if any('vbaproject' in x.casefold() for x in check.namelist()):raise ValueError('修复文档中仍存在宏项目。')
+            for name,h in before.items():
+                if hashlib.sha256(check.read(name)).hexdigest()!=h:raise ValueError('非目标工作簿成员发生变化：'+name)
+            for name in check.namelist():
+                if name.endswith(('.xml','.rels')):ET.fromstring(check.read(name))
+            for name in names:
+                if name.startswith('xl/worksheets/') and name.endswith('.xml') and check.read(name)!=src.read(name):raise ValueError('工作表内容校验不一致。')
+    return {'unchanged_parts':len(before),'removed_parts':sorted(removed),'worksheet_bytes_preserved':True}
+
+def powershell(script,timeout=60):
+    exe=os.path.join(os.environ.get('WINDIR','C:\\Windows'),'System32','WindowsPowerShell','v1.0','powershell.exe')
+    prefix="[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ErrorActionPreference='Stop'; "
+    encoded=base64.b64encode((prefix+script).encode('utf-16le')).decode('ascii')
+    r=subprocess.run([exe,'-NoProfile','-NonInteractive','-EncodedCommand',encoded],capture_output=True,timeout=timeout,creationflags=0x08000000)
+    if r.returncode:raise RuntimeError(r.stderr.decode('utf-8','replace')[-2000:])
+    s=r.stdout.decode('utf-8-sig','replace').strip()
+    return json.loads(s) if s else None
+
+def psquote(s):return "'"+str(s).replace("'","''")+"'"
+
+def enable_privileges():
+    adv=ctypes.WinDLL('advapi32',use_last_error=True)
+    class LUID(ctypes.Structure):_fields_=[('LowPart',W.DWORD),('HighPart',W.LONG)]
+    class TOKEN_PRIVILEGES(ctypes.Structure):_fields_=[('count',W.DWORD),('luid',LUID),('attr',W.DWORD)]
+    adv.OpenProcessToken.argtypes=[W.HANDLE,W.DWORD,ctypes.POINTER(W.HANDLE)];adv.LookupPrivilegeValueW.argtypes=[W.LPCWSTR,W.LPCWSTR,ctypes.POINTER(LUID)]
+    adv.AdjustTokenPrivileges.argtypes=[W.HANDLE,W.BOOL,ctypes.POINTER(TOKEN_PRIVILEGES),W.DWORD,ctypes.c_void_p,ctypes.c_void_p]
+    token=W.HANDLE();result={}
+    if adv.OpenProcessToken(kernel.GetCurrentProcess(),0x28,ctypes.byref(token)):
+        try:
+            for name in ('SeDebugPrivilege','SeBackupPrivilege','SeRestorePrivilege'):
+                t=TOKEN_PRIVILEGES();t.count=1;t.attr=2
+                if adv.LookupPrivilegeValueW(None,name,ctypes.byref(t.luid)):
+                    ctypes.set_last_error(0);adv.AdjustTokenPrivileges(token,False,ctypes.byref(t),0,None,None);result[name]=ctypes.get_last_error()==0
+        finally:kernel.CloseHandle(token)
+    return result
+
+def lock_holders(path):
+    rm=ctypes.WinDLL('rstrtmgr');session=W.DWORD();key=ctypes.create_unicode_buffer(33)
+    class UNIQUE(ctypes.Structure):_fields_=[('pid',W.DWORD),('start',W.FILETIME)]
+    class INFO(ctypes.Structure):_fields_=[('process',UNIQUE),('app',W.WCHAR*256),('service',W.WCHAR*64),('type',W.UINT),('status',W.ULONG),('ts',W.DWORD),('restart',W.BOOL)]
+    rm.RmStartSession.argtypes=[ctypes.POINTER(W.DWORD),W.DWORD,W.LPWSTR];rm.RmStartSession.restype=W.DWORD
+    rm.RmRegisterResources.argtypes=[W.DWORD,W.UINT,ctypes.POINTER(W.LPCWSTR),W.UINT,ctypes.POINTER(UNIQUE),W.UINT,ctypes.POINTER(W.LPCWSTR)];rm.RmRegisterResources.restype=W.DWORD
+    rm.RmGetList.argtypes=[W.DWORD,ctypes.POINTER(W.UINT),ctypes.POINTER(W.UINT),ctypes.POINTER(INFO),ctypes.POINTER(W.DWORD)];rm.RmGetList.restype=W.DWORD
+    rm.RmEndSession.argtypes=[W.DWORD];rm.RmEndSession.restype=W.DWORD
+    if rm.RmStartSession(ctypes.byref(session),0,key):return []
+    try:
+        names=(W.LPCWSTR*1)(str(path))
+        if rm.RmRegisterResources(session,1,names,0,None,0,None):return []
+        needed=W.UINT();count=W.UINT();reasons=W.DWORD()
+        result=rm.RmGetList(session,ctypes.byref(needed),ctypes.byref(count),None,ctypes.byref(reasons))
+        if result!=234 or not 0<needed.value<1024:return []
+        rows=(INFO*needed.value)();count.value=needed.value
+        if rm.RmGetList(session,ctypes.byref(needed),ctypes.byref(count),rows,ctypes.byref(reasons)):return []
+        return [x.process.pid for x in rows[:count.value]]
+    finally:rm.RmEndSession(session)
+
+class Cleaner:
+    def __init__(self,report_dir=None,emit=print,force_close=True,protected=(),restore_history=True,external_volumes=None,excluded_roots=()):
+        from device_scope import protection_path
+        profile=protection_path()
+        local=json.loads(profile.read_text(encoding='utf-8-sig')) if profile.exists() else {}
+        protected=[*protected,*local.get('excluded_paths',[])]
+        self.policy=VolumePolicy(external_volumes,excluded_roots);self.emit=emit;self.force_close=force_close;self.restore_history=restore_history;self.shadow_cache=None
+        default=pathlib.Path(os.environ.get('PROGRAMDATA','C:/ProgramData'))/'WormRecovery'
+        self.run=pathlib.Path(report_dir or default)/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        self.policy.mutation(self.run.parent);self.run.mkdir(parents=True,exist_ok=False)
+        self.quarantine=self.run/'quarantine';self.quarantine.mkdir();self.events=[];self.findings=[];self.errors=[]
+        tool_scope=pathlib.Path(sys.executable) if getattr(sys,'frozen',False) else HERE
+        self.protected=[tool_scope,self.run.parent,*map(pathlib.Path,protected)]
+        self.cancel=threading.Event();self.count=0;self.dircount=0;self.scanned_office=0;self.started=time.monotonic()
+        self.scan_roots=[];self.initial_findings=None;self.verification=None
+        self.skipped=[];self.reparse_points=[];self.inspection_failed=False
+        self.log('session',version=VERSION,volume_policy='Explicit physical-device scope; local exclusions enforced',privileges=enable_privileges())
+    def log(self,kind,**data):
+        rec={'time':datetime.datetime.now().isoformat(timespec='seconds'),'kind':kind,**data};self.events.append(rec)
+        with (self.run/'journal.jsonl').open('a',encoding='utf-8') as f:f.write(json.dumps(rec,ensure_ascii=False)+'\n');f.flush();os.fsync(f.fileno())
+    def protected_path(self,p):return any(beneath(p,r) for r in self.protected)
+    def confirmed_command(self,command):
+        text=os.path.expandvars(str(command))
+        pattern=r'"([^"]+)"|((?:[A-Za-z]:[\\/])[^"\r\n]*?\.(?:exe|com|scr|lnk|a3x))(?=\s|$|\")'
+        for quoted,bare in re.findall(pattern,text,re.I):
+            path=quoted or bare
+            if not os.path.isabs(path) or self.protected_path(path):continue
+            try:
+                self.policy.check(path)
+                if not os.path.isfile(path):continue
+                extension=os.path.splitext(path)[1].casefold()
+                if extension=='.a3x' and digest_file(path)==AUTOIT_A3X_SHA256:return True
+                if extension=='.lnk' and (shortcut(path) or {}).get('malicious'):return True
+                if extension in ('.exe','.com','.scr') and is_stub(path):return True
+            except (OSError,ValueError,struct.error):continue
+        return False
+    def error(self,path,ex):self.errors.append({'path':str(path),'error':str(ex)});self.log('error',path=str(path),error=str(ex))
+    def add(self,kind,path,**detail):
+        record={'kind':kind,'path':str(path),**detail};self.findings.append(record)
+        labels={'infected_office':'受感染文档','infected_executable':'受感染程序','worm_payload':'恶意载荷','worm_hook':'恶意组件','worm_runtime':'恶意缓存','worm_script':'恶意脚本','malicious_shortcut':'恶意快捷方式','review_office':'待核查文档','review_autoit':'待核查脚本'}
+        self.emit('检测到'+labels.get(kind,'风险项目')+'：'+str(path));return record
+    def backup(self,path):
+        self.policy.mutation(path);p=pathlib.Path(path)
+        if self.protected_path(p):raise PermissionError('所选路径已列入排除范围。')
+        before=p.stat();h=digest_file(p);dest=self.quarantine/(h+'-'+uuid.uuid4().hex[:8]+'.quarantined')
+        shutil.copy2(p,dest)
+        if digest_file(dest)!=h or p.stat().st_size!=before.st_size or p.stat().st_mtime_ns!=before.st_mtime_ns:raise RuntimeError('备份期间源文件发生变化，操作已中止。')
+        self.log('backup',path=str(p),backup=str(dest),sha256=h,attributes=file_attributes(p),mtime_ns=before.st_mtime_ns,size=before.st_size)
+        return h,dest,before
+    def stop_pid(self,pid,reason):
+        if pid in (0,4,os.getpid()):raise PermissionError('不能终止关键系统进程或当前程序。')
+        p=psutil.Process(pid)
+        if p.name().casefold() in CRITICAL_PROCESSES:raise PermissionError('受保护进程不能自动终止：'+p.name())
+        self.log('terminate_process',pid=pid,name=p.name(),path=p.exe(),created=p.create_time(),reason=reason)
+        p.kill();p.wait(10)
+    def close_locks(self,path):
+        if not self.force_close:return
+        for pid in lock_holders(path):
+            try:self.stop_pid(pid,'User-authorized release of confirmed infected file '+str(path))
+            except psutil.NoSuchProcess:pass
+    def quarantine_file(self,path,reason):
+        self.policy.mutation(path);p=pathlib.Path(path)
+        if not p.exists():return
+        h,dest,st=self.backup(p);self.close_locks(p)
+        if digest_file(p)!=h:raise RuntimeError('隔离前源文件发生变化，操作已中止。')
+        attrs=file_attributes(p);kernel.SetFileAttributesW(str(p),attrs&~1)
+        p.unlink();self.log('quarantined',path=str(p),backup=str(dest),sha256=h,reason=reason)
+    def replace(self,path,stage,expected=None):
+        self.policy.mutation(path);self.policy.mutation(stage);p=pathlib.Path(path);t=pathlib.Path(stage)
+        if p.exists():
+            h,back,st=self.backup(p)
+            if expected and h!=expected:raise RuntimeError('源文件与检测记录不一致，操作已中止。')
+            self.close_locks(p)
+            if digest_file(p)!=h:raise RuntimeError('提交修复前源文件发生变化，操作已中止。')
+            oldattrs=file_attributes(p);kernel.SetFileAttributesW(str(p),oldattrs&~1)
+            if not kernel.ReplaceFileW(str(p),str(t),None,1,None,None):
+                error=ctypes.get_last_error()
+                if error in (1,50) and t.exists() and digest_file(p)==h:
+                    try:os.replace(t,p)
+                    except OSError:kernel.SetFileAttributesW(str(p),oldattrs);raise
+                else:kernel.SetFileAttributesW(str(p),oldattrs);raise ctypes.WinError(error)
+            kernel.SetFileAttributesW(str(p),(oldattrs&~7) or 0x80);os.utime(p,ns=(st.st_atime_ns,st.st_mtime_ns))
+        else:
+            # rename on Windows fails if destination appeared; never overwrite it.
+            os.rename(t,p)
+        self.log('restored',path=str(p),sha256=digest_file(p))
+    def contain(self,apply=False):
+        hits=[]
+        for p in psutil.process_iter(['pid','name','exe','cmdline']):
+            try:
+                if p.pid==os.getpid() or (p.info['name'] or '').casefold() in CRITICAL_PROCESSES:continue
+                exe=p.info['exe'];args=p.info['cmdline'] or [];cmd=' '.join(args)
+                if not exe:continue
+                try:self.policy.check(exe)
+                except PermissionError:continue
+                bad=bool(exe and not self.protected_path(exe) and is_stub(exe))
+                autoit=False
+                if exe and not self.protected_path(exe) and os.path.isfile(exe) and os.path.getsize(exe)==750320 and digest_file(exe)==AUTOIT_EXE_SHA256:
+                    for arg in args[1:]:
+                        script=arg.strip('"')
+                        if os.path.isabs(script):
+                            try:self.policy.check(script)
+                            except PermissionError:continue
+                        if os.path.isabs(script) and script.casefold().endswith('.a3x') and os.path.isfile(script) and digest_file(script)==AUTOIT_A3X_SHA256:
+                            autoit=True;break
+                if bad or autoit:
+                    rec={'pid':p.pid,'exe':exe,'cmdline':cmd,'family':'Synaptics' if bad else 'AutoIt'};hits.append(rec)
+                    if apply:self.stop_pid(p.pid,'Confirmed worm process')
+            except (psutil.Error,OSError,ValueError) as ex:self.error('process:'+str(p.pid),ex)
+        self.log('process_inspection',apply=apply,processes=hits);return hits
+    def registry(self,apply=False):
+        hits=[];hives=[('HKLM',winreg.HKEY_LOCAL_MACHINE)]
+        # Inspect loaded user hives without mounting or writing offline hives.
+        i=0
+        while True:
+            try:sid=winreg.EnumKey(winreg.HKEY_USERS,i);i+=1
+            except OSError:break
+            if sid.startswith('S-1-5-') and not sid.endswith('_Classes'):
+                hives.append(('HKU\\'+sid,(winreg.HKEY_USERS,sid)))
+        paths=[r'Software\Microsoft\Windows\CurrentVersion\Run',r'Software\Microsoft\Windows\CurrentVersion\RunOnce',r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run']
+        for label,hive in hives:
+            for view in (winreg.KEY_WOW64_64KEY,winreg.KEY_WOW64_32KEY):
+                for sub in paths:
+                    base,prefix=hive if isinstance(hive,tuple) else (hive,'')
+                    keypath=(prefix+'\\' if prefix else '')+sub
+                    try:
+                        with winreg.OpenKey(base,keypath,0,winreg.KEY_READ|(winreg.KEY_SET_VALUE if apply else 0)|view) as key:
+                            values=[];i=0
+                            while True:
+                                try:values.append(winreg.EnumValue(key,i));i+=1
+                                except OSError:break
+                            for name,value,typ in values:
+                                text=str(value).casefold()
+                                bad=('googlechrome.a3x' in text or ('\\googlechrome\\' in text and any(x in text for x in ('windowsupdate.lnk','googleupdate.lnk'))))
+                                if 'synaptics' in text:
+                                    target=str(value).strip('"').split('"')[0]
+                                    bad=bad or (os.path.isfile(target) and is_stub(target))
+                                if bad:
+                                    rec={'hive':label,'key':sub,'view':view,'name':name,'value':value,'type':typ};hits.append(rec)
+                                    rec['confirmed']=self.confirmed_command(value)
+                                    if apply and rec['confirmed']:self.log('registry_backup',**rec);winreg.DeleteValue(key,name);self.log('registry_removed',**rec)
+                    except FileNotFoundError:pass
+                    except OSError as ex:self.error(label+'\\'+sub,ex)
+        self.log('registry_inspection',apply=apply,hits=hits);return hits
+    def system_persistence(self,apply=False):
+        script=r"""
+        $rx='GoogleChrome\.a3x|AutoIt3ExecuteScript.*MozillaFirefox|[\\/]GoogleChrome[\\/].*(WindowsUpdate|GoogleUpdate)\.lnk|[\\/]Synaptics[\\/]Synaptics\.exe';
+        $tasks=@();foreach($t in Get-ScheduledTask){foreach($a in $t.Actions){if(($a.Execute+' '+$a.Arguments)-match $rx){$tasks += @{name=$t.TaskName;path=$t.TaskPath;execute=$a.Execute;arguments=$a.Arguments;xml=(Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath)}}}};
+        $services=@(Get-CimInstance Win32_Service|Where-Object {$_.PathName -match $rx}|Select-Object Name,PathName,State,StartMode);
+        $wmi=@(Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer|Where-Object {$_.CommandLineTemplate -match $rx}|Select-Object Name,CommandLineTemplate);
+        @{tasks=$tasks;services=$services;wmi=$wmi}|ConvertTo-Json -Depth 7 -Compress
+        """
+        try:
+            d=powershell(script);self.log('system_persistence',apply=apply,result=d)
+            if apply:
+                for t in d.get('tasks',[]):
+                    if self.confirmed_command(str(t.get('execute',''))+' '+str(t.get('arguments',''))):
+                        powershell('Disable-ScheduledTask -TaskName '+psquote(t['name'])+' -TaskPath '+psquote(t['path'])+' | Out-Null');self.log('task_disabled',task=t)
+                for s in d.get('services',[]):
+                    # Require the real engine fingerprint before changing a service.
+                    if self.confirmed_command(s['PathName']):powershell('Stop-Service -Name '+psquote(s['Name'])+' -Force; Set-Service -Name '+psquote(s['Name'])+' -StartupType Disabled');self.log('service_disabled',service=s)
+                for x in d.get('wmi',[]):
+                    if self.confirmed_command(x['CommandLineTemplate']):
+                        powershell('$n='+psquote(x['Name'])+r'; Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer | Where-Object {$_.Name -eq $n} | Remove-CimInstance');self.log('wmi_consumer_removed',consumer=x)
+            return d
+        except Exception as ex:self.inspection_failed=True;self.error('system_persistence',ex);return {}
+    def firewall(self,apply=False):
+        # The exact abused cache name, never a generic Chrome browser rule.
+        script=r"""
+        $out=@();foreach($r in (Get-NetFirewallRule -DisplayName 'GoogleChrome.exe' -ErrorAction SilentlyContinue)){
+          foreach($f in ($r|Get-NetFirewallApplicationFilter)){
+            if($f.Program.Replace([char]92,[char]47).EndsWith('/._cache_GoogleChrome.exe',[StringComparison]::OrdinalIgnoreCase)){
+              $out+=@{name=$r.Name;display=$r.DisplayName;enabled=[string]$r.Enabled;program=$f.Program;direction=[string]$r.Direction;action=[string]$r.Action}
+            }
+          }
+        };ConvertTo-Json -InputObject @($out) -Compress
+        """
+        try:
+            rows=powershell(script) or [];rows=[rows] if isinstance(rows,dict) else rows
+            self.log('firewall_inspection',rules=rows,apply=apply)
+            if apply:
+                for r in rows:
+                    if r['enabled']=='True':
+                        self.log('firewall_backup',rule=r)
+                        powershell('Disable-NetFirewallRule -Name '+psquote(r['name'])+' | Out-Null')
+                        self.log('firewall_disabled',rule=r)
+            return rows
+        except Exception as ex:self.inspection_failed=True;self.error('firewall',ex);return []
+    def historical_original(self,path,infected_mtime):
+        """Optional, exact-path snapshot recovery; the current bytes stay backed up."""
+        if not self.restore_history:return None
+        if self.shadow_cache is None:
+            script=r"@(Get-CimInstance Win32_ShadowCopy | ForEach-Object {@{device=$_.DeviceObject;volume=$_.VolumeName;created=$_.InstallDate.ToUniversalTime().ToString('o')}}) | ConvertTo-Json -Compress"
+            rows=powershell(script) or [];self.shadow_cache=[rows] if isinstance(rows,dict) else rows
+        p=pathlib.Path(path).with_suffix('.xlsx')
+        source_volume=volume_identity(volume(p))
+        for s in sorted(self.shadow_cache,key=lambda x:x['created'],reverse=True):
+            if str(s.get('volume','')).casefold()!=source_volume:continue
+            created=datetime.datetime.fromisoformat(s['created'].replace('Z','+00:00')).timestamp()
+            if created>=infected_mtime:continue
+            source=s['device']+chr(92)+str(p)[3:]
+            try:
+                st=os.stat(source)
+                if st.st_mtime>infected_mtime or st.st_size>1024*1024*1024:continue
+                if office_check(source).get('macro') is not False:continue
+                with zipfile.ZipFile(source) as z:
+                    if z.testzip():continue
+                    if 'xl/workbook.xml' not in z.namelist():continue
+                    if any(any(t in n.casefold() for t in ('vbaproject','activex','embeddings/','externallinks/')) for n in z.namelist()):continue
+                self.log('historical_original_selected',path=str(p),source=source,sha256=digest_file(source),snapshot=s,warning='Explicit historical recovery can discard edits after this snapshot; pre-repair bytes are retained in quarantine.')
+                return {'source':source,'sha256':digest_file(source),'mtime_ns':st.st_mtime_ns,'snapshot':s}
+            except FileNotFoundError:continue
+            except OSError as ex:self.log('snapshot_unavailable',source=source,error=str(ex))
+        return None
+    def scan_file(self,path,st):
+        self.count+=1;name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
+        if name.startswith('~$') and not name.startswith('~$cache'):return
+        if ext in EXE_EXTS or name.startswith(('~$cache','._cache_')):
+            if is_stub(path,strict=True):
+                with PEView(path) as pe:original=pe.resource('EXERESX')
+                self.add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None)
+            elif st.st_size==15360 and digest_file(path)==HOOK_SHA256:self.add('worm_hook',path,sha256=HOOK_SHA256)
+            elif name.startswith('._cache_') and st.st_size==750320 and digest_file(path)==AUTOIT_EXE_SHA256:self.add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
+        elif ext=='.a3x':
+            if digest_file(path)==AUTOIT_A3X_SHA256:self.add('worm_script',path,sha256=AUTOIT_A3X_SHA256)
+            else:self.add('review_autoit',path,reason='未识别脚本已保留，需进一步核查。')
+        elif ext=='.lnk' and st.st_size<1024*1024:
+            result=shortcut(path)
+            if result and result.get('malicious'):self.add('malicious_shortcut',path,shortcut=result)
+        elif ext in OFFICE_EXTS:
+            self.scanned_office+=1;info=office_check(path)
+            if info['status']=='infected':self.add('infected_office',path,**info)
+            elif info['status']=='review':self.add('review_office',path,**info)
+    def scan(self,roots=None):
+        from reparse_scan import inspect_reparse,resolve_target,CoverageLimit
+        roots=self.policy.fixed_roots() if roots is None else roots
+        if not roots:raise ValueError('未指定有效扫描范围。')
+        self.findings=[];self.count=0;self.dircount=0;self.scanned_office=0;self.skipped=[];self.reparse_points=[];start=time.monotonic()
+        self.scan_roots=list(map(os.path.abspath,roots))
+        self.emit('正在检查所选扫描范围。');stack=[];visited=set();files_seen=set();failed_directories=set()
+        def approved(path):
+            if self.protected_path(path) or not any(beneath(path,r) for r in self.scan_roots):return False
+            try:self.policy.check(path);return True
+            except OSError:return False
+        def directory_id(path,st=None):
+            st=st or os.stat(path)
+            return ('id',st.st_dev,st.st_ino) if st.st_ino else ('path',norm(path))
+        def inspect_file(path,st):
+            key=norm(path)
+            if key in files_seen:return 'target_already_checked'
+            self.scan_file(path,st);files_seen.add(key);return 'target_checked'
+        def inspect_link(path):
+            record={'path':path,'status':'pending'};self.reparse_points.append(record)
+            try:
+                if self.protected_path(path):raise CoverageLimit('excluded_path',path)
+                info=inspect_reparse(path);record.update(info)
+                resolved=resolve_target(info['target'],approved)
+                target=resolved['target'];record['resolved_target']=target;record['chain']=resolved['chain']
+                st=os.stat(target)
+                if os.path.isdir(target):
+                    record['directory_id']=directory_id(target,st);stack.append(target)
+                else:record['status']=inspect_file(target,st)
+            except CoverageLimit as ex:
+                record['status']='unverified';record['reason']=ex.reason
+                if ex.target:record['target']=ex.target
+                self.skipped.append({'path':path,'reason':ex.reason,'target':ex.target})
+            except Exception as ex:
+                record['status']='error';record['error']=str(ex);self.error(path,ex)
+        for root in roots:
+            self.policy.check(root)
+            if not os.path.isdir(root):raise ValueError('扫描位置不存在或不是目录：'+str(root))
+            if self.protected_path(root):raise ValueError('所选位置已列入排除范围。')
+            if file_attributes(root)&0x400:inspect_link(os.path.abspath(root))
+            else:stack.append(os.path.abspath(root))
+        while stack and not self.cancel.is_set():
+            directory=stack.pop()
+            if self.protected_path(directory):
+                self.skipped.append({'path':directory,'reason':'excluded_path'});continue
+            try:
+                self.policy.check(directory)
+                identity=directory_id(directory)
+                if identity in visited:continue
+                with os.scandir(directory) as entries:
+                    visited.add(identity)
+                    self.dircount+=1
+                    for e in entries:
+                        if self.cancel.is_set():break
+                        try:
+                            st=e.stat(follow_symlinks=False)
+                            if st.st_file_attributes&0x400:
+                                inspect_link(e.path);continue
+                            if e.is_dir(follow_symlinks=False):
+                                self.policy.check(e.path);stack.append(e.path);continue
+                            inspect_file(e.path,st)
+                        except Exception as ex:self.error(e.path,ex)
+                if self.dircount%500==0:self.emit('已扫描 %s 文件 / %s 目录'%(self.count,self.dircount))
+            except OSError as ex:failed_directories.add(norm(directory));self.error(directory,ex)
+        for record in self.reparse_points:
+            identity=record.pop('directory_id',None)
+            if identity is not None:
+                target=record['resolved_target']
+                record['status']='target_visited' if identity in visited and norm(target) not in failed_directories else 'unverified'
+                if record['status']=='unverified':
+                    record['reason']='scan_cancelled_or_target_unavailable';self.skipped.append({'path':record['path'],'target':target,'reason':record['reason']})
+        self.scan_seconds=time.monotonic()-start
+        self.log('scan_complete',files=self.count,directories=self.dircount,seconds=self.scan_seconds,cancelled=self.cancel.is_set(),findings=len(self.findings),skipped_count=len(self.skipped))
+        self.save();return self.findings
+    def payload_path(self,path):
+        p=pathlib.Path(path);parts=[x.casefold() for x in p.parts]
+        root_payload=len(parts)>1 and parts[1] in ('googlechrome','mozillafirefox')
+        return root_payload or p.name.casefold().startswith(('~$cache','._cache_')) or ('synaptics' in parts and p.name.casefold()=='synaptics.exe')
+    def restore_executable(self,path):
+        p=pathlib.Path(path);self.policy.mutation(p);source_hash=digest_file(p);stage=p.with_name('.wormrepair-'+uuid.uuid4().hex+'.tmp');created=[]
+        try:
+            current=p;layers=0
+            while is_stub(current):
+                if layers>=8:raise ValueError('嵌套感染层数超过处理上限。')
+                nextstage=p.with_name('.wormrepair-'+uuid.uuid4().hex+'.tmp');created.append(nextstage)
+                with PEView(current) as pe:
+                    res=pe.resource('EXERESX')
+                    if not res:raise ValueError('文件中未发现可验证原件，无法自动恢复。')
+                    pe.extract_resource(res,nextstage)
+                current=nextstage;layers+=1
+            with PEView(current) as clean:
+                if clean.size<1024:raise ValueError('嵌入原件结构无效，无法自动恢复。')
+            if digest_file(p)!=source_hash:raise RuntimeError('提取期间源文件发生变化，操作已中止。')
+            restored_hash=digest_file(current);self.replace(p,current,expected=source_hash)
+            if digest_file(p)!=restored_hash or is_stub(p):raise RuntimeError('程序修复后校验失败。')
+            self.log('executable_recovered',path=str(p),layers=layers,original_sha256=restored_hash,original_bytes=p.stat().st_size,scope='observed Synaptics wrapper only; unrelated threats not certified')
+        finally:
+            for t in created:
+                if t.exists():t.unlink()
+    def restore_office(self,path):
+        p=pathlib.Path(path);self.policy.mutation(p);check=office_check(p)
+        if check['status']!='infected':raise ValueError('文档不再匹配检测指纹，请重新检测。')
+        h=digest_file(p);source_stat=p.stat();source_attrs=file_attributes(p);dest=p.with_suffix('.xlsx')
+        if dest!=p and dest.exists():raise FileExistsError('目标文件已存在，双方均已保留，需人工核查：'+str(dest))
+        stage=p.with_name('.wormrepair-'+uuid.uuid4().hex+'.xlsx.tmp')
+        try:
+            history=self.historical_original(p,source_stat.st_mtime)
+            if history:
+                shutil.copyfile(history['source'],stage)
+                if digest_file(stage)!=history['sha256']:raise RuntimeError('历史原件复制后的哈希校验失败。')
+                validation={'historical_original':history,'worksheet_bytes_preserved':False}
+            else:validation=sanitized_xlsx(p,stage)
+            if digest_file(p)!=h:raise RuntimeError('修复期间文档发生变化，操作已中止。')
+            result_hash=digest_file(stage);self.backup(p);self.close_locks(p)
+            if digest_file(p)!=h:raise RuntimeError('提交修复前文档发生变化，操作已中止。')
+            if dest==p:self.replace(p,stage,expected=h)
+            else:
+                self.replace(dest,stage)
+                if digest_file(dest)!=result_hash:raise RuntimeError('文档修复后校验失败。')
+                os.utime(dest,ns=(source_stat.st_atime_ns,source_stat.st_mtime_ns))
+                if not kernel.SetFileAttributesW(str(dest),(source_attrs&~7) or 0x80):raise ctypes.WinError(ctypes.get_last_error())
+                kernel.SetFileAttributesW(str(p),file_attributes(p)&~1);p.unlink()
+            if history:os.utime(dest,ns=(source_stat.st_atime_ns,history['mtime_ns']))
+            self.log('office_recovered',path=str(p),restored_path=str(dest),source_sha256=h,sha256=result_hash,validation=validation,content_provenance='exact-path macro-free snapshot original' if history else 'preserved current worksheet bytes; no claim of missing historical data restoration')
+        finally:
+            if stage.exists():stage.unlink()
+    def security_settings(self):
+        changes=[]
+        # Only repair the exact weakened macro setting observed in the malware.
+        for version in ('12.0','14.0','15.0','16.0'):
+            for app in ('Excel','Word'):
+                sub='Software\\Microsoft\\Office\\'+version+'\\'+app+'\\Security'
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,sub,0,winreg.KEY_READ|winreg.KEY_SET_VALUE) as k:
+                        old,typ=winreg.QueryValueEx(k,'VBAWarnings')
+                        if old==1:self.log('security_setting_backup',key=sub,name='VBAWarnings',value=old,type=typ);winreg.SetValueEx(k,'VBAWarnings',0,winreg.REG_DWORD,2);changes.append(sub)
+                except FileNotFoundError:pass
+        sub=r'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,sub) as k:
+            for name,new in [('Hidden',1),('ShowSuperHidden',1)]:
+                try:old,typ=winreg.QueryValueEx(k,name)
+                except FileNotFoundError:old,typ=None,winreg.REG_DWORD
+                self.log('security_setting_backup',key=sub,name=name,value=old,type=typ);winreg.SetValueEx(k,name,0,winreg.REG_DWORD,new)
+        self.log('security_settings_repaired',macro_keys=changes)
+    def repair(self):
+        self.initial_findings=list(self.findings)
+        self.contain(True);self.registry(True);self.system_persistence(True);self.firewall(True)
+        for rec in list(self.findings):
+            if self.cancel.is_set():break
+            kind,p=rec['kind'],pathlib.Path(rec['path'])
+            if kind.startswith('review_'):continue
+            try:
+                if not p.exists():continue
+                self.policy.mutation(p)
+                self.emit('正在修复：'+str(p))
+                # Only scan-confirmed items reach here; release exclusive locks
+                # before reopening and rechecking their fingerprints.
+                self.close_locks(p)
+                if kind=='infected_office':self.restore_office(p)
+                elif kind=='infected_executable' and not self.payload_path(p):self.restore_executable(p)
+                elif kind=='malicious_shortcut':
+                    if not shortcut(p).get('malicious'):raise ValueError('快捷方式已发生变化，请重新检测。')
+                    self.quarantine_file(p,'confirmed AutoIt shortcut')
+                    candidate=p.with_suffix('')
+                    if candidate.is_dir() and not self.payload_path(candidate) and not beneath(candidate,os.environ.get('WINDIR','C:/Windows')):
+                        self.policy.mutation(candidate);a=file_attributes(candidate)
+                        if a&6:self.log('attributes_backup',path=str(candidate),attributes=a);kernel.SetFileAttributesW(str(candidate),(a&~6) or 16)
+                elif kind in ('worm_payload','infected_executable'):
+                    if not is_stub(p):raise ValueError('载荷指纹已发生变化，请重新检测。')
+                    self.quarantine_file(p,kind)
+                elif kind=='worm_script':
+                    if digest_file(p)!=AUTOIT_A3X_SHA256:raise ValueError('脚本已发生变化，请重新检测。')
+                    self.quarantine_file(p,kind)
+                elif kind in ('worm_runtime','worm_hook'):
+                    expected=AUTOIT_EXE_SHA256 if kind=='worm_runtime' else HOOK_SHA256
+                    if digest_file(p)!=expected:raise ValueError('组件指纹已发生变化，请重新检测。')
+                    self.quarantine_file(p,kind)
+            except Exception as ex:self.error(p,ex)
+        try:self.security_settings();self.registry(True)
+        except Exception as ex:self.error('security_settings',ex)
+        self.save()
+    def verify(self):
+        before_errors=len(self.errors);roots=list(self.scan_roots)
+        remaining=self.scan(roots)
+        processes=self.contain(False);registry=self.registry(False);system=self.system_persistence(False);firewall=[x for x in self.firewall(False) if x['enabled']=='True']
+        active_tasks=[]
+        for x in system.get('tasks',[]):
+            try:
+                enabled=ET.fromstring(x.get('xml','')).find('.//{*}Settings/{*}Enabled')
+                if enabled is None or (enabled.text or '').strip().casefold()!='false':active_tasks.append(x)
+            except ET.ParseError:active_tasks.append(x)
+        active_services=[x for x in system.get('services',[]) if x.get('StartMode')!='Disabled' or x.get('State')=='Running']
+        confirmed=[x for x in remaining if not x['kind'].startswith('review_')]
+        self.verification={'roots':roots,'remaining_confirmed':confirmed,'review_count':sum(x['kind'].startswith('review_') for x in remaining),'processes':processes,'registry':registry,'active_tasks':active_tasks,'active_services':active_services,'wmi':system.get('wmi',[]),'enabled_worm_firewall_rules':firewall,'new_errors':len(self.errors)-before_errors,'known_family_clear':not (confirmed or processes or registry or active_tasks or active_services or system.get('wmi',[]) or firewall or len(self.errors)>before_errors or self.cancel.is_set()),'coverage':'USB, research paths, and inaccessible locations excluded; no universal clean certification'}
+        self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.errors and not self.inspection_failed
+        self.verification['unverified_links']=[r for r in getattr(self,'reparse_points',[]) if r.get('status') in ('unverified','error','pending')]
+        self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.verification['unverified_links']
+        self.verification['coverage']='Selected mounted volumes only; exclusions, reparse points, archives, offline hives and other malware families are not certified.'
+        self.verification['skipped_count']=len(self.skipped)
+        self.verification['assessment']='未检出已知威胁，检测覆盖范围存在限制。' if self.verification['known_family_clear'] else '存在未解决项目或未完成检查，不能判定清理完成。'
+        self.verification['unverified_areas']=['压缩档内部文件','离线用户配置单元','未分配盘符或未挂载的卷','排除目录与未解析或范围外的链接目标','未识别的恶意软件家族']
+        self.log('verification_complete',result=self.verification);self.save();return self.verification
+    def save(self):
+        summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
+        summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
+        json_save(self.run/'report.json',summary);return summary
+
+def resolve_scan_scope(mode='internal',manual=None):
+    from device_scope import resolve_scope
+    return resolve_scope(powershell,mode,manual)
+
+def cli_main():
+    parser=argparse.ArgumentParser(description='WormRecovery 文件安全检测与原位恢复')
+    parser.add_argument('--scan',action='store_true',help='只扫描，不修复')
+    parser.add_argument('--clean',action='store_true',help='扫描并修复确认感染项')
+    parser.add_argument('--root',action='append',help='手动指定扫描位置；选择外接设备中的位置时包含同设备全部盘符')
+    parser.add_argument('--scope',choices=['internal','removable'],default='internal',help='internal：本机全盘；removable：可移动设备')
+    parser.add_argument('--report-dir',help='固定磁盘上的报告/隔离根目录')
+    parser.add_argument('--force-close',action='store_true',default=True,help=argparse.SUPPRESS)
+    parser.add_argument('--restore-history',action='store_true',default=True,help=argparse.SUPPRESS)
+    parser.add_argument('--exclude',action='append',default=[],help='额外保护目录')
+    args=parser.parse_args()
+    if not args.scan and not args.clean:return gui_main()
+    if args.clean and not ctypes.windll.shell32.IsUserAnAdmin():raise PermissionError('修复需要以管理员身份运行')
+    scope=resolve_scan_scope(args.scope,args.root)
+    cleaner=Cleaner(args.report_dir,force_close=True,protected=args.exclude,restore_history=True,external_volumes=scope['external_volumes'],excluded_roots=scope['excluded_roots'])
+    cleaner.scope_summary=scope
+    cleaner.contain(args.clean);cleaner.registry(args.clean);cleaner.system_persistence(args.clean);cleaner.scan(scope['roots'])
+    if args.clean:cleaner.repair();cleaner.verify()
+    failed=bool(cleaner.errors or cleaner.cancel.is_set() or cleaner.inspection_failed or any(x.get('status') in ('unverified','error','pending') for x in getattr(cleaner,'reparse_points',[])) or args.clean and not (cleaner.verification or {}).get('known_family_clear'))
+    status=1 if failed else 2 if any(not x['kind'].startswith('review_') for x in cleaner.findings) else 0
+    print(json.dumps({'report':str(cleaner.run/'report.json'),'files':cleaner.count,'findings':dict(collections.Counter(x['kind'] for x in cleaner.findings)),'errors':len(cleaner.errors),'skipped':len(cleaner.skipped),'exit_code':status},ensure_ascii=False))
+    return status
+
+def gui_main():
+    from modern_ui import run
+    run(sys.modules[__name__])
+
+if __name__=='__main__':
+    try:raise SystemExit(cli_main())
+    except Exception as ex:
+        if getattr(sys,'frozen',False) and not sys.stdout:
+            ctypes.windll.user32.MessageBoxW(None,str(ex),'蠕虫恢复工具：未完成',0x10)
+        else:raise
