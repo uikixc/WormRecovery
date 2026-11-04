@@ -10,7 +10,16 @@ import time, uuid, winreg, zipfile, xml.etree.ElementTree as ET
 from ctypes import wintypes as W
 import psutil
 
-VERSION = '1.3.1'
+VERSION = '1.3.2'
+WINDOWLESS = sys.stdout is None
+
+def ensure_standard_streams():
+    """Provide file-like streams before libraries initialize console support."""
+    for name in ('stdout', 'stderr'):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, 'w', encoding='utf-8', errors='replace'))
+
+ensure_standard_streams()
 STUB_CODE_SHA256 = '9251b16208e38d5de48130230d5f51036c979843ac33bc52cd31c298dd9cb105'
 AUTOIT_A3X_SHA256 = '6cb8bd1ec21353f2a48f0f37c4125ebd04023153f70a00ceaf9787dd035868fa'
 AUTOIT_EXE_SHA256 = 'fb73a819b37523126c7708a1d06f3b8825fa60c926154ab2d511ba668f49dc4b'
@@ -239,7 +248,9 @@ def office_check(path):
                 if macro[0].filename!='xl/vbaProject.bin' or 'xl/workbook.xml' not in names:return {'status':'review','reason':'已知宏位于非预期文档结构中，需人工核查。'}
                 return {'status':'infected','family':'Synaptics-Excel','vba_hash':h,'vba_part':macro[0].filename}
             from oletools.olevba import VBA_Parser
-            v=VBA_Parser('vbaProject.bin',data=data);mods=list(v.extract_macros());v.close()
+            v=VBA_Parser('vbaProject.bin',data=data)
+            try:mods=list(v.extract_macros())
+            finally:v.close()
             matches=[];others=[]
             for _,stream,name,code in mods:
                 low=code.casefold()
@@ -252,9 +263,13 @@ def office_check(path):
         if p.name.startswith('~$'):return {'status':'lock_file'}
         try:
             from oletools.olevba import VBA_Parser
-            v=VBA_Parser(str(p));has=v.detect_vba_macros();v.close()
+            v=VBA_Parser(str(p))
+            try:has=v.detect_vba_macros()
+            finally:v.close()
             return {'status':'review' if has else 'clean','reason':'旧版二进制文档中的宏需单独核查。' if has else None}
-        except Exception as ex:return {'status':'review','reason':str(ex)}
+        except Exception as ex:return {'status':'review','reason':'文档解析未完成：'+str(ex),'analysis_error':True}
+    except Exception as ex:
+        return {'status':'review','reason':'文档解析未完成：'+str(ex),'analysis_error':True}
 
 def sanitized_xlsx(source,dest):
     """Copy original parts verbatim except VBA relationships/types and visibility."""
@@ -568,7 +583,11 @@ class Cleaner:
         elif ext in OFFICE_EXTS:
             self.scanned_office+=1;info=office_check(path)
             if info['status']=='infected':self.add('infected_office',path,**info)
-            elif info['status']=='review':self.add('review_office',path,**info)
+            elif info['status']=='review':
+                self.add('review_office',path,**info)
+                if info.get('analysis_error'):
+                    self.inspection_failed=True
+                    self.error(path,info['reason'])
     def scan(self,roots=None):
         from reparse_scan import inspect_reparse,resolve_target,CoverageLimit
         roots=self.policy.fixed_roots() if roots is None else roots
@@ -810,6 +829,6 @@ def gui_main():
 if __name__=='__main__':
     try:raise SystemExit(cli_main())
     except Exception as ex:
-        if getattr(sys,'frozen',False) and not sys.stdout:
+        if getattr(sys,'frozen',False) and WINDOWLESS:
             ctypes.windll.user32.MessageBoxW(None,str(ex),'蠕虫恢复工具：未完成',0x10)
         else:raise

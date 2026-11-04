@@ -338,7 +338,10 @@ class ModernWindow:
         for i,r in enumerate(self.result_records):
             review=r['kind'].startswith('review_')
             if self.filter=='review' and not review or self.filter=='confirmed' and review:continue
-            self.tree.insert('',tk.END,iid=str(i),values=('保留待核查' if review else '待修复',LABELS.get(r['kind'],r['kind']),r['path']),tags=('review' if review else 'confirmed',))
+            state=('解析失败' if r.get('analysis_error') else '保留待核查') if review else '待修复'
+            category=LABELS.get(r['kind'],r['kind'])
+            if review and r.get('reason'):category+='：'+r['reason']
+            self.tree.insert('',tk.END,iid=str(i),values=(state,category,r['path']),tags=('review' if review else 'confirmed',))
             visible+=1
         if visible:self.empty.place_forget()
         else:

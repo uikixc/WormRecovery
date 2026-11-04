@@ -101,6 +101,13 @@ class ModernUITests(unittest.TestCase):
         self.app.cleaner=FakeCleaner(emit=lambda s:None)
         self.app.cleaner.events=[{'kind':'registry_inspection','hits':[{'name':'confirmed malicious startup'}]}]
         self.assertTrue(self.app.has_confirmed())
+    def test_parser_failure_displays_reason(self):
+        self.app.result_records=[{'kind':'review_office','path':'C:/test/document.xlsm','analysis_error':True,'reason':'文档解析未完成：测试异常'}]
+        self.app.select_filter('all')
+        self.app.render_results()
+        values=self.app.tree.item(self.app.tree.get_children()[0],'values')
+        self.assertEqual(values[0],'解析失败')
+        self.assertIn('测试异常',values[1])
 
 
 if __name__=='__main__':
