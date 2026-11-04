@@ -108,6 +108,17 @@ class ModernUITests(unittest.TestCase):
         values=self.app.tree.item(self.app.tree.get_children()[0],'values')
         self.assertEqual(values[0],'解析失败')
         self.assertIn('测试异常',values[1])
+    def test_live_progress_shows_current_path_and_file_rate(self):
+        c=FakeCleaner(emit=lambda s:None)
+        c.count=500;c.scan_active=True;c.scan_started=time.monotonic()-5
+        c.last_completed=time.monotonic()-6;c.current_path='C:/test/large.xlsm'
+        self.app.cleaner=c;self.app.busy=True;self.app.started=c.scan_started
+        self.app.root.after_cancel(self.app.timer)
+        self.app.pump()
+        self.assertIn('文件/秒',self.app.detail.get())
+        self.assertIn('large.xlsm',self.app.detail.get())
+        self.assertIn('当前项目处理',self.app.detail.get())
+        self.app.busy=False
 
 
 if __name__=='__main__':

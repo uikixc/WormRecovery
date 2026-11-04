@@ -9,8 +9,9 @@ import os, pathlib, re, shutil, struct, subprocess, sys, tempfile, threading
 import time, uuid, winreg, zipfile, xml.etree.ElementTree as ET
 from ctypes import wintypes as W
 import psutil
+from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.3.2'
+VERSION = '1.3.3'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -94,7 +95,8 @@ class VolumePolicy:
         self.external_volumes={norm(k):v.casefold() for k,v in (external_volumes or {}).items()}
         self.excluded_roots={norm(k) for k in excluded_roots}
     def check(self,path):
-        root=volume(path)
+        return self.check_volume(volume(path))
+    def check_volume(self,root):
         if norm(root) in self.excluded_roots:raise PermissionError('该卷已列入本机排除列表。')
         if root not in self.cache:
             kind=kernel.GetDriveTypeW(root); info=storage_info(root) if kind in (2,3) else {'bus':None,'removable':None}
@@ -372,6 +374,22 @@ class Cleaner:
         rec={'time':datetime.datetime.now().isoformat(timespec='seconds'),'kind':kind,**data};self.events.append(rec)
         with (self.run/'journal.jsonl').open('a',encoding='utf-8') as f:f.write(json.dumps(rec,ensure_ascii=False)+'\n');f.flush();os.fsync(f.fileno())
     def protected_path(self,p):return any(beneath(p,r) for r in self.protected)
+    def root_residue_evidence(self,root):
+        root=pathlib.Path(root)
+        if norm(payload_root(root) or '')!=norm(root) or self.protected_path(root):return False
+        try:
+            self.policy.mutation(root)
+            for name in ('GoogleChrome.a3x','GoogleChrome.exe','WindowsUpdate.lnk','GoogleUpdate.lnk'):
+                p=root/name
+                if not p.is_file() or file_attributes(p)&0x400:continue
+                if name.endswith('.a3x') and digest_file(p)==AUTOIT_A3X_SHA256:return True
+                if name.endswith('.exe') and is_stub(p):return True
+                if name.endswith('.lnk') and (shortcut(p) or {}).get('malicious'):return True
+            if root.is_dir():
+                for p in root.iterdir():
+                    if p.suffix.casefold()=='.lnk' and p.is_file() and not file_attributes(p)&0x400 and digest_file(p) in QUARANTINE_LINK_HASHES:return True
+        except OSError:return False
+        return False
     def confirmed_command(self,command):
         text=os.path.expandvars(str(command))
         pattern=r'"([^"]+)"|((?:[A-Za-z]:[\\/])[^"\r\n]*?\.(?:exe|com|scr|lnk|a3x))(?=\s|$|\")'
@@ -386,11 +404,33 @@ class Cleaner:
                 if extension=='.lnk' and (shortcut(path) or {}).get('malicious'):return True
                 if extension in ('.exe','.com','.scr') and is_stub(path):return True
             except (OSError,ValueError,struct.error):continue
+        root=exact_startup_root(text)
+        if root and self.root_residue_evidence(root):return True
         return False
+    def startup_approved(self,base,prefix,name,branches,source):
+        for branch in branches:
+            sub=(prefix+'\\' if prefix else '')+r'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'+'\\'+branch
+            for view in (winreg.KEY_WOW64_64KEY,winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(base,sub,0,winreg.KEY_READ|winreg.KEY_SET_VALUE|view) as key:
+                        try:value,typ=winreg.QueryValueEx(key,name)
+                        except FileNotFoundError:continue
+                        self.log('startup_approved_backup',key=sub,name=name,type=typ,view=view,value=base64.b64encode(value).decode('ascii') if isinstance(value,bytes) else value,source=source)
+                        if winreg.QueryValueEx(key,name)!=(value,typ):raise RuntimeError('启动项状态已改变，请重新检测。')
+                        winreg.DeleteValue(key,name);self.log('startup_approved_removed',key=sub,name=name,source=source)
+                except FileNotFoundError:pass
+    def shortcut_startup_approved(self,path):
+        p=pathlib.Path(path)
+        common=pathlib.Path(os.environ.get('PROGRAMDATA','C:/ProgramData'))/'Microsoft/Windows/Start Menu/Programs/Startup'
+        user=pathlib.Path(os.environ.get('APPDATA',str(pathlib.Path.home()/'AppData/Roaming')))/'Microsoft/Windows/Start Menu/Programs/Startup'
+        if norm(p.parent)==norm(common):base=winreg.HKEY_LOCAL_MACHINE
+        elif norm(p.parent)==norm(user):base=winreg.HKEY_CURRENT_USER
+        else:return
+        self.startup_approved(base,'',p.name,('StartupFolder',),str(p))
     def error(self,path,ex):self.errors.append({'path':str(path),'error':str(ex)});self.log('error',path=str(path),error=str(ex))
     def add(self,kind,path,**detail):
         record={'kind':kind,'path':str(path),**detail};self.findings.append(record)
-        labels={'infected_office':'受感染文档','infected_executable':'受感染程序','worm_payload':'恶意载荷','worm_hook':'恶意组件','worm_runtime':'恶意缓存','worm_script':'恶意脚本','malicious_shortcut':'恶意快捷方式','review_office':'待核查文档','review_autoit':'待核查脚本'}
+        labels={'infected_office':'受感染文档','infected_executable':'受感染程序','worm_payload':'恶意载荷','worm_hook':'恶意组件','worm_runtime':'恶意缓存','worm_script':'恶意脚本','malicious_shortcut':'恶意快捷方式','worm_residue':'已确认家族残留','review_office':'待核查文档','review_autoit':'待核查脚本'}
         self.emit('检测到'+labels.get(kind,'风险项目')+'：'+str(path));return record
     def backup(self,path):
         self.policy.mutation(path);p=pathlib.Path(path)
@@ -444,18 +484,17 @@ class Cleaner:
                 if p.pid==os.getpid() or (p.info['name'] or '').casefold() in CRITICAL_PROCESSES:continue
                 exe=p.info['exe'];args=p.info['cmdline'] or [];cmd=' '.join(args)
                 if not exe:continue
-                try:self.policy.check(exe)
-                except PermissionError:continue
-                bad=bool(exe and not self.protected_path(exe) and is_stub(exe))
+                # Process containment is independent from file mutation scope.
+                # Reading a live external process image never removes USB samples.
+                bad=bool(is_stub(exe))
                 autoit=False
-                if exe and not self.protected_path(exe) and os.path.isfile(exe) and os.path.getsize(exe)==750320 and digest_file(exe)==AUTOIT_EXE_SHA256:
+                if os.path.isfile(exe) and os.path.getsize(exe)==750320 and digest_file(exe)==AUTOIT_EXE_SHA256 and any(str(a).casefold()=='/autoit3executescript' for a in args[1:]):
                     for arg in args[1:]:
                         script=arg.strip('"')
-                        if os.path.isabs(script):
-                            try:self.policy.check(script)
-                            except PermissionError:continue
                         if os.path.isabs(script) and script.casefold().endswith('.a3x') and os.path.isfile(script) and digest_file(script)==AUTOIT_A3X_SHA256:
                             autoit=True;break
+                        root=exact_script_root(script)
+                        if root and self.root_residue_evidence(root):autoit=True;break
                 if bad or autoit:
                     rec={'pid':p.pid,'exe':exe,'cmdline':cmd,'family':'Synaptics' if bad else 'AutoIt'};hits.append(rec)
                     if apply:self.stop_pid(p.pid,'Confirmed worm process')
@@ -484,14 +523,18 @@ class Cleaner:
                                 except OSError:break
                             for name,value,typ in values:
                                 text=str(value).casefold()
-                                bad=('googlechrome.a3x' in text or ('\\googlechrome\\' in text and any(x in text for x in ('windowsupdate.lnk','googleupdate.lnk'))))
+                                bad=('googlechrome.a3x' in text or exact_startup_root(value) is not None)
                                 if 'synaptics' in text:
                                     target=str(value).strip('"').split('"')[0]
                                     bad=bad or (os.path.isfile(target) and is_stub(target))
                                 if bad:
                                     rec={'hive':label,'key':sub,'view':view,'name':name,'value':value,'type':typ};hits.append(rec)
                                     rec['confirmed']=self.confirmed_command(value)
-                                    if apply and rec['confirmed']:self.log('registry_backup',**rec);winreg.DeleteValue(key,name);self.log('registry_removed',**rec)
+                                    if apply and rec['confirmed']:
+                                        self.log('registry_backup',**rec)
+                                        if winreg.QueryValueEx(key,name)!=(value,typ):raise RuntimeError('启动项已改变，请重新检测。')
+                                        winreg.DeleteValue(key,name);self.log('registry_removed',**rec)
+                                        self.startup_approved(base,prefix,name,('Run','Run32'),value)
                     except FileNotFoundError:pass
                     except OSError as ex:self.error(label+'\\'+sub,ex)
         self.log('registry_inspection',apply=apply,hits=hits);return hits
@@ -580,6 +623,9 @@ class Cleaner:
         elif ext=='.lnk' and st.st_size<1024*1024:
             result=shortcut(path)
             if result and result.get('malicious'):self.add('malicious_shortcut',path,shortcut=result)
+            elif result and result.get('av_placeholder') and payload_root(path) and norm(os.path.dirname(path))==norm(payload_root(path)):
+                fingerprint=digest_file(path)
+                if fingerprint in QUARANTINE_LINK_HASHES:self.add('worm_residue',path,sha256=fingerprint,reason='已确认家族目录内的已知隔离提示快捷方式。')
         elif ext in OFFICE_EXTS:
             self.scanned_office+=1;info=office_check(path)
             if info['status']=='infected':self.add('infected_office',path,**info)
@@ -594,7 +640,8 @@ class Cleaner:
         if not roots:raise ValueError('未指定有效扫描范围。')
         self.findings=[];self.count=0;self.dircount=0;self.scanned_office=0;self.skipped=[];self.reparse_points=[];start=time.monotonic()
         self.scan_roots=list(map(os.path.abspath,roots))
-        self.emit('正在检查所选扫描范围。');stack=[];visited=set();files_seen=set();failed_directories=set()
+        self.scan_active=True;self.scan_started=start;self.current_path='';self.last_progress=start;self.last_completed=start
+        self.emit('正在检查所选扫描范围。');stack=[];visited=set();files_seen=set();failed_directories=set();directory_volumes={}
         def approved(path):
             if self.protected_path(path) or not any(beneath(path,r) for r in self.scan_roots):return False
             try:self.policy.check(path);return True
@@ -605,7 +652,8 @@ class Cleaner:
         def inspect_file(path,st):
             key=norm(path)
             if key in files_seen:return 'target_already_checked'
-            self.scan_file(path,st);files_seen.add(key);return 'target_checked'
+            self.current_path=path
+            self.scan_file(path,st);self.last_completed=time.monotonic();files_seen.add(key);return 'target_checked'
         def inspect_link(path):
             record={'path':path,'status':'pending'};self.reparse_points.append(record)
             try:
@@ -615,7 +663,8 @@ class Cleaner:
                 target=resolved['target'];record['resolved_target']=target;record['chain']=resolved['chain']
                 st=os.stat(target)
                 if os.path.isdir(target):
-                    record['directory_id']=directory_id(target,st);stack.append(target)
+                    record['directory_id']=directory_id(target,st)
+                    directory_volumes[norm(target)]=self.policy.check(target)['root'];stack.append(target)
                 else:record['status']=inspect_file(target,st)
             except CoverageLimit as ex:
                 record['status']='unverified';record['reason']=ex.reason
@@ -624,17 +673,24 @@ class Cleaner:
             except Exception as ex:
                 record['status']='error';record['error']=str(ex);self.error(path,ex)
         for root in roots:
-            self.policy.check(root)
+            info=self.policy.check(root)
+            removed={norm(e['path']) for e in self.events if e['kind']=='empty_payload_directory_removed'}
+            if norm(root) in removed and not os.path.exists(root):
+                self.log('verified_removed_scan_root',path=str(root));continue
             if not os.path.isdir(root):raise ValueError('扫描位置不存在或不是目录：'+str(root))
             if self.protected_path(root):raise ValueError('所选位置已列入排除范围。')
             if file_attributes(root)&0x400:inspect_link(os.path.abspath(root))
-            else:stack.append(os.path.abspath(root))
+            else:
+                directory_volumes[norm(root)]=info['root'];stack.append(os.path.abspath(root))
         while stack and not self.cancel.is_set():
             directory=stack.pop()
             if self.protected_path(directory):
                 self.skipped.append({'path':directory,'reason':'excluded_path'});continue
             try:
-                self.policy.check(directory)
+                # Reparse targets are resolved separately; ordinary entries
+                # inherit the verified parent volume without a Win32 query.
+                root=directory_volumes[norm(directory)]
+                self.policy.check_volume(root);self.current_path=directory
                 identity=directory_id(directory)
                 if identity in visited:continue
                 with os.scandir(directory) as entries:
@@ -647,10 +703,13 @@ class Cleaner:
                             if st.st_file_attributes&0x400:
                                 inspect_link(e.path);continue
                             if e.is_dir(follow_symlinks=False):
-                                self.policy.check(e.path);stack.append(e.path);continue
+                                directory_volumes[norm(e.path)]=root;stack.append(e.path);continue
                             inspect_file(e.path,st)
                         except Exception as ex:self.error(e.path,ex)
-                if self.dircount%500==0:self.emit('已扫描 %s 文件 / %s 目录'%(self.count,self.dircount))
+                self.last_completed=time.monotonic()
+                if self.last_completed-self.last_progress>=1:
+                    self.last_progress=self.last_completed
+                    self.emit('已扫描 %s 文件 / %s 目录；平均 %s 文件/秒'%(self.count,self.dircount,int(self.count/max(.001,self.last_completed-start))))
             except OSError as ex:failed_directories.add(norm(directory));self.error(directory,ex)
         for record in self.reparse_points:
             identity=record.pop('directory_id',None)
@@ -659,13 +718,29 @@ class Cleaner:
                 record['status']='target_visited' if identity in visited and norm(target) not in failed_directories else 'unverified'
                 if record['status']=='unverified':
                     record['reason']='scan_cancelled_or_target_unavailable';self.skipped.append({'path':record['path'],'target':target,'reason':record['reason']})
-        self.scan_seconds=time.monotonic()-start
+        self.scan_seconds=time.monotonic()-start;self.scan_active=False
         self.log('scan_complete',files=self.count,directories=self.dircount,seconds=self.scan_seconds,cancelled=self.cancel.is_set(),findings=len(self.findings),skipped_count=len(self.skipped))
         self.save();return self.findings
     def payload_path(self,path):
         p=pathlib.Path(path);parts=[x.casefold() for x in p.parts]
         root_payload=len(parts)>1 and parts[1] in ('googlechrome','mozillafirefox')
         return root_payload or p.name.casefold().startswith(('~$cache','._cache_')) or ('synaptics' in parts and p.name.casefold()=='synaptics.exe')
+    def cleanup_empty_payload_roots(self,roots):
+        for raw in roots:
+            root=pathlib.Path(raw)
+            if not root.exists():continue
+            self.policy.mutation(root)
+            if self.protected_path(root) or norm(payload_root(root) or '')!=norm(root):continue
+            if any(root.iterdir()):
+                self.log('payload_directory_retained',path=str(root),reason='Contains unclassified files; no recursive deletion')
+                continue
+            attrs=file_attributes(root);self.log('empty_payload_directory_backup',path=str(root),attributes=attrs)
+            if not kernel.SetFileAttributesW(str(root),attrs&~7 or 16):raise ctypes.WinError(ctypes.get_last_error())
+            try:root.rmdir()
+            except OSError:
+                if root.exists():kernel.SetFileAttributesW(str(root),attrs)
+                raise
+            self.log('empty_payload_directory_removed',path=str(root))
     def restore_executable(self,path):
         p=pathlib.Path(path);self.policy.mutation(p);source_hash=digest_file(p);stage=p.with_name('.wormrepair-'+uuid.uuid4().hex+'.tmp');created=[]
         try:
@@ -735,6 +810,7 @@ class Cleaner:
     def repair(self):
         self.initial_findings=list(self.findings)
         self.contain(True);self.registry(True);self.system_persistence(True);self.firewall(True)
+        residue_roots=set()
         for rec in list(self.findings):
             if self.cancel.is_set():break
             kind,p=rec['kind'],pathlib.Path(rec['path'])
@@ -750,6 +826,7 @@ class Cleaner:
                 elif kind=='infected_executable' and not self.payload_path(p):self.restore_executable(p)
                 elif kind=='malicious_shortcut':
                     if not shortcut(p).get('malicious'):raise ValueError('快捷方式已发生变化，请重新检测。')
+                    self.shortcut_startup_approved(p)
                     self.quarantine_file(p,'confirmed AutoIt shortcut')
                     candidate=p.with_suffix('')
                     if candidate.is_dir() and not self.payload_path(candidate) and not beneath(candidate,os.environ.get('WINDIR','C:/Windows')):
@@ -765,7 +842,15 @@ class Cleaner:
                     expected=AUTOIT_EXE_SHA256 if kind=='worm_runtime' else HOOK_SHA256
                     if digest_file(p)!=expected:raise ValueError('组件指纹已发生变化，请重新检测。')
                     self.quarantine_file(p,kind)
+                elif kind=='worm_residue':
+                    if digest_file(p) not in QUARANTINE_LINK_HASHES:raise ValueError('残留文件指纹已改变，请重新检测。')
+                    self.quarantine_file(p,'confirmed family quarantine-link residue')
+                root=payload_root(p)
+                if root:residue_roots.add(root)
             except Exception as ex:self.error(p,ex)
+        for root in residue_roots:
+            try:self.cleanup_empty_payload_roots([root])
+            except Exception as ex:self.error(root,ex)
         try:self.security_settings();self.registry(True)
         except Exception as ex:self.error('security_settings',ex)
         self.save()

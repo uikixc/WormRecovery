@@ -19,7 +19,7 @@ LABELS={
     'infected_office':'Excel 宏感染', 'infected_executable':'程序被包裹',
     'malicious_shortcut':'恶意快捷方式', 'worm_payload':'病毒载荷',
     'worm_script':'恶意 AutoIt 脚本', 'worm_runtime':'病毒缓存',
-    'worm_hook':'病毒组件', 'review_office':'宏文件待核查',
+    'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'宏文件待核查',
     'review_autoit':'脚本待核查'}
 
 
@@ -384,6 +384,14 @@ class ModernWindow:
         if self.busy:
             elapsed=int(time.monotonic()-self.started)
             self.elapsed.set('%02d:%02d 已用时'%(elapsed//60,elapsed%60))
+            c=self.cleaner
+            if c and getattr(c,'scan_active',False):
+                duration=max(.001,time.monotonic()-c.scan_started)
+                pending=max(0,int(time.monotonic()-c.last_completed))
+                text='已检查 %s 个文件 · 平均 %s 文件/秒'%(format(c.count,','),format(int(c.count/duration),','))
+                if pending>=5:text+=' · 当前项目处理已用 %s 秒'%pending
+                path=getattr(c,'current_path','')
+                self.detail.set(text+' · '+(path if len(path)<=85 else '…'+path[-84:]))
         elif self.started:
             value=self.elapsed.get().replace(' 已用时','')
             self.elapsed.set(value+' 已结束' if '已结束' not in value else value)
