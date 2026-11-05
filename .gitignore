@@ -31,4 +31,6 @@ reports/
 .env.*
 *.pem
 *.key
+*.dpapi
+update-signing-key*
 device-protection.json

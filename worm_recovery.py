@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.4.2'
+VERSION = '1.5.0'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -983,6 +983,9 @@ def resolve_scan_scope(mode='internal',manual=None):
     return resolve_scope(powershell,mode,manual)
 
 def cli_main():
+    if len(sys.argv)==3 and sys.argv[1]=='--apply-update':
+        from update_install import run_job
+        return run_job(sys.argv[2])
     if sys.argv[1:]==['--office-analysis-worker']:
         from office_analysis import worker_main
         return worker_main()

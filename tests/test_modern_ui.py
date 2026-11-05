@@ -59,6 +59,48 @@ class ModernUITests(unittest.TestCase):
         self.app=modern_ui.ModernWindow(types.SimpleNamespace(VERSION='test',Cleaner=FakeCleaner,resolve_scan_scope=lambda **kwargs:{'roots':['C:/test'],'external_volumes':{},'excluded_roots':[]}))
         self.app.root.update()
     def tearDown(self):self.app.close()
+    def test_background_update_check_does_not_disable_scan(self):
+        a=self.app;release={'available':False,'version':'1.5.0','private':True}
+        with patch('app_update.check_update',return_value=release):
+            a.check_for_updates(automatic=True)
+            a.launch('scan');self.wait()
+            deadline=time.monotonic()+3
+            while a.update_busy and time.monotonic()<deadline:
+                a.root.update();time.sleep(.01)
+        self.assertFalse(a.update_busy)
+        self.assertEqual(a.metrics['files'].get(),'4,321')
+        self.assertIn('1.5.0',a.update_state.get())
+
+    def test_automatic_update_error_does_not_open_dialog(self):
+        a=self.app;a.update_busy=True
+        with patch.object(modern_ui.messagebox,'showinfo') as message:
+            a.update_event('update_error',{'automatic':True,'message':'网络不可用'})
+        message.assert_not_called();self.assertFalse(a.update_busy)
+        self.assertIn('网络不可用',a.log.get('1.0','end'))
+
+    def test_download_waits_for_active_file_task(self):
+        a=self.app;a.busy=True
+        payload={'path':'C:/update/WormRecovery.exe','info':{'manifest':{}}}
+        a.update_event('update_downloaded',payload)
+        self.assertEqual(a.update_pending_install,payload)
+        self.assertIn('等待',a.update_state.get())
+        a.busy=False
+
+    def test_install_closes_after_current_event_callback(self):
+        a=self.app
+        with patch.object(modern_ui.sys,'frozen',True,create=True),patch.object(modern_ui.messagebox,'askyesno',return_value=True),patch('update_install.start_install') as install,patch.object(a.root,'after_idle') as idle:
+            a.update_event('update_downloaded',{'path':'C:/update/WormRecovery.exe','info':{'manifest':{}}})
+        install.assert_called_once();idle.assert_called_once_with(a.close)
+
+    def test_manual_check_cancels_scheduled_startup_check(self):
+        a=self.app;a.update_timer=a.root.after(60000,lambda:None);timer=a.update_timer
+        with patch('app_update.check_update',return_value={'available':False,'version':'1.5.0'}):
+            a.check_for_updates(automatic=True)
+            deadline=time.monotonic()+3
+            while a.update_busy and time.monotonic()<deadline:
+                a.root.update();time.sleep(.01)
+        self.assertNotIn(timer,a.root.tk.call('after','info'))
+        self.assertIsNone(a.update_timer)
     def wait(self):
         deadline=time.monotonic()+3
         while self.app.busy and time.monotonic()<deadline:

@@ -5,3 +5,4 @@ yara-x==1.22.1
 autoit-ripper==1.2.0
 XLMMacroDeobfuscator==0.2.7
 defusedxml==0.7.1
+cryptography==50.0.2

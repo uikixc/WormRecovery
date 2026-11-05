@@ -5,8 +5,9 @@ import os
 import queue
 import threading
 import time
+import sys
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from office_triage import is_confirmed
 
 BG='#F3F6FA'
@@ -52,6 +53,11 @@ class ModernWindow:
         self.filter='all'
         self.displayed=0
         self.result_records=[]
+        self.update_busy=False
+        self.update_info=None
+        self.update_pending_install=None
+        self.update_cancel=threading.Event()
+        self.update_state=tk.StringVar(value='更新服务：等待检查')
         self.scope=tk.StringVar()
         self.scope_mode=tk.StringVar(value='internal')
         self.scope_description=tk.StringVar(value='本机全部内置磁盘')
@@ -64,6 +70,7 @@ class ModernWindow:
         self.build()
         self.root.protocol('WM_DELETE_WINDOW',self.close)
         self.timer=self.root.after(150,self.pump)
+        self.update_timer=self.root.after(3500,lambda:self.check_for_updates(True)) if getattr(sys,'frozen',False) else None
 
     def style(self):
         self.root.option_add('*Font',(FONT,10))
@@ -119,6 +126,10 @@ class ModernWindow:
         self.nav_log.pack(fill='x',padx=12,pady=4)
         bottom=tk.Frame(sidebar,bg=NAV)
         bottom.pack(side='bottom',fill='x',padx=24,pady=24)
+        tk.Label(bottom,textvariable=self.update_state,bg=NAV,fg='#9DADC2',font=(FONT,8),wraplength=150,justify='left').pack(anchor='w',pady=(0,8))
+        self.update_button=tk.Button(bottom,text='检查更新',command=self.check_for_updates,bg='#1E344C',fg='white',relief='flat',bd=0,padx=12,pady=7)
+        self.update_button.pack(fill='x',pady=3)
+        tk.Button(bottom,text='更新设置',command=self.update_settings,bg=NAV,fg='#ACBED3',relief='flat',bd=0,padx=12,pady=5).pack(fill='x',pady=(0,7))
         self.label(bottom,'本地处理 · '+self.engine.VERSION,fg='#8094AD',font=(FONT,8)).pack(anchor='w')
 
         main=tk.Frame(self.root,bg=BG)
@@ -387,6 +398,9 @@ class ModernWindow:
         try:
             for _ in range(200):
                 generation,kind,payload=self.queue.get_nowait()
+                if kind.startswith('update_'):
+                    self.update_event(kind,payload)
+                    continue
                 if generation!=self.generation:continue
                 if kind=='log':self.append_log(payload)
                 elif kind=='phase':self.status.set(payload);self.detail.set('重新检查文件和已知持久化位置，确认是否还有残留。')
@@ -416,6 +430,9 @@ class ModernWindow:
                         self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
                         self.detail.set('确认残留 %s 项；未确认文件 %s 项；已核对组件 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     self.append_log('报告：'+str(c.run/'report.json'))
+                    if self.update_pending_install:
+                        pending=self.update_pending_install;self.update_pending_install=None
+                        self.root.after_idle(lambda value=pending:self.update_event('update_downloaded',value))
         except queue.Empty:pass
         self.update_metrics()
         if self.busy:
@@ -447,12 +464,103 @@ class ModernWindow:
         if self.cleaner:os.startfile(str(self.cleaner.run))
 
     def close(self):
+        if self.update_busy:
+            self.update_cancel.set()
+            self.update_state.set('正在停止更新下载')
+            return
         if self.busy:
             self.stop()
             self.detail.set('正在停止；请等待当前文件事务完成后再关闭。')
         else:
+            if self.update_timer:
+                self.root.after_cancel(self.update_timer)
+                self.update_timer=None
             self.root.after_cancel(self.timer)
             self.root.destroy()
+
+    def update_settings(self):
+        if self.busy or self.update_busy:return
+        dialog=tk.Toplevel(self.root);dialog.title('更新设置');dialog.geometry('570x300');dialog.transient(self.root);dialog.grab_set()
+        tk.Label(dialog,text='GitHub 私有仓库授权',font=(FONT,12,'bold')).pack(anchor='w',padx=20,pady=(20,8))
+        tk.Label(dialog,text='当前仓库 uikixc/WormRecovery 为私有仓库。\n请输入仅授权该仓库、Contents 只读权限的细粒度访问令牌。\n凭据保存在当前 Windows 用户的凭据管理器，不随程序分发。',justify='left',wraplength=525).pack(anchor='w',padx=20)
+        entry=ttk.Entry(dialog,show='•',width=65);entry.pack(fill='x',padx=20,pady=15)
+        tk.Label(dialog,text='私有附件使用 GitHub 授权直连；公共附件自动测速并切换加速线路。',fg=MUTED,wraplength=525,justify='left').pack(anchor='w',padx=20)
+        row=tk.Frame(dialog);row.pack(fill='x',padx=20,pady=18)
+        def save():
+            try:
+                from update_security import save_token
+                save_token(entry.get());entry.delete(0,'end');dialog.destroy()
+                self.update_state.set('设备授权已保存');self.check_for_updates()
+            except Exception as ex:messagebox.showerror('无法保存授权',str(ex),parent=dialog)
+        def remove():
+            try:
+                from update_security import delete_token
+                delete_token();entry.delete(0,'end');dialog.destroy();self.update_state.set('设备授权已移除')
+            except Exception as ex:messagebox.showerror('无法移除授权',str(ex),parent=dialog)
+        ttk.Button(row,text='保存授权并检查',command=save).pack(side='left')
+        ttk.Button(row,text='移除授权',command=remove).pack(side='right')
+
+    def check_for_updates(self,automatic=False):
+        if self.update_timer:self.root.after_cancel(self.update_timer)
+        self.update_timer=None
+        if self.update_busy:return
+        if self.busy:
+            self.update_state.set('当前任务完成后可检查更新')
+            return
+        self.update_busy=True;self.update_cancel.clear();self.update_state.set('正在检查 GitHub Release')
+        self.update_button.configure(state='disabled')
+        def check():
+            try:
+                from app_update import check_update
+                info=check_update(self.engine.VERSION)
+                self.queue.put((None,'update_checked',{'automatic':automatic,'info':info}))
+            except Exception as ex:self.queue.put((None,'update_error',{'automatic':automatic,'message':str(ex)}))
+        threading.Thread(target=check,daemon=True).start()
+
+    def download_new_version(self):
+        if self.busy or self.update_busy or not self.update_info:return
+        self.update_busy=True;self.update_cancel.clear();self.update_button.configure(state='disabled')
+        info=self.update_info
+        def download():
+            try:
+                from app_update import download_update
+                path=download_update(info,lambda value:self.queue.put((None,'update_progress',value)),self.update_cancel)
+                self.queue.put((None,'update_downloaded',{'path':str(path),'info':info}))
+            except Exception as ex:self.queue.put((None,'update_error',{'automatic':False,'message':str(ex)}))
+        threading.Thread(target=download,daemon=True).start()
+
+    def update_event(self,kind,payload):
+        if kind=='update_progress':
+            if payload.get('total'):
+                percent=100*payload['received']/payload['total']
+                self.update_state.set('下载 %.1f%% · %s'%(percent,payload.get('route','')))
+            else:self.update_state.set(payload.get('message','正在准备更新'))
+            return
+        self.update_busy=False;self.update_button.configure(state='normal')
+        if kind=='update_error':
+            self.update_state.set('更新检查或下载未完成')
+            self.append_log('更新：'+payload['message'])
+            if not payload.get('automatic'):messagebox.showinfo('更新未完成',payload['message'],parent=self.root)
+        elif kind=='update_checked':
+            info=payload['info'];self.update_info=info if info['available'] else None
+            self.update_state.set('发现新版本 '+info['version'] if info['available'] else '已是最新版本 '+info['version'])
+            if info['available'] and not self.busy:
+                text='发现 WormRecovery '+info['version']+'。\n下载完成并验证发布签名后，可原位更新。\n\n现在下载？'
+                if messagebox.askyesno('软件更新',text,parent=self.root):self.download_new_version()
+        elif kind=='update_downloaded':
+            self.update_state.set('更新已下载并通过签名校验')
+            if self.busy:
+                self.update_pending_install=payload
+                self.update_state.set('更新已下载，等待当前任务完成')
+                return
+            if not getattr(sys,'frozen',False):
+                self.append_log('更新文件：'+payload['path']);return
+            if messagebox.askyesno('安装更新','更新文件已验证。程序将退出、保留旧版备份并原位替换，然后重新启动。\n\n现在安装？',parent=self.root):
+                try:
+                    from update_install import start_install
+                    start_install(payload['path'],payload['info']['manifest'])
+                    self.root.after_idle(self.close)
+                except Exception as ex:messagebox.showerror('无法安装更新',str(ex),parent=self.root)
 
 
 def run(engine):
