@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.5.1'
+VERSION = '1.6.0'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -246,6 +246,8 @@ def office_check(path):
 def _office_check(path):
     p=pathlib.Path(path)
     try:
+        with p.open('rb') as header:prefix=header.read(16)
+        if not prefix:return {'status':'review','reason':'文件内容为空，无法恢复缺失正文；需要原文件或备份。','document_format':'empty','analysis_error':True,'error_category':'empty_document'}
         with zipfile.ZipFile(p) as z:
             entries=z.infolist()
             if len(entries)>20000 or sum(x.file_size for x in entries)>1024*1024*1024:return {'status':'review','reason':'文档超过检查资源上限，需进一步核查。'}
@@ -268,10 +270,21 @@ def _office_check(path):
             return attach_evidence(result,structure)
     except zipfile.BadZipFile:
         if p.name.startswith('~$'):return {'status':'lock_file'}
+        if prefix.lstrip().startswith(b'{\\rtf'):
+            from document_formats import inspect_rtf
+            return inspect_rtf(p)
+        if not prefix.startswith(bytes.fromhex('d0cf11e0a1b11ae1')):
+            return {'status':'review','analysis_error':True,'document_format':'unrecognized',
+                    'reason':'文件内容不是可识别的 Office 容器或 RTF，可能为扩展名不符、损坏或其他格式；未判为病毒。'}
         try:
             from oletools.olevba import VBA_Parser
             v=VBA_Parser(str(p))
-            try:has=v.detect_vba_macros()
+            try:
+                has=v.detect_vba_macros()
+                if has:
+                    from secondary_analysis import parser_request
+                    analysis=parser_request('legacy_office',p)
+                    return dict(analysis,document_format='ole')
             finally:v.close()
             return {'status':'review' if has else 'clean','reason':'旧版二进制文档中的宏需单独核查。' if has else None}
         except Exception as ex:return {'status':'review','reason':'文档解析未完成：'+str(ex),'analysis_error':True}

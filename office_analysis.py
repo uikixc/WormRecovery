@@ -79,6 +79,8 @@ def inspect_project(data):
         rule_pcode = scan_bytes(pcode.encode('utf-8'))
         mr = MacroRaptor(source)
         mr.scan()
+        from macro_verdict import inspect_behavior
+        behavior=inspect_behavior(source,pcode)
         indicators = []
         for keyword in ('Shell', 'CreateObject', 'RegWrite', 'RegKeySave', 'VBProject',
                         'VBComponents', 'SaveAs', 'Workbook_Open', 'Document_Open',
@@ -94,6 +96,7 @@ def inspect_project(data):
                 'pcode_indicators': indicators, 'source_behavior_flags': mr.get_flags(),
                 'content_rules': {'source': rule_source, 'pcode': rule_pcode},
                 'source_behavior_suspicious': bool(mr.suspicious),
+                'behavior_analysis':behavior,
                 'analysis_method': 'olevba + MacroRaptor + pcodedmp; offline static analysis',
                 'analysis_limit': '源码与返回的编译指令仅作静态证据；未返回指令时不授权自动清理，未证明完整运行行为或所有威胁不存在。'}
     finally:

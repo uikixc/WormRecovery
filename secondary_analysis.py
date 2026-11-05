@@ -126,7 +126,7 @@ def clam_batch(paths, work, timeout=180, cancel=None):
 def worker_request(request):
     """Selected parsers only; no specimen is launched or sent to a server."""
     mode = request.get('mode')
-    if mode not in ('autoit', 'xlm'):
+    if mode not in ('autoit', 'xlm','legacy_office'):
         raise ValueError('未知离线分析任务。')
     path = Path(request['path'])
     if not path.is_file() or path.stat().st_size > MAX_INPUT:
@@ -144,6 +144,13 @@ def worker_request(request):
         if event.startswith(('subprocess.', 'os.exec', 'os.spawn')) or event in ('os.system', 'socket.connect', 'socket.bind'):
             raise PermissionError('离线解析任务禁止启动外部程序或建立网络连接。')
     sys.addaudithook(parser_audit)
+    if mode=='legacy_office':
+        from office_analysis import inspect_project
+        analysis=inspect_project(path.read_bytes())
+        return {'status':'review','macro':True,'macro_analysis':analysis,
+                'has_family_macro':bool(analysis.get('family_modules')),
+                'other_modules':analysis.get('other_modules',[]),
+                'reason':'旧版 Office 宏已完成源码、编译指令和内容特征检查。'}
     if mode == 'autoit':
         from autoit_ripper import extract
         extracted = extract(path.read_bytes())
@@ -322,6 +329,8 @@ def enrich_reviews(cleaner):
             if failures:
                 row['analysis_incomplete_engines'] = failures
                 cleaner.inspection_failed = True
+            from office_triage import decide_after_engines
+            decide_after_engines(row)
             cleaner.log('secondary_analysis', path=row['path'], sha256=row['analysis_sha256'], result=evidence)
             phase('离线复核进度',row['path'],index+1)
         if cleaner.cancel.is_set():

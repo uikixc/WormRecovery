@@ -21,6 +21,16 @@ def is_confirmed(record):
 
 def installation_component(path):
     path=ntpath.normcase(ntpath.abspath(str(path)))
+    # An offline Windows installation may be mounted under another drive letter.
+    # Drive-independent directory matching still requires an exact content pin.
+    drive,tail=ntpath.splitdrive(path)
+    if drive and not drive.startswith('\\'):
+        parts=tail.strip('\\').split('\\')
+        if len(parts)>=5 and parts[0] in ('program files','program files (x86)') and parts[1]=='microsoft office':
+            rest=parts[2:]
+            if rest and rest[0]=='root':rest=rest[1:]
+            if len(rest)>=3 and rest[0].startswith('office') and rest[1] in ('library','samples'):return True
+        if len(parts)>=6 and parts[:4]==['windows','installer','$patchcache$','managed']:return True
     for env,default in (('ProgramFiles','C:/Program Files'),('ProgramFiles(x86)','C:/Program Files (x86)')):
         root=ntpath.normcase(ntpath.join(os.environ.get(env,default),'Microsoft Office'))
         if path.startswith(root+'\\'):
@@ -51,7 +61,7 @@ def assess_office(path,result):
     if result.get('analysis_error'):
         result.update(assessment='analysis_incomplete',action='暂勿打开或启用宏；保留原件，查看解析错误并使用已更新的安全软件检查。')
     elif result.get('active_content_unresolved'):
-        names={'xlm_macro_sheet':'Excel 4.0 宏表','auto_macro_name':'自动运行宏名称','embedded_object':'嵌入对象','activex':'ActiveX 控件','external_data':'外部数据连接','external_relationship':'外部内容关系','dde_field':'DDE 字段'}
+        names={'xlm_macro_sheet':'Excel 4.0 宏表','auto_macro_name':'自动运行宏名称','embedded_object':'嵌入对象','activex':'ActiveX 控件','external_data':'外部数据连接','external_relationship':'外部内容关系','dde_field':'DDE 字段','external_book_link':'工作簿数据链接','external_executable_link':'DDE/OLE 外部执行连接'}
         types=list(dict.fromkeys(names.get(row['kind'],row['kind']) for row in result.get('structural_evidence',[])))
         result.update(assessment='active_content_unresolved',reason='检测到'+ '、'.join(types)+'；存在此类内容不等于已感染，但当前检查不能证明其安全。',action='保留原件，暂勿启用宏、外部内容或嵌入对象；需要针对列出的活动内容进一步检查，不自动删除或转换格式。')
     elif result.get('has_family_macro'):
@@ -61,3 +71,17 @@ def assess_office(path,result):
         if result.get('other_modules') is not None:
             result['reason']='含宏项目，未匹配本次蠕虫；文件来源与宏用途尚未验证。'
     return result
+
+
+def decide_after_engines(row):
+    """Offline final decision from typed evidence, never from no-match alone."""
+    from document_verdict import assess_document
+    decision=assess_document(row)
+    row['decision']=decision
+    if decision['classification']=='suspicious':
+        row.update(reason=decision['reason'],action='保留原件并禁用活动内容；已有行为证据，不能按无害资源忽略。')
+    if decision['classification']=='informational':
+        row.update(kind='info_office' if decision['rule']=='reviewed_office_component' else 'info_document',status='info',assessment=decision['rule'],reason=decision['reason'],
+                   action='保留，无需删除、转换格式或移除内容。',assessment_basis=decision['basis'],
+                   assessment_limit=decision['scope'])
+    return decision

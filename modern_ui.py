@@ -21,11 +21,13 @@ LABELS={
     'infected_office':'Excel 宏感染', 'infected_executable':'程序被包裹',
     'malicious_shortcut':'恶意快捷方式', 'worm_payload':'病毒载荷',
     'worm_script':'恶意 AutoIt 脚本', 'worm_runtime':'病毒缓存',
-    'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'Office 活动内容', 'info_office':'已核对的 Office 组件',
+    'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'Office 活动内容', 'info_office':'已核对的 Office 组件','info_document':'已分析的文档资源',
     'review_autoit':'AutoIt 脚本','review_script':'脚本行为','review_binary':'程序行为'}
 
 
 def review_state(record):
+    decision=record.get('decision',{})
+    if decision.get('classification')=='suspicious':return '高风险行为'
     secondary=record.get('secondary_analysis',{})
     if secondary.get('status')=='detected':return '引擎检出'
     if record.get('analysis_error'):return '解析失败'
@@ -191,7 +193,7 @@ class ModernWindow:
         self.panel_title=self.label(toolbar,'扫描结果',font=(FONT,11,'bold'))
         self.panel_title.pack(side='left')
         self.filters={}
-        for key,title in [('errors','检查异常'),('info','组件说明'),('review','需进一步检查'),('confirmed','确认感染'),('all','全部')]:
+        for key,title in [('errors','检查异常'),('info','分析说明'),('review','需进一步检查'),('confirmed','确认感染'),('all','全部')]:
             b=tk.Button(toolbar,text=title,command=lambda k=key:self.select_filter(k),bg='white',fg=MUTED,
                         activebackground='#E9F3F4',activeforeground=ACCENT,relief='flat',bd=0,padx=10,pady=3,cursor='hand2')
             b.pack(side='right',padx=2)
@@ -283,6 +285,8 @@ class ModernWindow:
             text=record['path']
             for key in ('reason','action','assessment_limit','error'):
                 if record.get(key):text+='\n'+record[key]
+            decision=record.get('decision',{})
+            if decision:text+='\n自动判定：'+decision.get('reason','')+'\n判定依据：'+decision.get('basis','')
             secondary=record.get('secondary_analysis',{})
             if secondary:
                 names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA','office_parser':'Office 解析'}
@@ -424,11 +428,11 @@ class ModernWindow:
                     if c.cancel.is_set():self.status.set('已停止');self.detail.set('已完成的文件事务已保存；重新扫描后再修复。')
                     elif payload=='scan':
                         self.status.set('检测完成')
-                        self.detail.set('确认感染 %s 项，未确认文件 %s 项，已核对组件 %s 项，检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
+                        self.detail.set('确认感染 %s 项，未确认文件 %s 项，已自动归类说明 %s 项，检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     else:
                         complete=(getattr(c,'verification',None) or {}).get('known_family_clear',False)
                         self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
-                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；已核对组件 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
+                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；已自动归类说明 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     self.append_log('报告：'+str(c.run/'report.json'))
                     if self.update_pending_install:
                         pending=self.update_pending_install;self.update_pending_install=None
@@ -558,6 +562,7 @@ class ModernWindow:
             if not payload.get('automatic'):messagebox.showinfo('更新未完成',payload['message'],parent=self.root)
         elif kind=='update_checked':
             info=payload['info'];self.update_info=info if info['available'] else None
+            if info.get('metadata_fallback'):self.append_log(info.get('diagnostics','已通过备用线路验证更新清单。')+' 线路：'+info.get('metadata_route',''))
             self.update_state.set('发现新版本 '+info['version'] if info['available'] else '已是最新版本 '+info['version'])
             if info['available'] and not self.busy:
                 text='发现 WormRecovery '+info['version']+'。\n下载完成并验证发布签名后，可原位更新。\n\n现在下载？'

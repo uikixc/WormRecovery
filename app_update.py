@@ -1,5 +1,5 @@
 """GitHub release checks, authenticated private downloads and public mirrors."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor,as_completed
 import hashlib
 import json
 import os
@@ -11,6 +11,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import socket
+import ssl
 
 from update_security import REPOSITORY,load_token,verify_manifest,verify_file,version_tuple
 
@@ -56,13 +58,22 @@ def read_json(url,token=None,asset=False):
         with open_url(url,token,accept='application/octet-stream' if asset else 'application/vnd.github+json') as response:
             data=response.read(MAX_METADATA+1)
         if len(data)>MAX_METADATA:raise UpdateError('更新元数据超过限制。')
-        return json.loads(data.decode('utf-8'))
+        document=json.loads(data.decode('utf-8-sig'))
+        if not isinstance(document,dict):raise ValueError('metadata object expected')
+        return document
     except urllib.error.HTTPError as ex:
         if ex.code in (401,403):raise UpdateError('GitHub 授权无效、权限不足或访问频率受限，请检查更新设置。') from None
         if ex.code==404:raise UpdateError('尚无正式 Release，或当前设备无权读取此私有仓库。') from None
         raise UpdateError('GitHub 请求失败：HTTP '+str(ex.code)) from None
     except (OSError,ValueError) as ex:
-        raise UpdateError('更新服务暂不可用，离线检测和恢复仍可使用。') from None
+        cause=getattr(ex,'reason',ex)
+        if isinstance(cause,(TimeoutError,socket.timeout)):reason='连接超时'
+        elif isinstance(cause,socket.gaierror):reason='DNS 名称解析失败'
+        elif isinstance(cause,ssl.SSLCertVerificationError):reason='HTTPS 证书验证失败'
+        elif isinstance(cause,ssl.SSLError):reason='TLS 连接失败'
+        elif isinstance(ex,ValueError):reason='服务返回的版本清单格式无效'
+        else:reason='网络连接失败'
+        raise UpdateError(reason+'；离线检测和恢复仍可使用。') from None
 
 
 def validate_asset_url(url,tag):
@@ -73,12 +84,13 @@ def validate_asset_url(url,tag):
     return url
 
 
-def check_update(current_version,token=None):
-    token=load_token() if token is None else token
+def _api_check(current_version,token=None):
     repository=read_json(API,token)
     private=repository.get('private')
     if type(private) is not bool:raise UpdateError('无法确认仓库可见性。')
-    release=read_json(API+'/releases/latest',token)
+    try:release=read_json(API+'/releases/latest',token)
+    except UpdateError as ex:
+        ex.private=private;raise
     if release.get('draft') or release.get('prerelease'):raise UpdateError('更新版本不是正式发布。')
     latest=version_tuple(release.get('tag_name'))
     if latest<=version_tuple(current_version):return {'available':False,'version':release['tag_name'].lstrip('v'),'private':private}
@@ -86,7 +98,9 @@ def check_update(current_version,token=None):
     if not all(name in assets for name in ('update-manifest.json','WormRecovery.exe')):raise UpdateError('此 Release 缺少完整更新附件。')
     for item in assets.values():
         if type(item.get('id')) is not int:raise UpdateError('Release 附件标识无效。')
-    signed=read_json(API+'/releases/assets/'+str(assets['update-manifest.json']['id']),token,asset=True)
+    try:signed=read_json(API+'/releases/assets/'+str(assets['update-manifest.json']['id']),token,asset=True)
+    except UpdateError as ex:
+        ex.private=private;raise
     payload=verify_manifest(signed)
     if version_tuple(payload['version'])!=latest or assets['WormRecovery.exe'].get('size')!=payload['bytes']:
         raise UpdateError('签名清单与 Release 附件不一致。')
@@ -94,6 +108,44 @@ def check_update(current_version,token=None):
     return {'available':True,'version':payload['version'],'private':private,'manifest':signed,
         'asset_id':assets['WormRecovery.exe']['id'],'public_url':assets['WormRecovery.exe']['browser_download_url'],
         'notes':str(release.get('body',''))[:12000]}
+
+
+def public_manifest_check(current_version,api_error):
+    """Public channel fallback independent of API availability; always verify signature."""
+    url='https://github.com/'+REPOSITORY+'/releases/latest/download/update-manifest.json'
+    routes=[(name,prefix+url) for name,prefix in PUBLIC_MIRRORS]
+    successes=[];failures=[]
+    def fetch(route):
+        name,target=route
+        try:
+            signed=read_json(target,token='',asset=True)
+            payload=verify_manifest(signed)
+            return name,signed,payload,None
+        except Exception as ex:
+            return name,None,None,str(ex) if isinstance(ex,UpdateError) else '发布签名或清单校验失败'
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for future in as_completed([executor.submit(fetch,route) for route in routes]):
+            name,signed,payload,error=future.result()
+            if payload:successes.append((version_tuple(payload['version']),name,signed,payload))
+            else:failures.append(name+'：'+error)
+    if not successes:
+        raise UpdateError('版本检查未完成。GitHub API：'+str(api_error)+'；备用线路：'+'；'.join(failures))
+    latest,name,signed,payload=max(successes,key=lambda item:item[0])
+    available=latest>version_tuple(current_version)
+    return {'available':available,'version':payload['version'],'private':False,'manifest':signed,
+            'asset_id':None,'public_url':'https://github.com/'+REPOSITORY+'/releases/download/v'+payload['version']+'/WormRecovery.exe',
+            'notes':'','metadata_route':name,'metadata_fallback':True,
+            'diagnostics':'GitHub API 未完成，已通过备用线路获取并验证发布清单。'}
+
+
+def check_update(current_version,token=None):
+    if token is None:
+        try:token=load_token()
+        except OSError:token=''
+    try:return _api_check(current_version,token)
+    except UpdateError as ex:
+        if getattr(ex,'private',False):raise
+        return public_manifest_check(current_version,ex)
 
 
 def routes_for(info):

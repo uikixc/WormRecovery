@@ -22,6 +22,15 @@ def validate(executable, output, vba_fixture=None):
         portable = program / 'WormRecovery.exe'
         shutil.copy2(executable, portable)
         write_xlm_fixture(inputs / 'inert-xlm.xlsm')
+        if __import__('worm_recovery').VERSION>='1.6.0':
+            with zipfile.ZipFile(inputs/'inert-linked-resource.pptx','w') as archive:
+                archive.writestr('[Content_Types].xml','<Types/>')
+                archive.writestr('ppt/presentation.xml','<presentation/>')
+                archive.writestr('ppt/_rels/presentation.xml.rels','<Relationships><Relationship Type="x/image" TargetMode="External" Target="file:///C:/images/inert.png"/></Relationships>')
+            with zipfile.ZipFile(inputs/'inert-external-data.xlsx','w') as archive:
+                archive.writestr('[Content_Types].xml','<Types/>');archive.writestr('xl/workbook.xml','<workbook/>')
+                archive.writestr('xl/externalLinks/externalLink1.xml','<externalLink><externalBook/></externalLink>')
+                archive.writestr('xl/externalLinks/_rels/externalLink1.xml.rels','<Relationships><Relationship Type="x/externalLinkPath" TargetMode="External" Target="file:///C:/data/inert.xlsx"/></Relationships>')
         (inputs / 'inert-unknown.a3x').write_bytes(b'Harmless unsupported AutoIt parser fixture.')
         binary = inputs / 'inert-family-combination.exe'
         shutil.copy2('C:/Windows/System32/where.exe', binary)
@@ -62,7 +71,7 @@ def validate(executable, output, vba_fixture=None):
                   'capa_ran': pe.get('capa', {}).get('status') == 'analyzed',
                   'rea_ran': pe.get('rea', {}).get('status') == 'analyzed',
                   'autoit_unsupported_explicit': autoit.get('autoit', {}).get('status') == 'unsupported',
-                  'unknowns_preserved': all(row['kind'].startswith('review_') for row in findings.values()),
+                  'unknowns_preserved': all(row['kind'].startswith('review_') for name,row in findings.items() if name not in ('inert-linked-resource.pptx','inert-external-data.xlsx')),
                   'no_scan_errors': not scan['errors'],
                   'uncompleted_is_failure': scan['inspection_failed'] and result.returncode == 1}
         if __import__('worm_recovery').VERSION>='1.5.1':
@@ -73,6 +82,9 @@ def validate(executable, output, vba_fixture=None):
         if vba_fixture:
             macro=findings.get('static-vba-regression.xlsm',{})
             checks['real_vba_json_transport']=not macro.get('analysis_error') and macro.get('macro_analysis',{}).get('pcode_status')=='instructions_read'
+        if __import__('worm_recovery').VERSION>='1.6.0':
+            checks['resources_classified_inside_exe']=all(findings.get(name,{}).get('kind')=='info_document' for name in ('inert-linked-resource.pptx','inert-external-data.xlsx'))
+            checks['vba_behavior_engine_ran']=bool(findings.get('static-vba-regression.xlsm',{}).get('macro_analysis',{}).get('behavior_analysis')) if vba_fixture else True
         record = {'passed': all(checks.values()), 'checks': checks,
                   'elapsed_seconds': round(time.monotonic() - started, 2), 'exit_code': result.returncode,
                   'source_exe': str(Path(executable).resolve()), 'exe_bytes': portable.stat().st_size,

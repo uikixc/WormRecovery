@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest.mock import patch
 import urllib.request
+import urllib.error
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding,PublicFormat
@@ -72,6 +73,29 @@ class UpdateSecurityTests(unittest.TestCase):
 
 
 class UpdateFlowTests(unittest.TestCase):
+    def test_api_failure_uses_signed_public_metadata_without_sending_token(self):
+        _,document,key=signed_fixture(version='1.6.0')
+        def read(url,token=None,asset=False):
+            if url==update.API:raise update.UpdateError('DNS 名称解析失败')
+            self.assertEqual(token,'');self.assertIn('/releases/latest/download/update-manifest.json',url)
+            return document
+        with patch.object(update,'read_json',side_effect=read),patch('update_trust.UPDATE_PUBLIC_KEY',key):
+            info=update.check_update('1.5.1',token='private-fixture')
+        self.assertTrue(info['available']);self.assertFalse(info['private']);self.assertTrue(info['metadata_fallback'])
+
+    def test_private_repository_failure_does_not_try_public_metadata(self):
+        with patch.object(update,'read_json',side_effect=[{'private':True},update.UpdateError('denied')]),patch.object(update,'public_manifest_check') as fallback:
+            with self.assertRaises(update.UpdateError):update.check_update('1.5.1',token='fixture')
+        fallback.assert_not_called()
+
+    def test_unsigned_fallback_metadata_cannot_be_used(self):
+        with patch.object(update,'read_json',side_effect=lambda *a,**kw:{'payload':{},'signature':'invalid'}):
+            with self.assertRaises(update.UpdateError):update.public_manifest_check('1.5.1','offline')
+
+    def test_timeout_error_has_a_specific_reason(self):
+        with patch.object(update,'open_url',side_effect=urllib.error.URLError(TimeoutError())):
+            with self.assertRaisesRegex(update.UpdateError,'连接超时'):update.read_json(update.API)
+
     def test_release_check_verifies_signature_and_size(self):
         content,document,key=signed_fixture()
         release={'tag_name':'v1.5.1','draft':False,'prerelease':False,'assets':[
