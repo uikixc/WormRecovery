@@ -51,7 +51,7 @@ class DeviceScopeTests(unittest.TestCase):
         self.assertTrue(parameters['force_close'].default)
         self.assertTrue(parameters['restore_history'].default)
     def test_pe_access_error_is_not_reported_as_clean(self):
-        with patch('builtins.open',side_effect=PermissionError('locked')):
+        with patch.object(wr,'open_read',side_effect=PermissionError('locked')):
             with self.assertRaises(PermissionError):wr.is_stub('C:/locked.exe',strict=True)
 
 if __name__=='__main__':

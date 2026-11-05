@@ -38,5 +38,13 @@ class CoverageErrorTests(unittest.TestCase):
             self.assertEqual(c.errors[0]['category'],'active_pagefile_unreadable')
             self.assertIn('permission denied',c.errors[0]['error'])
 
+    def test_backup_read_sharing_violation_still_explains_paging_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c=w.Cleaner(report_dir=Path(temp)/'reports',emit=lambda _:None)
+            with patch('coverage_errors.active_pagefiles',return_value={'C:/pagefile.sys'}):
+                c.error('C:/pagefile.sys',OSError('[WinError 32] sharing violation'))
+            self.assertEqual(c.errors[0]['category'],'active_pagefile_unreadable')
+            self.assertFalse(c.errors[0]['content_inspected'])
+
 
 if __name__=='__main__':unittest.main()

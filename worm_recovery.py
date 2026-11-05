@@ -9,12 +9,13 @@ import os, pathlib, re, shutil, struct, subprocess, sys, tempfile, threading
 import time, uuid, winreg, zipfile, xml.etree.ElementTree as ET
 from ctypes import wintypes as W
 import psutil
+from windows_read import open_read,extended_path
 from office_triage import assess_office,is_confirmed
 from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.2'
+VERSION = '1.7.3'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -56,7 +57,7 @@ kernel.ReplaceFileW.restype=W.BOOL
 
 def digest_file(path):
     h=hashlib.sha256()
-    with open(path,'rb') as f:
+    with open_read(path) as f:
         while b:=f.read(4*1024*1024):h.update(b)
     return h.hexdigest()
 
@@ -67,7 +68,7 @@ def norm(path):return os.path.normcase(os.path.abspath(path)).rstrip('\\/')
 def beneath(path,root):return norm(path)==norm(root) or norm(path).startswith(norm(root)+os.sep)
 
 def file_attributes(path):
-    a=kernel.GetFileAttributesW(str(path))
+    a=kernel.GetFileAttributesW(extended_path(path))
     if a==0xffffffff:raise ctypes.WinError(ctypes.get_last_error())
     return a
 
@@ -133,7 +134,7 @@ class VolumePolicy:
 class PEView:
     """Small read-only PE header/resource reader; streams large original payloads."""
     def __init__(self,path):
-        self.path=pathlib.Path(path); self.f=open(path,'rb');self.size=os.fstat(self.f.fileno()).st_size
+        self.path=pathlib.Path(path); self.f=open_read(path);self.size=os.fstat(self.f.fileno()).st_size
         try:
             h=self.read(0,64)
             if h[:2]!=b'MZ':raise ValueError('not PE')
@@ -206,7 +207,7 @@ class PEView:
 
 def is_stub(path,strict=False,data=None):
     try:
-        with (io.BytesIO(data) if data is not None else open(path,'rb')) as f:
+        with (io.BytesIO(data) if data is not None else open_read(path)) as f:
             h=f.read(4096)
             if len(h)<64 or h[:2]!=b'MZ':return False
             off=struct.unpack_from('<I',h,60)[0]
@@ -221,7 +222,7 @@ def is_stub(path,strict=False,data=None):
     except (ValueError,struct.error):return False
 
 def shortcut(path):
-    b=pathlib.Path(path).read_bytes()
+    with open_read(path) as stream:b=stream.read()
     if len(b)<76 or b[:4]!=bytes.fromhex('4c000000') or b[4:20]!=bytes.fromhex('0114020000000000c000000000000046'):return None
     flags=struct.unpack_from('<I',b,20)[0];pos=76;strings={}
     if flags&1:
@@ -248,9 +249,9 @@ def office_check(path):
 def _office_check(path):
     p=pathlib.Path(path)
     try:
-        with p.open('rb') as header:prefix=header.read(16)
+        with open_read(p) as header:prefix=header.read(16)
         if not prefix:return {'status':'review','reason':'文件内容为空，无法恢复缺失正文；需要原文件或备份。','document_format':'empty','analysis_error':True,'error_category':'empty_document'}
-        with zipfile.ZipFile(p) as z:
+        with open_read(p) as package,zipfile.ZipFile(package) as z:
             entries=z.infolist()
             if len(entries)>20000 or sum(x.file_size for x in entries)>1024*1024*1024:return {'status':'review','reason':'文档超过检查资源上限，需进一步核查。'}
             names=[x.filename for x in entries]
@@ -268,7 +269,8 @@ def _office_check(path):
             matches=analysis['family_modules'];others=analysis['other_modules']
             result={'status':'review','reason':'未识别宏已完成源码及编译指令特征检查，尚未确认感染。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h,'macro_analysis':analysis}
             if matches and not others and analysis.get('pcode_family_match') and macro[0].filename=='xl/vbaProject.bin':
-                result.update(status='infected',family='Synaptics-Excel',vba_part=macro[0].filename)
+                result.update(status='infected',family='Synaptics-Excel',vba_part=macro[0].filename,
+                              reason='宏源码与编译指令均匹配 Synaptics-Excel 感染特征，已确认感染。')
             return attach_evidence(result,structure)
     except zipfile.BadZipFile:
         if p.name.startswith('~$'):return {'status':'lock_file'}
@@ -383,7 +385,7 @@ def inspect_file_content(path,st):
     if ext in EXE_EXTS or name.startswith(('~$cache','._cache_')):
         data=None
         if st.st_size<=16*1024*1024:
-            with open(path,'rb') as stream:data=stream.read(st.st_size+1)
+            with open_read(path) as stream:data=stream.read(st.st_size+1)
             if len(data)!=st.st_size:raise ValueError('检查时文件大小发生变化，请重新扫描。')
         if is_stub(path,strict=True,data=data):
             with PEView(path) as pe:original=pe.resource('EXERESX')
@@ -392,14 +394,15 @@ def inspect_file_content(path,st):
         elif name.startswith('._cache_') and st.st_size==750320 and (hashlib.sha256(data).hexdigest() if data is not None else digest_file(path))==AUTOIT_EXE_SHA256:add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
         elif st.st_size<=16*1024*1024:
             from local_rules import scan_bytes
-            rules=scan_bytes(data)
+            rules=scan_bytes(data);result['engine_checks']={'yara_x':1}
             if rules['matches']:add('review_binary',path,reason='程序内容命中家族组合规则，正在执行离线复核。',content_rules=rules)
     elif ext=='.a3x':
         if digest_file(path)==AUTOIT_A3X_SHA256:add('worm_script',path,sha256=AUTOIT_A3X_SHA256)
         else:add('review_autoit',path,reason='未识别脚本已保留，需进一步核查。')
     elif ext in ('.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf') and st.st_size<=4*1024*1024:
         from local_rules import scan_bytes
-        with open(path,'rb') as stream:rules=scan_bytes(stream.read())
+        with open_read(path) as stream:rules=scan_bytes(stream.read())
+        result['engine_checks']={'yara_x':1}
         if rules['matches']:add('review_script',path,reason='本地组合规则命中，正在执行离线复核。',content_rules=rules)
     elif ext=='.lnk' and st.st_size<1024*1024:
         link=shortcut(path)
@@ -409,6 +412,11 @@ def inspect_file_content(path,st):
             if fingerprint in QUARANTINE_LINK_HASHES:add('worm_residue',path,sha256=fingerprint,reason='已确认家族目录内的已知隔离提示快捷方式。')
     elif ext in OFFICE_EXTS:
         result['office']=1;info=office_check(path)
+        analysis=info.get('macro_analysis',{});checks={}
+        if analysis.get('source_sha256'):checks['vba_source']=1
+        if analysis.get('pcode_status')=='instructions_read':checks['vba_pcode']=1
+        if analysis.get('content_rules'):checks['yara_x']=1
+        if checks:result['engine_checks']=checks
         if info['status']=='infected':add('infected_office',path,**info)
         elif info['status']=='info':add('info_office',path,**info)
         elif info['status']=='review':
@@ -504,7 +512,7 @@ class Cleaner:
     def error(self,path,ex):
         record={'path':str(path),'error':str(ex)}
         from coverage_errors import active_pagefiles,describe_read_error
-        if 'permission denied' in str(ex).casefold() or isinstance(ex,PermissionError):
+        if 'permission denied' in str(ex).casefold() or 'winerror 32' in str(ex).casefold() or getattr(ex,'winerror',None) in (5,32) or isinstance(ex,PermissionError):
             if not hasattr(self,'_active_pagefiles'):
                 try:self._active_pagefiles=active_pagefiles()
                 except OSError:self._active_pagefiles=set()
@@ -697,6 +705,9 @@ class Cleaner:
         return None
     def record_file_result(self,path,result):
         self.count+=1;self.scanned_office+=result.get('office',0)
+        if not hasattr(self,'engine_checks'):self.engine_checks={}
+        for engine,count in result.get('engine_checks',{}).items():
+            self.engine_checks[engine]=self.engine_checks.get(engine,0)+count
         for row in result.get('findings',[]):
             row=dict(row);kind=row.pop('kind');target=row.pop('path')
             self.add(kind,target,**row)
@@ -710,6 +721,7 @@ class Cleaner:
         roots=self.policy.fixed_roots() if roots is None else roots
         if not roots:raise ValueError('未指定有效扫描范围。')
         self.findings=[];self.count=0;self.dircount=0;self.scanned_office=0;self.skipped=[];self.reparse_points=[];start=time.monotonic()
+        self.engine_checks={};self.secondary_dispatch={'status':'not_started','candidates':0}
         self.scan_roots=list(map(os.path.abspath,roots))
         self.scan_active=True;self.scan_started=start;self.current_path='';self.last_progress=start;self.last_completed=start
         self.set_progress('files','正在遍历并检查文件')
@@ -719,7 +731,7 @@ class Cleaner:
             try:self.policy.check(path);return True
             except OSError:return False
         def directory_id(path,st=None):
-            st=st or os.stat(path)
+            st=st or os.stat(extended_path(path))
             return ('id',st.st_dev,st.st_ino) if st.st_ino else ('path',norm(path))
         failed_files=set()
         def accept_file(path,result,error):
@@ -777,7 +789,7 @@ class Cleaner:
                     removed={norm(e['path']) for e in self.events if e['kind']=='empty_payload_directory_removed'}
                     if norm(root) in removed and not os.path.exists(root):
                         self.log('verified_removed_scan_root',path=str(root));continue
-                    if not os.path.isdir(root):raise ValueError('扫描位置不存在或不是目录：'+str(root))
+                    if not os.path.isdir(extended_path(root)):raise ValueError('扫描位置不存在或不是目录：'+str(root))
                     if self.protected_path(root):raise ValueError('所选位置已列入排除范围。')
                     if file_attributes(root)&0x400:inspect_link(os.path.abspath(root))
                     else:
@@ -794,19 +806,20 @@ class Cleaner:
                         self.policy.check_volume(root);self.current_path=directory
                         identity=directory_id(directory)
                         if identity in visited:continue
-                        with os.scandir(directory) as entries:
+                        with os.scandir(extended_path(directory)) as entries:
                             visited.add(identity)
                             self.dircount+=1
                             for e in entries:
                                 if self.cancel.is_set():break
+                                path=os.path.join(directory,e.name)
                                 try:
                                     st=e.stat(follow_symlinks=False)
                                     if st.st_file_attributes&0x400:
-                                        inspect_link(e.path);continue
+                                        inspect_link(path);continue
                                     if e.is_dir(follow_symlinks=False):
-                                        directory_volumes[norm(e.path)]=root;stack.append(e.path);continue
-                                    inspect_file(e.path,st)
-                                except Exception as ex:self.error(e.path,ex)
+                                        directory_volumes[norm(path)]=root;stack.append(path);continue
+                                    inspect_file(path,st)
+                                except Exception as ex:self.error(path,ex)
                         self.last_completed=time.monotonic()
                         if self.last_completed-self.last_progress>=1:
                             self.last_progress=self.last_completed
@@ -1002,7 +1015,9 @@ class Cleaner:
         from engine_assets import manifest
         from local_rules import RULESET_VERSION
         assets=manifest()
-        summary['offline_analysis']={'versions':assets.get('versions',{}),'ruleset_version':RULESET_VERSION,'assets_available':bool(assets),'scope':'Content screening plus second-opinion analysis of unresolved candidates; no universal safety verdict'}
+        from engine_audit import build_audit
+        summary['offline_analysis']={'versions':assets.get('versions',{}),'ruleset_version':RULESET_VERSION,'assets_available':bool(assets),'scope':'Content screening plus second-opinion analysis of unresolved candidates; no universal safety verdict',
+            **build_audit(getattr(self,'engine_checks',{}),getattr(self,'secondary_dispatch',{'status':'not_started','candidates':0}),self.findings)}
         json_save(self.run/'report.json',summary);return summary
 
 def resolve_scan_scope(mode='internal',manual=None):

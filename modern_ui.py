@@ -449,6 +449,8 @@ class ModernWindow:
                         self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
                         self.detail.set('确认残留 %s 项；未确认文件 %s 项；已自动归类说明 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     self.append_log('报告：'+str(c.run/'report.json'))
+                    from engine_audit import dispatch_message
+                    self.append_log(dispatch_message(getattr(c,'secondary_dispatch',{})))
                     if self.update_pending_install:
                         pending=self.update_pending_install;self.update_pending_install=None
                         self.root.after_idle(lambda value=pending:self.update_event('update_downloaded',value))

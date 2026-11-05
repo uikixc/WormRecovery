@@ -91,6 +91,11 @@ def validate(executable, output, vba_fixture=None):
             snapshots=list(paths[0].parent.glob('operations/*/report.json'))
             checks['scan_only_operation_identified']=operation.get('type')=='scan' and operation.get('mutations_allowed') is False
             checks['scan_snapshot_preserved']=len(snapshots)==1 and json.loads(snapshots[0].read_text(encoding='utf-8')).get('operation',{}).get('id')==operation.get('id')
+        if __import__('worm_recovery').VERSION>='1.7.3':
+            audit=scan.get('offline_analysis',{});usage=audit.get('engine_usage',{})
+            checks['engine_dispatch_saved']=audit.get('dispatch',{}).get('status')=='dispatched'
+            checks['actual_rea_execution_saved']=usage.get('rea',{}).get('second_pass_results',{}).get('analyzed')==1
+            checks['first_pass_rule_count_saved']=usage.get('yara_x',{}).get('first_pass_files',0)>=1
         record = {'passed': all(checks.values()), 'checks': checks,
                   'elapsed_seconds': round(time.monotonic() - started, 2), 'exit_code': result.returncode,
                   'source_exe': str(Path(executable).resolve()), 'exe_bytes': portable.stat().st_size,

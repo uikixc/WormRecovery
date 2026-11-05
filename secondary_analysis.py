@@ -18,6 +18,7 @@ import time
 
 from engine_assets import engine_root, manifest, subprocess_environment
 from engine_process import run as run_engine
+from windows_read import open_read,extended_path
 
 MAX_INPUT = 128 * 1024 * 1024
 _verified_tools = {}
@@ -25,9 +26,9 @@ _verified_tools = {}
 
 def snapshot_file(path,snapshot,cancel):
     """Bounded-memory copy and verification, with responsive cancellation."""
-    before=path.stat();digest=hashlib.sha256();written=0
+    before=os.stat(extended_path(path));digest=hashlib.sha256();written=0
     if before.st_size>MAX_INPUT:raise ValueError('文件超过多引擎复核大小上限。')
-    with path.open('rb') as source,snapshot.open('wb') as output:
+    with open_read(path) as source,snapshot.open('wb') as output:
         while True:
             if cancel.is_set():raise InterruptedError('离线分析已停止。')
             chunk=source.read(1024*1024)
@@ -36,7 +37,7 @@ def snapshot_file(path,snapshot,cancel):
             if written>MAX_INPUT:raise ValueError('准备分析时文件超过大小上限。')
             digest.update(chunk);output.write(chunk)
     original=hashlib.sha256();verified_bytes=0
-    with path.open('rb') as source:
+    with open_read(path) as source:
         while True:
             if cancel.is_set():raise InterruptedError('离线分析已停止。')
             chunk=source.read(1024*1024)
@@ -44,7 +45,7 @@ def snapshot_file(path,snapshot,cancel):
             verified_bytes+=len(chunk)
             if verified_bytes>MAX_INPUT:raise ValueError('校验分析副本时原文件超过大小上限。')
             original.update(chunk)
-    after=path.stat()
+    after=os.stat(extended_path(path))
     if written!=before.st_size or digest.digest()!=original.digest() or (after.st_size,after.st_mtime_ns)!=(before.st_size,before.st_mtime_ns):
         raise ValueError('准备分析时文件发生变化。')
     return digest.hexdigest()
@@ -232,6 +233,9 @@ def pe_second_opinion(path, cancel=None, progress=lambda stage: None):
 
 def enrich_reviews(cleaner):
     candidates = [row for row in cleaner.findings if row.get('kind', '').startswith('review_')]
+    cleaner.secondary_dispatch={'candidates':len(candidates),'status':'cancelled' if cleaner.cancel.is_set() else 'not_needed' if not candidates else 'dispatched',
+        'reason':'没有未决候选项；已确认家族和已核对组件未重复调用二次引擎。' if not candidates else '仅对未决候选项启动二次分析。'}
+    cleaner.log('secondary_dispatch',**cleaner.secondary_dispatch)
     if not candidates or cleaner.cancel.is_set():
         return
     def phase(stage,path='',completed=0,timeout=None):

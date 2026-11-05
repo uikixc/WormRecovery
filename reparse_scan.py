@@ -4,6 +4,7 @@ from ctypes import wintypes as W
 import ntpath
 import os
 import struct
+from windows_read import extended_path
 
 k=ctypes.WinDLL('kernel32',use_last_error=True)
 k.CreateFileW.argtypes=[W.LPCWSTR,W.DWORD,W.DWORD,ctypes.c_void_p,W.DWORD,W.DWORD,W.HANDLE]
@@ -52,7 +53,7 @@ def decode_reparse(data,path):
     return result
 
 def inspect_reparse(path):
-    handle=k.CreateFileW(str(path),0,7,None,3,0x02200000,None)
+    handle=k.CreateFileW(extended_path(path),0,7,None,3,0x02200000,None)
     if handle==ctypes.c_void_p(-1).value:raise ctypes.WinError(ctypes.get_last_error())
     try:
         buffer=ctypes.create_string_buffer(16384);size=W.DWORD()
