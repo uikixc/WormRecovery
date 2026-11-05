@@ -10,7 +10,7 @@ import tempfile
 import time
 import zipfile
 
-from tests.office_fixtures import compound,vba_streams,plain_workbook
+from tests.office_fixtures import compound,vba_streams,plain_workbook,record as vba_record
 
 
 def fingerprint(path):
@@ -31,6 +31,9 @@ def validate(executable,output):
                 for path,data in (extra or {}).items():archive.writestr(path,data)
         project=compound(vba_streams())
         package('empty-project.xlsm',project)
+        dependency=b'*\\G{00000000-0000-0000-0000-000000000001}#1.0#0#C:\\fixture\\library.tlb#Fixture'
+        reference=vba_record(0x0D,len(dependency).to_bytes(4,'little')+dependency+b'\0'*6)
+        package('referenced-library.xlsm',compound(vba_streams(references=reference)))
         (inputs/'empty-project.xls').write_bytes(compound(vba_streams(extra={'Workbook':plain_workbook()})))
         package('nonempty-source.xlsm',compound(vba_streams('Attribute VB_Name = "Fixture"\r\nSub A()\r\nDebug.Print "inert fixture"\r\nEnd Sub\r\n')))
         package('embedded-object.xlsm',project,extra={'xl/embeddings/fixture.bin':b'inert object'})
@@ -62,7 +65,7 @@ def validate(executable,output):
             for name,rule in expected.items():
                 row=rows.get(name,{})
                 checks[name+'_classified']=row.get('kind')=='info_document' and row.get('decision',{}).get('rule')==rule
-            for name in ('nonempty-source.xlsm','embedded-object.xlsm','remote-image.docx','attached-template.docx','invalid-format.doc'):
+            for name in ('nonempty-source.xlsm','referenced-library.xlsm','embedded-object.xlsm','remote-image.docx','attached-template.docx','invalid-format.doc'):
                 checks[name+'_retained']=rows.get(name,{}).get('kind')=='review_office'
             checks['only_actual_format_error']=len(errors)==1 and Path(errors[0]['path']).name=='invalid-format.doc'
             checks['empty_file_content_loss_preserved']=rows.get('empty.pptx',{}).get('data_integrity_issue')=='empty_document' and '历史原件' in rows.get('empty.pptx',{}).get('action','')
