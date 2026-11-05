@@ -15,7 +15,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.5'
+VERSION = '1.7.6'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -331,10 +331,12 @@ def sanitized_xlsx(source,dest):
 
 def powershell(script,timeout=60):
     exe=os.path.join(os.environ.get('WINDIR','C:\\Windows'),'System32','WindowsPowerShell','v1.0','powershell.exe')
-    prefix="[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ErrorActionPreference='Stop'; "
+    prefix="[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
     encoded=base64.b64encode((prefix+script).encode('utf-16le')).decode('ascii')
     r=subprocess.run([exe,'-NoProfile','-NonInteractive','-EncodedCommand',encoded],capture_output=True,timeout=timeout,creationflags=0x08000000)
-    if r.returncode:raise RuntimeError(r.stderr.decode('utf-8','replace')[-2000:])
+    if r.returncode:
+        from powershell_output import error_text
+        raise RuntimeError(error_text(r.stderr)[-2000:])
     s=r.stdout.decode('utf-8-sig','replace').strip()
     return json.loads(s) if s else None
 
@@ -1022,7 +1024,13 @@ class Cleaner:
 
 def resolve_scan_scope(mode='internal',manual=None):
     from device_scope import resolve_scope
-    return resolve_scope(powershell,mode,manual)
+    try:return resolve_scope(powershell,mode,manual)
+    except Exception as ex:
+        try:
+            from operation_capture import capture_preflight_failure
+            capture_preflight_failure(ex,VERSION,mode,manual)
+        except Exception:pass  # Reporting failure must not replace the discovery error.
+        raise
 
 def cli_main():
     if sys.argv[1:]==['--check-update']:

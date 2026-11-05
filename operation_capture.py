@@ -1,8 +1,31 @@
 """Capture scan and repair independently before a later operation changes results."""
 import datetime
+import json
+import os
 from pathlib import Path
 import shutil
 import uuid
+
+
+def capture_preflight_failure(error,version,mode,manual=None):
+    """Retain discovery failures that occur before a Cleaner can be created."""
+    operation_id=str(uuid.uuid4());now=datetime.datetime.now(datetime.timezone.utc).isoformat()
+    operation={'id':operation_id,'session_id':str(uuid.uuid4()),'type':'scan','status':'failed',
+               'stage':'storage_discovery','started_at':now,'finished_at':now,
+               'mutations_allowed':False,'error_type':type(error).__name__}
+    detail={'stage':'storage_discovery','error_type':type(error).__name__,'message':str(error)[:2000],
+            'details':getattr(error,'details',{})}
+    report={'version':version,'operation':operation,'files':0,'directories':0,'findings':[],
+            'errors':[detail],'inspection_failed':True,'scan_roots':[],
+            'scope_summary':{'mode':mode,'requested_paths':manual or []},
+            'events':[{'kind':'operation_failed','operation':operation,**detail}]}
+    root=Path(os.environ.get('LOCALAPPDATA',Path.home()))/'WormRecovery/diagnostics/failures'/operation_id
+    root.mkdir(parents=True,exist_ok=False)
+    path=root/'report.json';path.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    (root/'journal.jsonl').write_text(json.dumps(report['events'][0],ensure_ascii=False)+'\n',encoding='utf-8')
+    from diagnostic_client import collect,schedule
+    collect(path,upload=False);schedule()
+    return path
 
 
 def execute(cleaner,kind,action):
