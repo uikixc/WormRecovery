@@ -5,6 +5,7 @@ cache layouts and undeclared streams remain explicit; no macro is executed.
 """
 import hashlib
 import re
+import struct
 
 
 def source_inventory(code):
@@ -37,13 +38,28 @@ def source_inventory(code):
 def inspect_inventory(parser, extracted):
     """Require strict declarations to cover all extracted modules and streams."""
     from oletools.olevba import VBA_Project
-    rows=[];unknown=[];cache_streams=[];roots=[];containers=[]
+    class InventoryProject(VBA_Project):
+        def check_value(self,name,expected,value):
+            super().check_value(name,expected,value)
+            if name=='PROJECTCONSTANTS_Reserved':
+                # Pinned olevba 0.60.2 reads the Unicode constants length next,
+                # then the reference records, ending at PROJECTMODULES_Id.
+                position=self.dir_stream.tell();raw=self.dir_stream.getvalue()
+                size=struct.unpack_from('<I',raw,position)[0]
+                self.reference_start=position+4+size
+                if self.reference_start>len(raw):raise ValueError('项目引用清单边界异常。')
+    rows=[];unknown=[];cache_streams=[];roots=[];containers=[];references=[]
     try:
         expected={str(row['stream']).casefold():row for row in extracted}
         if len(expected)!=len(extracted):raise ValueError('重复的模块流标识。')
         for root,project_path,dir_path in parser.find_vba_projects():
             roots.append(root)
-            project=VBA_Project(parser.ole_file,root,project_path,dir_path,relaxed=False)
+            project=InventoryProject(parser.ole_file,root,project_path,dir_path,relaxed=False)
+            reference_end=project.dir_stream.tell()-2
+            reference_start=getattr(project,'reference_start',None)
+            if reference_start is None or not 0<=reference_start<=reference_end:raise ValueError('无法核对完整项目引用清单。')
+            references.append({'project':project_path,'record_bytes':reference_end-reference_start,
+                               'status':'absent' if reference_end==reference_start else 'dependencies_not_verified'})
             project.parse_project_stream();list(project.parse_modules())
             if len(project.modules)!=project.modules_count:raise ValueError('模块声明数量不一致。')
             if project.dir_stream.read()!=b'\x10\x00\x00\x00\x00\x00':raise ValueError('项目结束记录缺失或存在未分类记录。')
@@ -85,7 +101,8 @@ def inspect_inventory(parser, extracted):
         return {'status':'complete','modules':rows,'module_count':len(rows),'project_caches':cache_streams,
                 'unclassified_streams':unknown,'compiled_cache_absent':absent,
                 'container_streams':containers,
-                'empty_project_verified':absent and not unknown and all(row['source']['empty_bodies_verified'] for row in rows),
+                'project_references':references,
+                'empty_project_verified':absent and not unknown and not any(row['record_bytes'] for row in references) and all(row['source']['empty_bodies_verified'] for row in rows),
                 'basis':'Strict MS-OVBA module declarations, exact source offsets, complete source coverage, and cache inventory'}
     except Exception as error:
         return {'status':'partial','modules':rows,'unclassified_streams':unknown,

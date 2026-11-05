@@ -105,6 +105,17 @@ class VbaInventoryTests(unittest.TestCase):
         result=self.inspect(vba_streams('Attribute VB_Name = "Fixture"\r\nSub A()\r\nDebug.Print "fixture"\r\nEnd Sub\r\n'))
         self.assertFalse(result['module_inventory']['empty_project_verified'])
 
+    def test_empty_module_with_library_reference_needs_dependency_check(self):
+        import struct
+        name=b'FixtureLibrary';libid=b'*\\G{00000000-0000-0000-0000-000000000001}#1.0#0#C:\\fixture\\library.tlb#Fixture'
+        reference=struct.pack('<HI',0x16,len(name))+name+struct.pack('<HI',0x3E,len(name)*2)+name.decode().encode('utf-16-le')
+        reference+=struct.pack('<HII',0x0D,len(libid)+10,len(libid))+libid+b'\0'*6
+        inventory=self.inspect(vba_streams(references=reference))['module_inventory']
+        self.assertEqual(inventory['status'],'complete',inventory)
+        self.assertTrue(inventory['compiled_cache_absent'])
+        self.assertEqual(inventory['project_references'][0]['status'],'dependencies_not_verified')
+        self.assertFalse(inventory['empty_project_verified'])
+
     def test_unknown_streams_and_project_caches_disqualify_positive_proof(self):
         for extra in ({'VBA/__SRP_0':b'cache'},{'VBA/Unknown':b'unknown'},
                       {'VBA/_VBA_PROJECT':b'\xcc\x61\xff\xff\0\0\0cache'},

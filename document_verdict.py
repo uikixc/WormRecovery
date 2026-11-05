@@ -71,8 +71,8 @@ def assess_document(row):
     supported_container=(row.get('document_format')=='ooxml' and row.get('package_structure_checked') is True and not inventory.get('container_streams')) or (
         row.get('document_format')=='ole' and legacy.get('status')=='complete' and legacy.get('active_or_unclassified_features')==[])
     if inventory.get('status')=='complete' and inventory.get('empty_project_verified') is True and inventory.get('module_count',0)>0 and supported_container and row.get('analysis_sha256') and row.get('snapshot_analysis_sha256')==row.get('analysis_sha256') and not row.get('structural_evidence') and not row.get('active_content_unresolved'):
-        return result('informational','empty_vba_project','文档保留了 VBA 项目，但所有已核验模块均为空实现，且不存在编译缓存；无需进行宏清理。',
-                      '严格模块清单覆盖全部源码、逐模块源码偏移与缓存检查、容器活动内容检查、病毒库与内容规则共同完成')
+        return result('informational','empty_vba_project','文档保留了 VBA 项目，但所有已核验模块均为空实现，且不存在编译缓存或待核验依赖；无需进行宏清理。',
+                      '严格模块清单覆盖全部源码、逐模块源码偏移与缓存检查、项目依赖及容器活动内容检查、病毒库与内容规则共同完成')
     if row.get('parser_recovery',{}).get('status')=='completed' and row.get('status')=='clean' and row.get('macro') is False and not row.get('structural_evidence') and evidence.get('office_parser',{}).get('status')=='analyzed':
         return result('informational','recovered_document_analysis','文档重试分析完成，未发现宏或已检查类型的活动内容，当前病毒库与内容规则未检出威胁。',
                       '完整哈希校验的只读副本、文档解析成功、当前病毒检查及内容规则均完成')

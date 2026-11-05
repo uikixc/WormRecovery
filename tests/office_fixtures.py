@@ -77,13 +77,13 @@ def compound(streams):
     return bytes(header)+b''.join(sectors)
 
 
-def vba_streams(source=None,cache=b'',extra=None):
+def vba_streams(source=None,cache=b'',extra=None,references=b''):
     if source is None:source='Attribute VB_Name = "Fixture"\r\nOption Explicit\r\nPrivate Sub Workbook_Open()\r\nEnd Sub\r\n'
     u32=lambda value:struct.pack('<I',value)
     info=b''.join((record(1,u32(1)),record(2,u32(0x409)),record(0x14,u32(0x409)),
         record(3,struct.pack('<H',1252)),record(4,b'Fixture'),record(5,b''),record(0x40,b''),
         record(6,b''),record(0x3D,b''),record(7,u32(0)),record(8,u32(0)),
-        record(9,u32(1))+b'\0\0',record(0x0C,b''),record(0x3C,b''),
+        record(9,u32(1))+b'\0\0',record(0x0C,b''),record(0x3C,b''),references,
         record(0x0F,struct.pack('<H',1)),record(0x13,b'\0\0')))
     module=b''.join((record(0x19,b'Fixture'),record(0x47,'Fixture'.encode('utf-16-le')),
         record(0x1A,b'Fixture'),record(0x32,'Fixture'.encode('utf-16-le')),
