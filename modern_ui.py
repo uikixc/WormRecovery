@@ -439,7 +439,22 @@ class ModernWindow:
             elapsed=int(time.monotonic()-self.started)
             self.elapsed.set('%02d:%02d 已用时'%(elapsed//60,elapsed%60))
             c=self.cleaner
-            if c and getattr(c,'scan_active',False):
+            phase=getattr(c,'progress',{}) if c else {}
+            if c and phase.get('phase') in ('review','save'):
+                elapsed=max(0,int(time.monotonic()-phase['started']))
+                total=phase.get('total',0);completed=phase.get('completed',0)
+                text=phase['stage']
+                if total:text+=' · 已复核 %s/%s 项'%(completed,total)
+                text+=' · 当前步骤 %s 秒'%elapsed
+                if phase.get('timeout'):text+=' · 引擎执行上限 %s 秒'%phase['timeout']
+                path=phase.get('path','')
+                if path:text+=' · '+(path if len(path)<=85 else '…'+path[-84:])
+                if phase['phase']=='review':
+                    text+=' · 文件遍历已结束，正在离线复核'
+                    if not self.stop_requested.is_set():self.status.set('正在离线复核')
+                elif not self.stop_requested.is_set():self.status.set('正在保存报告')
+                self.detail.set(text)
+            elif c and getattr(c,'scan_active',False):
                 duration=max(.001,time.monotonic()-c.scan_started)
                 pending=max(0,int(time.monotonic()-c.last_completed))
                 text='已检查 %s 个文件 · 平均 %s 文件/秒'%(format(c.count,','),format(int(c.count/duration),','))
@@ -481,8 +496,8 @@ class ModernWindow:
     def update_settings(self):
         if self.busy or self.update_busy:return
         dialog=tk.Toplevel(self.root);dialog.title('更新设置');dialog.geometry('570x300');dialog.transient(self.root);dialog.grab_set()
-        tk.Label(dialog,text='GitHub 私有仓库授权',font=(FONT,12,'bold')).pack(anchor='w',padx=20,pady=(20,8))
-        tk.Label(dialog,text='当前仓库 uikixc/WormRecovery 为私有仓库。\n请输入仅授权该仓库、Contents 只读权限的细粒度访问令牌。\n凭据保存在当前 Windows 用户的凭据管理器，不随程序分发。',justify='left',wraplength=525).pack(anchor='w',padx=20)
+        tk.Label(dialog,text='GitHub 更新访问设置',font=(FONT,12,'bold')).pack(anchor='w',padx=20,pady=(20,8))
+        tk.Label(dialog,text='当前公开发行版无需填写访问令牌，可直接检查和下载更新。\n仅在需要授权访问时，填写仅限本仓库、Contents 只读权限的令牌。\n凭据保存在当前 Windows 用户的凭据管理器，不随程序分发。',justify='left',wraplength=525).pack(anchor='w',padx=20)
         entry=ttk.Entry(dialog,show='•',width=65);entry.pack(fill='x',padx=20,pady=15)
         tk.Label(dialog,text='私有附件使用 GitHub 授权直连；公共附件自动测速并切换加速线路。',fg=MUTED,wraplength=525,justify='left').pack(anchor='w',padx=20)
         row=tk.Frame(dialog);row.pack(fill='x',padx=20,pady=18)

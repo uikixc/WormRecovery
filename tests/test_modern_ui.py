@@ -193,6 +193,27 @@ class ModernUITests(unittest.TestCase):
         self.assertIn('当前项目处理',self.app.detail.get())
         self.app.busy=False
 
+    def test_review_progress_is_visible_after_file_count_stops(self):
+        c=FakeCleaner(emit=lambda _:None);c.count=500;c.scan_active=False
+        c.progress={'phase':'review','stage':'REA 程序结构分析','started':time.monotonic()-6,
+                    'completed':2,'total':8,'timeout':25,'path':'C:/test/candidate.exe'}
+        self.app.cleaner=c;self.app.busy=True;self.app.started=time.monotonic()-20
+        self.app.root.after_cancel(self.app.timer);self.app.pump()
+        self.assertEqual(self.app.status.get(),'正在离线复核')
+        for text in ('2/8','25 秒','candidate.exe','文件遍历已结束'):
+            self.assertIn(text,self.app.detail.get())
+        self.assertEqual(self.app.metrics['files'].get(),'500')
+        self.app.busy=False
+
+    def test_stopping_review_keeps_stopping_status_visible(self):
+        c=FakeCleaner(emit=lambda _:None)
+        c.progress={'phase':'review','stage':'ClamAV 批量复核','started':time.monotonic(),
+                    'completed':0,'total':5,'path':''}
+        self.app.cleaner=c;self.app.busy=True;self.app.started=time.monotonic()
+        self.app.stop();self.app.root.after_cancel(self.app.timer);self.app.pump()
+        self.assertTrue(c.cancel.is_set());self.assertEqual(self.app.status.get(),'正在停止')
+        self.app.busy=False
+
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

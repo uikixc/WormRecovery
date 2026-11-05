@@ -13,6 +13,21 @@ import worm_recovery as w
 
 
 class ConcurrentQueueTests(unittest.TestCase):
+    def test_completed_file_is_reported_before_its_batch_finishes(self):
+        blocked=threading.Event();release=threading.Event();rows=[]
+        def inspect(path,stat):
+            if path=='second':blocked.set();release.wait(timeout=3)
+            return {'path':path}
+        with FileScanner(inspect,lambda *row:rows.append(row),threading.Event(),self.profiles(),workers=2,batch_size=2) as scanner:
+            try:
+                scanner.submit('first',None,'C:/');scanner.submit('second',None,'C:/')
+                self.assertTrue(blocked.wait(timeout=2))
+                scanner.poll()
+                self.assertEqual([row[0] for row in rows],['first'])
+                self.assertEqual(len(scanner.pending),1)
+            finally:release.set()
+        self.assertEqual([row[0] for row in rows],['first','second'])
+
     def test_nonblocking_poll_does_not_allocate_waiter(self):
         from concurrent.futures import Future
         future=Future()

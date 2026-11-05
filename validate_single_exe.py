@@ -65,6 +65,11 @@ def validate(executable, output, vba_fixture=None):
                   'unknowns_preserved': all(row['kind'].startswith('review_') for row in findings.values()),
                   'no_scan_errors': not scan['errors'],
                   'uncompleted_is_failure': scan['inspection_failed'] and result.returncode == 1}
+        if __import__('worm_recovery').VERSION>='1.5.1':
+            phases=[row for row in scan['events'] if row.get('kind')=='scan_phase']
+            checks['review_phase_has_total_and_current_file']=any(row.get('phase')=='review' and row.get('total',0)>0 and row.get('path') for row in phases)
+            checks['review_completion_reported']=any(row.get('phase')=='review' and row.get('completed',0)==row.get('total') and row.get('total',0)>0 for row in phases)
+            checks['engine_stages_reported']=any('ClamAV' in row.get('stage','') for row in phases) and any('REA' in row.get('stage','') for row in phases)
         if vba_fixture:
             macro=findings.get('static-vba-regression.xlsm',{})
             checks['real_vba_json_transport']=not macro.get('analysis_error') and macro.get('macro_analysis',{}).get('pcode_status')=='instructions_read'

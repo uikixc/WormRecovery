@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import ctypes
 from ctypes import wintypes as W
 import os
+import queue
 import struct
 import threading
 
@@ -44,6 +45,7 @@ class FileScanner:
         self.limits={key:threading.BoundedSemaphore(value) for key,value in devices.items()}
         self.queue_limit=self.workers*2;self.peak_pending=0;self.pool=None
         self.active={};self.lock=threading.Lock()
+        self.completed=queue.SimpleQueue()
     def __enter__(self):
         if self.workers>1:self.pool=ThreadPoolExecutor(max_workers=self.workers,thread_name_prefix='WormScan')
         return self
@@ -68,6 +70,9 @@ class FileScanner:
         self.peak_pending=max(self.peak_pending,len(self.pending))
     def _batch(self,batch,root):
         output=[];gate=self.limits[self.profiles[root]['device']]
+        def ready(row):
+            if self.pool:self.completed.put(row)
+            else:output.append(row)
         while not self.cancel.is_set():
             if gate.acquire(timeout=.1):break
         else:return output
@@ -75,12 +80,14 @@ class FileScanner:
             if self.cancel.is_set():return output
             try:
                 if self.validate:self.validate(root)
-            except Exception as ex:return [(path,None,str(ex)) for path,_ in batch]
+            except Exception as ex:
+                for path,_ in batch:ready((path,None,str(ex)))
+                return output
             for path,stat in batch:
                 if self.cancel.is_set():break
                 with self.lock:self.active[threading.get_ident()]=path
-                try:output.append((path,self.inspect(path,stat),None))
-                except Exception as ex:output.append((path,None,str(ex)))
+                try:ready((path,self.inspect(path,stat),None))
+                except Exception as ex:ready((path,None,str(ex)))
             return output
         finally:
             with self.lock:self.active.pop(threading.get_ident(),None)
@@ -88,10 +95,16 @@ class FileScanner:
     def _accept(self,rows):
         for path,result,error in rows:self.accept(path,result,error)
     def poll(self,block=False):
+        self._collect_completed()
         if not self.pending:return
         done,_=wait(self.pending,timeout=.1,return_when=FIRST_COMPLETED) if block else ({future for future in self.pending if future.done()},None)
         for future in done:
             self.pending.remove(future);self._accept(future.result())
+        self._collect_completed()
+    def _collect_completed(self):
+        while True:
+            try:self.accept(*self.completed.get_nowait())
+            except queue.Empty:return
     def finish(self):
         if self.pool:
             for root in list(self.buffers):self._flush(root)

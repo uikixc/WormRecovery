@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.5.0'
+VERSION = '1.5.1'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -422,11 +422,17 @@ class Cleaner:
         self.cancel=threading.Event();self.count=0;self.dircount=0;self.scanned_office=0;self.started=time.monotonic()
         self.scan_roots=[];self.initial_findings=None;self.verification=None
         self.skipped=[];self.reparse_points=[];self.inspection_failed=False
+        self.progress={'phase':'idle','stage':'准备就绪','path':'','started':time.monotonic(),'completed':0,'total':0}
         self.log('session',version=VERSION,volume_policy='Explicit physical-device scope; local exclusions enforced',privileges=enable_privileges())
     def log(self,kind,**data):
         rec={'time':datetime.datetime.now().isoformat(timespec='seconds'),'kind':kind,**data};self.events.append(rec)
         with (self.run/'journal.jsonl').open('a',encoding='utf-8') as f:f.write(json.dumps(rec,ensure_ascii=False)+'\n');f.flush();os.fsync(f.fileno())
     def protected_path(self,p):return any(beneath(p,r) for r in self.protected)
+    def set_progress(self,phase,stage,path='',completed=0,total=0,timeout=None):
+        self.progress={'phase':phase,'stage':stage,'path':str(path),'started':time.monotonic(),
+                       'completed':completed,'total':total,'timeout':timeout}
+        self.log('scan_phase',**self.progress)
+        self.emit(stage+('：'+str(path) if path else ''))
     def root_residue_evidence(self,root):
         root=pathlib.Path(root)
         if norm(payload_root(root) or '')!=norm(root) or self.protected_path(root):return False
@@ -691,6 +697,7 @@ class Cleaner:
         self.findings=[];self.count=0;self.dircount=0;self.scanned_office=0;self.skipped=[];self.reparse_points=[];start=time.monotonic()
         self.scan_roots=list(map(os.path.abspath,roots))
         self.scan_active=True;self.scan_started=start;self.current_path='';self.last_progress=start;self.last_completed=start
+        self.set_progress('files','正在遍历并检查文件')
         self.emit('正在检查所选扫描范围。');stack=[];visited=set();files_seen=set();failed_directories=set();directory_volumes={}
         def approved(path):
             if self.protected_path(path) or not any(beneath(path,r) for r in self.scan_roots):return False
@@ -808,8 +815,11 @@ class Cleaner:
             enrich_reviews(self)
         self.scan_seconds=time.monotonic()-start
         self.review_seconds=max(0,self.scan_seconds-self.file_scan_seconds)
+        self.set_progress('save','正在保存检测报告')
         self.log('scan_complete',files=self.count,directories=self.dircount,seconds=self.scan_seconds,cancelled=self.cancel.is_set(),findings=len(self.findings),skipped_count=len(self.skipped))
-        self.save();return self.findings
+        self.save()
+        self.progress=dict(self.progress,phase='stopped' if self.cancel.is_set() else 'complete',stage='已停止' if self.cancel.is_set() else '检测完成')
+        return self.findings
     def payload_path(self,path):
         p=pathlib.Path(path);parts=[x.casefold() for x in p.parts]
         root_payload=len(parts)>1 and parts[1] in ('googlechrome','mozillafirefox')
@@ -972,6 +982,7 @@ class Cleaner:
         summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
         summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
         summary['scan_timing']={'file_scan_seconds':getattr(self,'file_scan_seconds',None),'secondary_analysis_seconds':getattr(self,'review_seconds',None)}
+        summary['scan_progress']=dict(self.progress)
         from engine_assets import manifest
         from local_rules import RULESET_VERSION
         assets=manifest()

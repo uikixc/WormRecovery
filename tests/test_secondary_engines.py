@@ -71,6 +71,48 @@ class ContentRuleTests(unittest.TestCase):
 
 
 class EngineResultTests(unittest.TestCase):
+    def test_pe_cancellation_does_not_start_following_engine(self):
+        cancel=threading.Event();stages=[]
+        def stop(*args,**kwargs):
+            self.assertIs(kwargs['cancel'],cancel);cancel.set();raise InterruptedError('stopped')
+        with patch.object(engines,'_tool',return_value=Path('fixture')),patch.object(engines,'_json_command',side_effect=stop) as command:
+            with self.assertRaises(InterruptedError):
+                engines.pe_second_opinion(Path('fixture.exe'),cancel=cancel,progress=stages.append)
+        self.assertEqual(command.call_count,1);self.assertEqual(len(stages),1)
+
+    def test_snapshot_cancelled_before_copy_does_not_read_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/'source';target=root/'copy';source.write_bytes(b'inert')
+            cancel=threading.Event();cancel.set()
+            with self.assertRaises(InterruptedError):engines.snapshot_file(source,target,cancel)
+            self.assertEqual(source.read_bytes(),b'inert');self.assertEqual(target.read_bytes(),b'')
+
+    def test_review_progress_reports_batch_and_completed_candidates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/'inert.txt';source.write_bytes(b'inert content')
+            phases=[];row={'kind':'review_script','path':str(source)}
+            cleaner=SimpleNamespace(findings=[row],cancel=threading.Event(),run=root,
+                policy=SimpleNamespace(check=lambda _:None),protected_path=lambda _:False,
+                emit=lambda _:None,log=lambda kind,**data:phases.append(data) if kind=='scan_phase' else None,
+                error=lambda *args:None,inspection_failed=False)
+            def scan(paths,work,**kwargs):return {str(p):{'status':'no_match'} for p in paths},{}
+            with patch.object(engines,'clam_batch',side_effect=scan):engines.enrich_reviews(cleaner)
+            self.assertTrue(any(p['timeout']==180 for p in phases))
+            self.assertEqual(phases[-1]['completed'],1);self.assertEqual(phases[-1]['total'],1)
+
+    def test_cancelled_batch_marks_every_unprocessed_candidate_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);paths=[root/'a.txt',root/'b.txt']
+            for path in paths:path.write_bytes(b'inert')
+            rows=[{'kind':'review_script','path':str(path)} for path in paths]
+            cleaner=SimpleNamespace(findings=rows,cancel=threading.Event(),run=root,
+                policy=SimpleNamespace(check=lambda _:None),protected_path=lambda _:False,
+                emit=lambda _:None,log=lambda *a,**kw:None,error=lambda *a:None,inspection_failed=False)
+            def stop(*args,**kwargs):cleaner.cancel.set();raise InterruptedError('stopped')
+            with patch.object(engines,'clam_batch',side_effect=stop):engines.enrich_reviews(cleaner)
+            self.assertTrue(cleaner.inspection_failed)
+            self.assertTrue(all(row['secondary_analysis']['status']=='incomplete' for row in rows))
+
     def clam_result(self, message, code=0):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

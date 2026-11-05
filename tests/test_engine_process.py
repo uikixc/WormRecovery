@@ -5,12 +5,25 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import Mock,patch
 
 import psutil
 from engine_process import run
 
 
 class EngineProcessTests(unittest.TestCase):
+    def test_cleanup_pipe_wait_is_bounded_and_does_not_close_live_reader(self):
+        process=Mock();process.poll.return_value=0
+        process._stdout_thread.is_alive.return_value=True
+        process._stderr_thread.is_alive.return_value=False
+        process.communicate.side_effect=[(b'ok',b''),subprocess.TimeoutExpired('fixture',2)]
+        with patch('engine_process.subprocess.Popen',return_value=process),patch('engine_process._job',return_value=(None,None)):
+            result=run(['inert fixture'],timeout=5)
+        self.assertEqual(result.stdout,b'ok')
+        self.assertEqual(process.communicate.call_args.kwargs['timeout'],2)
+        process.stdout.close.assert_not_called()
+        process.stderr.close.assert_called_once()
+
     def test_json_transport_and_stdin(self):
         result = run([sys.executable, '-c', 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read().upper())'], input=b'inert transport', timeout=5)
         self.assertEqual(result.returncode, 0)

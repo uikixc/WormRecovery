@@ -23,6 +23,33 @@ MAX_INPUT = 128 * 1024 * 1024
 _verified_tools = {}
 
 
+def snapshot_file(path,snapshot,cancel):
+    """Bounded-memory copy and verification, with responsive cancellation."""
+    before=path.stat();digest=hashlib.sha256();written=0
+    if before.st_size>MAX_INPUT:raise ValueError('文件超过多引擎复核大小上限。')
+    with path.open('rb') as source,snapshot.open('wb') as output:
+        while True:
+            if cancel.is_set():raise InterruptedError('离线分析已停止。')
+            chunk=source.read(1024*1024)
+            if not chunk:break
+            written+=len(chunk)
+            if written>MAX_INPUT:raise ValueError('准备分析时文件超过大小上限。')
+            digest.update(chunk);output.write(chunk)
+    original=hashlib.sha256();verified_bytes=0
+    with path.open('rb') as source:
+        while True:
+            if cancel.is_set():raise InterruptedError('离线分析已停止。')
+            chunk=source.read(1024*1024)
+            if not chunk:break
+            verified_bytes+=len(chunk)
+            if verified_bytes>MAX_INPUT:raise ValueError('校验分析副本时原文件超过大小上限。')
+            original.update(chunk)
+    after=path.stat()
+    if written!=before.st_size or digest.digest()!=original.digest() or (after.st_size,after.st_mtime_ns)!=(before.st_size,before.st_mtime_ns):
+        raise ValueError('准备分析时文件发生变化。')
+    return digest.hexdigest()
+
+
 def _tool(relative):
     root = engine_root()
     path = root / relative
@@ -41,8 +68,8 @@ def _tool(relative):
     return path
 
 
-def _json_command(command, timeout=45):
-    result = run_engine([str(x) for x in command], timeout=timeout, env=subprocess_environment())
+def _json_command(command, timeout=45, cancel=None):
+    result = run_engine([str(x) for x in command], timeout=timeout, env=subprocess_environment(), cancel=cancel)
     if result.returncode or len(result.stdout) > 16 * 1024 * 1024:
         raise ValueError('分析引擎未完成：' + result.stderr.decode('utf-8', 'replace')[-700:])
     return json.loads(result.stdout.decode('utf-8-sig'))
@@ -150,7 +177,7 @@ def worker_request(request):
             'coverage': 'bounded emulation; unsupported paths and unknown values are not proven safe'}
 
 
-def parser_request(mode, path, timeout=25):
+def parser_request(mode, path, timeout=25, cancel=None):
     frozen = getattr(sys, 'frozen', False)
     if frozen:
         from bundled_components import component_path
@@ -158,33 +185,39 @@ def parser_request(mode, path, timeout=25):
     else:
         command = [sys.executable, str(Path(__file__).with_name('analysis_entry.py'))]
     result = run_engine(command, input=json.dumps({'mode': mode, 'path': str(path)}).encode('utf-8'),
-        timeout=timeout, env=subprocess_environment())
+        timeout=timeout, env=subprocess_environment(), cancel=cancel)
     response = json.loads(result.stdout.decode('utf-8'))
     if result.returncode or not response.get('ok'):
         raise ValueError(response.get('error', '离线解析进程未完成。'))
     return response['result']
 
 
-def pe_second_opinion(path):
+def pe_second_opinion(path, cancel=None, progress=lambda stage: None):
     """Capabilities and declarations are evidence, not maliciousness verdicts."""
     output = {}
     try:
+        if cancel is not None and cancel.is_set():raise InterruptedError('离线分析已停止。')
+        progress('capa 程序能力分析')
         executable = _tool('capa/capa.exe')
-        document = _json_command([executable, '-j', str(path)], timeout=25)
+        document = _json_command([executable, '-j', str(path)], timeout=25, cancel=cancel)
         coverage = {'backend': 'auto', 'function_analysis': True}
         output['capa'] = {'status': 'analyzed', 'capabilities': list(document.get('rules', {}))[:120], 'coverage': coverage}
+    except InterruptedError:raise
     except Exception as ex:
         output['capa'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
     try:
+        if cancel is not None and cancel.is_set():raise InterruptedError('离线分析已停止。')
+        progress('REA 程序结构分析')
         node = _tool('rea/node.exe')
         entry = _tool('rea/package/scripts/rea.mjs')
-        document = _json_command([node, entry, 'inspect-pe-imports', path, '--format', 'json'], timeout=25)
+        document = _json_command([node, entry, 'inspect-pe-imports', path, '--format', 'json'], timeout=25, cancel=cancel)
         result = document.get('normalized_result', {})
         output['rea'] = {'status': 'analyzed', 'evidence_id': document.get('evidence_id'),
             'coverage': result.get('coverage'), 'imphash': result.get('imphash'),
             'imports': [{'dll': row.get('name'), 'functions': [x.get('name') for x in row.get('functions', [])][:150]}
                         for row in result.get('imports', [])],
             'scope': 'REA static PE import analysis; Ghidra decompilation is not bundled'}
+    except InterruptedError:raise
     except Exception as ex:
         output['rea'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
     return output
@@ -194,6 +227,16 @@ def enrich_reviews(cleaner):
     candidates = [row for row in cleaner.findings if row.get('kind', '').startswith('review_')]
     if not candidates or cleaner.cancel.is_set():
         return
+    def phase(stage,path='',completed=0,timeout=None):
+        state={'phase':'review','stage':stage,'path':str(path),'started':time.monotonic(),
+               'completed':completed,'total':len(candidates),'timeout':timeout}
+        cleaner.progress=state
+        cleaner.log('scan_phase',**state)
+        cleaner.emit(stage+('：'+str(path) if path else ''))
+    def stopped(row):
+        row['secondary_analysis']={'status':'incomplete','reason':'用户已停止，离线复核未完成。'}
+        cleaner.inspection_failed=True
+    phase('正在准备离线复核')
     cleaner.emit('正在执行离线多引擎复核：' + str(len(candidates)) + ' 项。')
     with tempfile.TemporaryDirectory(prefix='engine-review-', dir=cleaner.run) as temp:
         work = Path(temp)
@@ -203,36 +246,36 @@ def enrich_reviews(cleaner):
                 break
             path = Path(row['path'])
             try:
+                phase('正在准备分析副本',path,index)
                 cleaner.policy.check(path)
                 if cleaner.protected_path(path):
                     raise PermissionError('该位置受保护，不进入外部分析引擎。')
-                if path.stat().st_size > MAX_INPUT:
-                    raise ValueError('文件超过多引擎复核大小上限。')
-                before = path.stat()
                 snapshot = work / ('item-%06d' % index + path.suffix)
-                shutil.copyfile(path, snapshot)
-                digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
-                with path.open('rb') as stream:
-                    original_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-                if digest != original_digest or path.stat().st_mtime_ns != before.st_mtime_ns:
-                    raise ValueError('准备分析时文件发生变化。')
+                digest = snapshot_file(path,snapshot,cleaner.cancel)
                 row['analysis_sha256'] = digest
                 pairs.append((row, snapshot))
+            except InterruptedError:
+                stopped(row);break
             except Exception as ex:
                 row['secondary_analysis'] = {'status': 'incomplete', 'reason': str(ex)}
                 cleaner.inspection_failed = True
                 cleaner.error(path, ex)
         if not pairs:
+            for row in candidates:
+                if 'secondary_analysis' not in row:stopped(row)
             return
+        if hasattr(cleaner,'save'):cleaner.save()
         try:
+            phase('ClamAV 病毒库加载及批量复核',timeout=180)
             clam, database = clam_batch([snapshot for _, snapshot in pairs], work, cancel=cleaner.cancel)
         except Exception as ex:
             clam, database = {}, {}
             cleaner.inspection_failed = True
             cleaner.error('ClamAV', ex)
-        for row, snapshot in pairs:
+        for index,(row, snapshot) in enumerate(pairs):
             if cleaner.cancel.is_set():
                 break
+            phase('正在执行文件内容规则',row['path'],index)
             cleaner.emit('正在复核：' + str(row['path']))
             evidence = {'clamav': clam.get(str(snapshot), {'status': 'incomplete'}), 'database': database}
             if row.get('kind') == 'review_office':
@@ -244,19 +287,25 @@ def enrich_reviews(cleaner):
                 evidence['yara_x'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
             if row.get('kind') == 'review_autoit':
                 try:
-                    evidence['autoit'] = parser_request('autoit', snapshot)
+                    phase('AutoIt 静态解析',row['path'],index,25)
+                    evidence['autoit'] = parser_request('autoit', snapshot, cancel=cleaner.cancel)
                 except Exception as ex:
                     evidence['autoit'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
             kinds = {x['kind'] for x in row.get('structural_evidence', [])}
             if kinds & {'xlm_macro_sheet', 'auto_macro_name'}:
                 try:
-                    evidence['xlm'] = parser_request('xlm', snapshot)
+                    phase('Excel XLM 宏复核',row['path'],index,25)
+                    evidence['xlm'] = parser_request('xlm', snapshot, cancel=cleaner.cancel)
                 except Exception as ex:
                     evidence['xlm'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
             with snapshot.open('rb') as stream:
                 is_pe = stream.read(2) == b'MZ'
-            if is_pe:
-                evidence.update(pe_second_opinion(snapshot))
+            if is_pe and not cleaner.cancel.is_set():
+                try:
+                    evidence.update(pe_second_opinion(snapshot,cancel=cleaner.cancel,
+                        progress=lambda stage:phase(stage,row['path'],index,25)))
+                except InterruptedError:evidence['pe']={'status':'incomplete','reason':'用户已停止，程序分析未完成。'}
+            if cleaner.cancel.is_set():evidence['cancelled']={'status':'incomplete','reason':'用户已停止，离线复核未完成。'}
             detected = evidence['clamav'].get('status') == 'detected'
             rule_hits = evidence['yara_x'].get('matches', [])
             failures = [name for name, value in evidence.items() if isinstance(value, dict) and value.get('status') in ('incomplete', 'unsupported')]
@@ -274,3 +323,7 @@ def enrich_reviews(cleaner):
                 row['analysis_incomplete_engines'] = failures
                 cleaner.inspection_failed = True
             cleaner.log('secondary_analysis', path=row['path'], sha256=row['analysis_sha256'], result=evidence)
+            phase('离线复核进度',row['path'],index+1)
+        if cleaner.cancel.is_set():
+            for row in candidates:
+                if 'secondary_analysis' not in row:stopped(row)

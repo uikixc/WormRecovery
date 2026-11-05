@@ -62,4 +62,12 @@ def run(command, *, timeout, input=None, stdout=subprocess.PIPE, stderr=subproce
             kernel.CloseHandle(handle)
         if process.poll() is None:
             process.kill()
-        process.communicate()
+        try:process.communicate(timeout=2)
+        except (subprocess.TimeoutExpired,OSError):
+            # Never let inherited pipe handles turn cleanup into an endless wait.
+            for stream in (process.stdin,process.stdout,process.stderr):
+                if stream:
+                    reader=getattr(process,'_stdout_thread',None) if stream is process.stdout else getattr(process,'_stderr_thread',None) if stream is process.stderr else None
+                    if reader is not None and reader.is_alive():continue
+                    try:stream.close()
+                    except OSError:pass
