@@ -51,6 +51,9 @@ def assess_document(row):
     if known and installation_component(row['path']) and ntpath.basename(row['path']).casefold()==known[0].casefold() and not row.get('active_content_unresolved'):
         return result('informational','reviewed_office_component',known[1]+'：完整文件与已核对组件一致，未检出已知威胁。',
                       '安装目录结构、文件名、完整 SHA-256、当前病毒检查及内容规则同时匹配')
+    if row.get('parser_recovery',{}).get('status')=='completed' and row.get('status')=='clean' and row.get('macro') is False and not row.get('structural_evidence') and evidence.get('office_parser',{}).get('status')=='analyzed':
+        return result('informational','recovered_document_analysis','文档重试分析完成，未发现宏或已检查类型的活动内容，当前病毒库与内容规则未检出威胁。',
+                      '完整哈希校验的只读副本、文档解析成功、当前病毒检查及内容规则均完成')
     structures=row.get('structural_evidence',[])
     if row.get('macro') is not False or row.get('macro_analysis') or row.get('other_modules') or not structures or evidence.get('office_parser',{}).get('status')!='analyzed':
         return result('unresolved','unresolved_executable_content','宏或文档结构尚无足够证据，保留风险状态。','不使用文件名或杀毒未命中作为单独白名单')

@@ -138,7 +138,7 @@ class PowerShellOutputTests(unittest.TestCase):
 
     def test_powershell_suppresses_progress_and_decodes_error(self):
         result=types.SimpleNamespace(returncode=1,stderr=b'#< CLIXML\n<Objs><S S="Error">expected failure</S></Objs>',stdout=b'')
-        with patch.object(wr.subprocess,'run',return_value=result) as run:
+        with patch('engine_process.run',return_value=result) as run:
             with self.assertRaisesRegex(RuntimeError,'^expected failure$'):wr.powershell('Get-Disk')
         script=base64.b64decode(run.call_args.args[0][-1]).decode('utf-16le')
         self.assertIn("$ProgressPreference='SilentlyContinue'",script)

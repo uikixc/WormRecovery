@@ -30,11 +30,22 @@ def review_state(record):
     if decision.get('classification')=='suspicious':return '高风险行为'
     secondary=record.get('secondary_analysis',{})
     if secondary.get('status')=='detected':return '引擎检出'
-    if record.get('analysis_error'):return '解析失败'
+    if record.get('analysis_error'):
+        details=record.get('error_details',{})
+        if details.get('phase')=='process_start':return '组件启动失败'
+        return '解析未完成' if details.get('source_bytes_read') else '解析失败'
     if secondary.get('status')=='incomplete':return '分析未完成'
     if secondary.get('status')=='suspicious':return '规则命中'
     if secondary.get('status')=='no_known_match':return '无已知匹配'
     return '未确认感染'
+
+
+def coverage_state(record):
+    category=record.get('category')
+    if category=='document_analysis_failed':return '解析未完成'
+    if category=='inspection_process_start_failed':return '组件启动失败'
+    if category in ('active_pagefile_unreadable','system_swap_path_unreadable'):return '读取受限'
+    return '检查异常'
 
 
 class ModernWindow:
@@ -296,6 +307,8 @@ class ModernWindow:
             text=record['path']
             for key in ('reason','action','assessment_limit','error'):
                 if record.get(key):text+='\n'+record[key]
+            details=record.get('error_details',{})
+            if details.get('source_bytes_read'):text+='\n文件字节：已成功读取，后续分析未完成。'
             decision=record.get('decision',{})
             if decision:text+='\n自动判定：'+decision.get('reason','')+'\n判定依据：'+decision.get('basis','')
             secondary=record.get('secondary_analysis',{})
@@ -398,7 +411,7 @@ class ModernWindow:
             informational=r['kind'].startswith('info_')
             if r.get('_coverage_error'):
                 if self.filter not in ('all','errors'):continue
-                self.tree.insert('',tk.END,iid=str(i),values=('读取受限' if r.get('category') else '检查异常',r.get('reason','文件读取或检查未完成。'),r['path']),tags=('review',))
+                self.tree.insert('',tk.END,iid=str(i),values=(coverage_state(r),r.get('reason','检查未完成，请查看具体错误。'),r['path']),tags=('review',))
                 visible+=1
                 continue
             if self.filter=='errors':continue

@@ -6,6 +6,18 @@ import subprocess
 import time
 
 
+def start(command, **kwargs):
+    """Retry only failed process creation, never a command that already started."""
+    for attempt in range(4):
+        try:
+            return subprocess.Popen(command, **kwargs)
+        except OSError as error:
+            if getattr(error, 'winerror', None) not in (5, 32, 33) or attempt == 3:
+                error.operation_phase = 'process_start'
+                raise
+            time.sleep((0.10, 0.25, 0.50)[attempt])
+
+
 def _job(process):
     if os.name != 'nt':
         return None, None
@@ -44,7 +56,7 @@ def _job(process):
 
 
 def run(command, *, timeout, input=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=None, cancel=None):
-    process = subprocess.Popen(command, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+    process = start(command, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
         stdout=stdout, stderr=stderr, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     kernel = handle = None
     started = time.monotonic()

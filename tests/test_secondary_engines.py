@@ -237,6 +237,43 @@ class EngineResultTests(unittest.TestCase):
             self.assertIn('office_parser', row['analysis_incomplete_engines'])
             self.assertTrue(cleaner.inspection_failed)
 
+    def test_verified_snapshot_retries_worker_failure_and_keeps_unknown_macro(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);document=root/'fixture.xls';document.write_bytes(b'inert snapshot input')
+            reason='inert parser process denial'
+            row={'kind':'review_office','path':str(document),'reason':reason,'analysis_error':True,
+                 'error_details':{'phase':'legacy_worker','source_bytes_read':True}}
+            events=[]
+            cleaner=SimpleNamespace(findings=[row],cancel=threading.Event(),run=root,
+                errors=[{'path':str(document),'error':reason},{'path':'another-file','error':'unresolved'}],
+                policy=SimpleNamespace(check=lambda _:None),protected_path=lambda _:False,emit=lambda _:None,
+                log=lambda kind,**data:events.append(kind),error=lambda *args:None,inspection_failed=True)
+            def scan(paths,work,**kwargs):return {str(p):{'status':'no_match'} for p in paths},{}
+            def parse(snapshot):
+                self.assertNotEqual(snapshot,document);self.assertEqual(snapshot.read_bytes(),document.read_bytes())
+                return {'status':'review','macro':True,'macro_analysis':{'modules':[{'name':'fixture'}]}}
+            with patch.object(engines,'clam_batch',side_effect=scan),patch('worm_recovery._office_check',side_effect=parse):
+                engines.enrich_reviews(cleaner)
+            self.assertFalse(row.get('analysis_error'));self.assertEqual(row['kind'],'review_office')
+            self.assertEqual(row['parser_recovery']['status'],'completed');self.assertEqual(row['analysis_attempts'][0]['reason'],reason)
+            self.assertIn('office_parser_recovered',events)
+            self.assertEqual(len(cleaner.errors),1);self.assertTrue(cleaner.inspection_failed)
+
+    def test_successful_retry_only_clears_its_own_failure_after_complete_engines(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);document=root/'fixture.xlsx';document.write_bytes(b'inert fixture bytes')
+            reason='inert parser startup failure'
+            row={'kind':'review_office','path':str(document),'reason':reason,'analysis_error':True,
+                 'error_details':{'phase':'process_start','source_bytes_read':True}}
+            cleaner=SimpleNamespace(findings=[row],cancel=threading.Event(),run=root,
+                errors=[{'path':str(document),'error':reason}],policy=SimpleNamespace(check=lambda _:None),
+                protected_path=lambda _:False,emit=lambda _:None,log=lambda *args,**kw:None,error=lambda *args:None,inspection_failed=True)
+            def scan(paths,work,**kwargs):return {str(p):{'status':'no_match'} for p in paths},{}
+            with patch.object(engines,'clam_batch',side_effect=scan),patch('worm_recovery._office_check',return_value={'status':'clean','macro':False}):
+                engines.enrich_reviews(cleaner)
+            self.assertEqual(row['kind'],'info_document');self.assertFalse(cleaner.inspection_failed)
+            self.assertEqual(cleaner.errors,[])
+
 
 if __name__ == '__main__':
     unittest.main()

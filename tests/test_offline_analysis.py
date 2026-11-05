@@ -147,10 +147,10 @@ class AnalysisTransportTests(unittest.TestCase):
             executable = Path(temp) / 'WormRecovery.exe'
             helper = executable.with_name('WormRecovery-Analysis.exe')
             helper.write_bytes(b'inert test placeholder')
-            with patch.object(analysis.sys, 'frozen', True, create=True), patch.object(analysis.sys, 'executable', str(executable)), patch.object(analysis.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(response).encode(), stderr=b'')) as run:
+            with patch.object(analysis.sys, 'frozen', True, create=True), patch.object(analysis.sys, 'executable', str(executable)), patch('office_worker_transport.request', return_value=(json.dumps(response).encode(),{})) as run:
                 analysis.analyze_project(data)
-            self.assertEqual(run.call_args.args[0], [str(helper)])
-            self.assertEqual(run.call_args.kwargs['stdout'], subprocess.PIPE)
+            self.assertEqual(run.call_args.args[0], [str(helper),'--office-worker-server'])
+            self.assertEqual(run.call_args.args[2]['mode'], 'vba')
 
     def test_graphical_build_missing_companion_is_explicit_error(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -163,10 +163,10 @@ class AnalysisTransportTests(unittest.TestCase):
             analysis.analyze_project(b'inert invalid OLE project', timeout=15)
 
     def test_worker_timeout_and_output_errors_are_not_suppressed(self):
-        with patch.object(analysis.subprocess, 'run', side_effect=subprocess.TimeoutExpired('fixture', 1)):
+        with patch('office_worker_transport.request', side_effect=subprocess.TimeoutExpired('fixture', 1)):
             with self.assertRaises(subprocess.TimeoutExpired):
                 analysis.analyze_project(b'inert')
-        with patch.object(analysis.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=b'not json', stderr=b'')):
+        with patch('office_worker_transport.request', return_value=(b'not json',{})):
             with self.assertRaisesRegex(ValueError, '无效结果'):
                 analysis.analyze_project(b'inert')
 
@@ -180,10 +180,29 @@ class AnalysisTransportTests(unittest.TestCase):
     def test_frozen_cli_uses_private_analysis_worker_instead_of_self_spawn(self):
         response={'ok':True,'result':{'family_modules':[],'other_modules':[]}}
         helper=Path('C:/private/analysis/WormRecovery-Analysis.exe')
-        with patch.object(analysis.sys,'frozen',True,create=True),patch.object(analysis.sys,'executable','C:/private/WormRecovery-CLI.exe'),patch('bundled_components.component_path',return_value=helper),patch.object(analysis.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(response).encode(),stderr=b'')) as run:
+        with patch.object(analysis.sys,'frozen',True,create=True),patch.object(analysis.sys,'executable','C:/private/WormRecovery-CLI.exe'),patch('bundled_components.component_path',return_value=helper),patch('office_worker_transport.request',return_value=(json.dumps(response).encode(),{})) as run:
             analysis.analyze_project(b'fresh frozen cli worker fixture')
-        self.assertEqual(run.call_args.args[0],[str(helper)])
-        self.assertEqual(run.call_args.kwargs['env']['PYINSTALLER_RESET_ENVIRONMENT'],'1')
+        self.assertEqual(run.call_args.args[0],[str(helper),'--office-worker-server'])
+        self.assertEqual(run.call_args.args[1]['PYINSTALLER_RESET_ENVIRONMENT'],'1')
+
+    def test_legacy_document_reuses_bytes_without_worker_reopening_original(self):
+        data=bytes.fromhex('d0cf11e0a1b11ae1')+b'inert legacy bytes'
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'legacy.xls';path.write_bytes(data)
+            with patch.object(analysis,'analyze_legacy_document',return_value={'status':'clean','macro':False}) as worker:
+                result=w.office_check(path)
+            self.assertEqual(result['status'],'clean')
+            worker.assert_called_once_with(data)
+
+    def test_launch_denial_is_reported_as_analysis_failure_after_successful_read(self):
+        data=bytes.fromhex('d0cf11e0a1b11ae1')+b'inert legacy denial fixture'
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'legacy.xls';path.write_bytes(data)
+            error=PermissionError('process start denied');error.winerror=5;error.operation_phase='process_start'
+            with patch.object(analysis,'analyze_legacy_document',side_effect=error):result=w.office_check(path)
+            self.assertTrue(result['analysis_error']);self.assertTrue(result['error_details']['source_bytes_read'])
+            self.assertEqual(result['error_details']['phase'],'process_start')
+            self.assertNotIn('文件读取未完成',result['reason'])
 
     def test_source_and_pcode_output_limits_are_enforced(self):
         output = analysis.LimitedText(4)

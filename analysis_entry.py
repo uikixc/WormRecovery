@@ -6,7 +6,7 @@ for name in ('stdout', 'stderr'):
     if getattr(sys, name) is None:
         setattr(sys, name, open(os.devnull, 'w', encoding='utf-8', errors='replace'))
 
-from office_analysis import worker_main
+from office_analysis import worker_main, worker_server
 
 if __name__ == '__main__':
-    raise SystemExit(worker_main())
+    raise SystemExit(worker_server() if sys.argv[1:]==['--office-worker-server'] else worker_main())

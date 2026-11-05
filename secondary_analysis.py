@@ -263,6 +263,7 @@ def enrich_reviews(cleaner):
     with tempfile.TemporaryDirectory(prefix='engine-review-', dir=cleaner.run) as temp:
         work = Path(temp)
         pairs = []
+        recovered_office=False
         for index, row in enumerate(candidates):
             if cleaner.cancel.is_set():
                 break
@@ -275,6 +276,25 @@ def enrich_reviews(cleaner):
                 snapshot = work / ('item-%06d' % index + path.suffix)
                 digest = snapshot_file(path,snapshot,cleaner.cancel)
                 row['analysis_sha256'] = digest
+                details=row.get('error_details',{})
+                if row.get('kind')=='review_office' and row.get('analysis_error') and details.get('phase') in (
+                        'macro_worker','legacy_worker','process_start','read_header','read_macro_bytes','read_legacy_bytes'):
+                    phase('正在重试文档分析',path,index,25)
+                    from worm_recovery import _office_check
+                    from office_triage import assess_office
+                    previous={'reason':row.get('reason'),'error_details':details}
+                    parsed=assess_office(path,_office_check(snapshot))
+                    if not parsed.get('analysis_error'):
+                        for key in ('analysis_error','error_details','error_category','assessment','action','reason'):
+                            row.pop(key,None)
+                        row.update(parsed)
+                        row['analysis_attempts']=[previous]
+                        row['parser_recovery']={'status':'completed','sha256':digest,'source':'verified_readonly_snapshot'}
+                        if hasattr(cleaner,'errors'):
+                            cleaner.errors[:]=[error for error in cleaner.errors if not (
+                                error.get('path')==str(path) and error.get('error')==previous['reason'])]
+                        recovered_office=True
+                        cleaner.log('office_parser_recovered',path=str(path),sha256=digest,previous=previous)
                 pairs.append((row, snapshot))
             except InterruptedError:
                 stopped(row);break
@@ -351,3 +371,6 @@ def enrich_reviews(cleaner):
         if cleaner.cancel.is_set():
             for row in candidates:
                 if 'secondary_analysis' not in row:stopped(row)
+        if recovered_office:
+            cleaner.inspection_failed=bool(getattr(cleaner,'errors',[])) or cleaner.cancel.is_set() or any(
+                row.get('analysis_error') or row.get('secondary_analysis',{}).get('status')=='incomplete' for row in candidates)

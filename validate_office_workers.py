@@ -107,6 +107,8 @@ def validate(executable, analysis, fixtures, output, rounds=3, workers=3):
             checks['no_scan_errors'] = not report['errors']
             checks['no_fixture_confirmed_infection'] = not any(
                 not row['kind'].startswith(('review_', 'info_')) for row in findings.values())
+            runtime=[row.get('worker_runtime') or row.get('macro_analysis',{}).get('worker_runtime',{}) for row in findings.values()]
+            checks['portable_office_worker_reused'] = bool(runtime) and all(item.get('transport')=='persistent_bytes' for item in runtime) and len({item.get('process_id') for item in runtime})==1
             scan_summary.update(version=report['version'], files=report['files'],
                                 findings=len(findings), errors=report['errors'])
         else:

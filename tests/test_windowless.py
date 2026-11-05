@@ -50,7 +50,7 @@ output.write_text(json.dumps({'windowless': w.WINDOWLESS, 'parser': VBA_Parser._
         cleaner.findings=[]
         cleaner.errors=[]
         cleaner.add=lambda kind,path,**info:cleaner.findings.append({'kind':kind,'path':path,**info})
-        cleaner.error=lambda path,error:cleaner.errors.append({'path':path,'error':error})
+        cleaner.error=lambda path,error,details=None:cleaner.errors.append({'path':path,'error':error,'error_details':details})
         with patch.object(w,'office_check',return_value={'status':'review','analysis_error':True,'reason':'fixture failure'}):
             cleaner.scan_file('C:/fixture.xlsm',None)
         self.assertTrue(cleaner.inspection_failed)

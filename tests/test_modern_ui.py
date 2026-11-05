@@ -76,6 +76,16 @@ class ModernUITests(unittest.TestCase):
         self.app.select_filter('confirmed')
         self.assertEqual(self.app.tree.get_children(),())
 
+    def test_parser_failure_after_read_is_not_labeled_read_permission_limit(self):
+        record={'kind':'coverage_error','_coverage_error':True,'path':'C:/fixture.xlsx',
+                'category':'document_analysis_failed','reason':'文件字节已经读取，后续解析未完成。',
+                'error_details':{'source_bytes_read':True},'error':'inert process failure'}
+        self.app.result_records=[record];self.app.select_filter('errors')
+        self.assertEqual(self.app.tree.item('0','values')[0],'解析未完成')
+        self.app.tree.selection_set('0');self.app.selected()
+        self.assertIn('已成功读取',self.app.selected_path.get())
+        self.assertEqual(modern_ui.coverage_state({'category':'inspection_process_start_failed'}),'组件启动失败')
+
     def test_secondary_results_have_distinct_visible_states(self):
         for result,state in (('detected','引擎检出'),('incomplete','分析未完成'),('suspicious','规则命中'),('no_known_match','无已知匹配')):
             with self.subTest(result=result):

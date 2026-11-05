@@ -15,7 +15,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.8'
+VERSION = '1.7.9'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -248,10 +248,20 @@ def office_check(path):
 
 def _office_check(path):
     p=pathlib.Path(path)
+    stage='read_header';source_read=False
+    def failed(error):
+        details={'phase':getattr(error,'operation_phase',stage),'exception_type':type(error).__name__,
+                 'winerror':getattr(error,'winerror',None),'source_bytes_read':source_read}
+        details.update(getattr(error,'analysis_details',{}))
+        labels={'macro_worker':'宏分析进程','legacy_worker':'旧版文档分析进程','package_structure':'文档结构解析'}
+        return {'status':'review','reason':('文件读取未完成：' if stage.startswith('read_') else '文档分析未完成（'+labels.get(stage,stage)+'）：')+str(error),
+                'analysis_error':True,'error_details':details}
     try:
         with open_read(p) as header:prefix=header.read(16)
         if not prefix:return {'status':'review','reason':'文件内容为空，无法恢复缺失正文；需要原文件或备份。','document_format':'empty','analysis_error':True,'error_category':'empty_document'}
+        stage='read_container'
         with open_read(p) as package,zipfile.ZipFile(package) as z:
+            stage='package_structure'
             entries=z.infolist()
             if len(entries)>20000 or sum(x.file_size for x in entries)>1024*1024*1024:return {'status':'review','reason':'文档超过检查资源上限，需进一步核查。'}
             names=[x.filename for x in entries]
@@ -260,11 +270,12 @@ def _office_check(path):
             macro=[x for x in entries if x.filename.casefold().endswith('vbaproject.bin')]
             if not macro:return attach_evidence({'status':'clean','macro':False},structure)
             if len(macro)!=1 or macro[0].file_size>16*1024*1024:return {'status':'review','reason':'宏项目结构异常，需进一步核查。'}
-            data=z.read(macro[0]);h=hashlib.sha256(data).hexdigest()
+            stage='read_macro_bytes';data=z.read(macro[0]);source_read=True;h=hashlib.sha256(data).hexdigest()
             if h in BAD_VBA_HASHES:
                 if macro[0].filename!='xl/vbaProject.bin' or 'xl/workbook.xml' not in names:return {'status':'review','reason':'已知宏位于非预期文档结构中，需人工核查。'}
                 return attach_evidence({'status':'infected','family':'Synaptics-Excel','vba_hash':h,'vba_part':macro[0].filename},structure)
             from office_analysis import analyze_project
+            stage='macro_worker'
             analysis=analyze_project(data)
             matches=analysis['family_modules'];others=analysis['other_modules']
             result={'status':'review','reason':'未识别宏已完成源码及编译指令特征检查，尚未确认感染。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h,'macro_analysis':analysis}
@@ -281,21 +292,15 @@ def _office_check(path):
             return {'status':'review','analysis_error':True,'document_format':'unrecognized',
                     'reason':'文件内容不是可识别的 Office 容器或 RTF，可能为扩展名不符、损坏或其他格式；未判为病毒。'}
         try:
-            from oletools.olevba import VBA_Parser
+            stage='read_legacy_bytes'
             with open_read(p) as source:data=source.read(128*1024*1024+1)
             if len(data)>128*1024*1024:raise ValueError('旧版 Office 文件超过静态解析上限。')
-            v=VBA_Parser(str(p),data=data)
-            try:
-                has=v.detect_vba_macros()
-                if has:
-                    from secondary_analysis import parser_request
-                    analysis=parser_request('legacy_office',p)
-                    return dict(analysis,document_format='ole')
-            finally:v.close()
-            return {'status':'review' if has else 'clean','reason':'旧版二进制文档中的宏需单独核查。' if has else None}
-        except Exception as ex:return {'status':'review','reason':'文档解析未完成：'+str(ex),'analysis_error':True}
+            source_read=True;stage='legacy_worker'
+            from office_analysis import analyze_legacy_document
+            return analyze_legacy_document(data)
+        except Exception as ex:return failed(ex)
     except Exception as ex:
-        return {'status':'review','reason':'文档解析未完成：'+str(ex),'analysis_error':True}
+        return failed(ex)
 
 def sanitized_xlsx(source,dest):
     """Copy original parts verbatim except VBA relationships/types and visibility."""
@@ -335,7 +340,8 @@ def powershell(script,timeout=60):
     exe=os.path.join(os.environ.get('WINDIR','C:\\Windows'),'System32','WindowsPowerShell','v1.0','powershell.exe')
     prefix="[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
     encoded=base64.b64encode((prefix+script).encode('utf-16le')).decode('ascii')
-    r=subprocess.run([exe,'-NoProfile','-NonInteractive','-EncodedCommand',encoded],capture_output=True,timeout=timeout,creationflags=0x08000000)
+    from engine_process import run
+    r=run([exe,'-NoProfile','-NonInteractive','-EncodedCommand',encoded],timeout=timeout)
     if r.returncode:
         from powershell_output import error_text
         raise RuntimeError(error_text(r.stderr)[-2000:])
@@ -427,6 +433,7 @@ def inspect_file_content(path,st):
             add('review_office',path,**info)
             if info.get('analysis_error'):
                 result['error']=info['reason']
+                result['error_details']=info.get('error_details',{})
     return result
 
 class Cleaner:
@@ -513,10 +520,18 @@ class Cleaner:
         elif norm(p.parent)==norm(user):base=winreg.HKEY_CURRENT_USER
         else:return
         self.startup_approved(base,'',p.name,('StartupFolder',),str(p))
-    def error(self,path,ex):
+    def error(self,path,ex,details=None):
         record={'path':str(path),'error':str(ex)}
+        details=details or {'phase':getattr(ex,'operation_phase',None),'winerror':getattr(ex,'winerror',None)}
+        if details.get('phase'):record['error_details']=details
+        if details.get('source_bytes_read'):
+            record.update(category='document_analysis_failed',source_bytes_read=True,content_inspected=False,
+                          reason='文件字节已经读取，后续文档解析未完成。',action='保留原文件，查看具体分析步骤及自动重试结果。')
+        elif details.get('phase')=='process_start':
+            record.update(category='inspection_process_start_failed',reason='内部检查进程未能启动。',
+                          action='文件访问权限与进程启动限制分别记录，不能将该错误解释为文件内容不可读。')
         from coverage_errors import active_pagefiles,describe_read_error
-        if 'permission denied' in str(ex).casefold() or 'winerror 32' in str(ex).casefold() or getattr(ex,'winerror',None) in (5,32) or isinstance(ex,PermissionError):
+        if not record.get('category') and ('permission denied' in str(ex).casefold() or 'winerror 32' in str(ex).casefold() or getattr(ex,'winerror',None) in (5,32) or isinstance(ex,PermissionError)):
             if not hasattr(self,'_active_pagefiles'):
                 try:self._active_pagefiles=active_pagefiles()
                 except OSError:self._active_pagefiles=set()
@@ -716,7 +731,7 @@ class Cleaner:
             row=dict(row);kind=row.pop('kind');target=row.pop('path')
             self.add(kind,target,**row)
         if result.get('error'):
-            self.inspection_failed=True;self.error(path,result['error'])
+            self.inspection_failed=True;self.error(path,result['error'],result.get('error_details'))
     def scan_file(self,path,st):
         self.record_file_result(path,inspect_file_content(path,st))
     def scan(self,roots=None,workers=None):
