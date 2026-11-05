@@ -1,12 +1,10 @@
-"""Inert fixtures only: local TLS, bounded evidence, queue, and authorization."""
-import base64
+"""Inert fixtures only: local HTTP, bounded evidence, queue, and authorization."""
 import copy
 import gzip
 import hashlib
 import http.client
 import json
 from pathlib import Path
-import ssl
 import tempfile
 import threading
 import unittest
@@ -40,7 +38,7 @@ class DiagnosticsTests(unittest.TestCase):
     def start_receiver(self):
         self.receiver=server.Collector(('127.0.0.1',0),self.config)
         self.thread=threading.Thread(target=self.receiver.serve_forever,kwargs={'poll_interval':.02},daemon=True);self.thread.start()
-        return 'https://127.0.0.1:'+str(self.receiver.server_port)
+        return 'http://127.0.0.1:'+str(self.receiver.server_port)
     def data(self):return bundle.build_bundle(self.report,state=self.state)
     def test_report_keeps_evidence_without_originals_or_secrets(self):
         before=self.report.read_bytes();record,compressed=self.data();text=gzip.decompress(compressed).decode()
@@ -52,34 +50,35 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(record['device_id'],self.data()[0]['device_id'])
     def test_oversized_report_refused_before_loading(self):
         with patch.object(bundle,'MAX_REPORT',2),self.assertRaises(ValueError):self.data()
-    def test_authenticated_encryption_roundtrip_and_tamper_rejection(self):
-        record,compressed=self.data();sealed=transport.encrypt(compressed,self.enrollment['encryption_public_key'])
-        self.assertNotIn(b'private.xlsm',sealed)
-        self.assertEqual(transport.decrypt(sealed,self.config['encryption_private_key']),compressed)
-        envelope=json.loads(sealed);encoded=bytearray(base64.b64decode(envelope['ciphertext']));encoded[0]^=1
-        envelope['ciphertext']=base64.b64encode(encoded).decode()
-        with self.assertRaises(Exception):transport.decrypt(json.dumps(envelope).encode(),self.config['encryption_private_key'])
-    def test_local_tls_upload_idempotency_and_conflict(self):
+    def test_http_upload_idempotency_and_conflict(self):
         endpoint=self.start_receiver();record,compressed=self.data()
-        sealed=transport.encrypt(compressed,self.enrollment['encryption_public_key'])
-        send=lambda value:transport.send(endpoint,value,self.enrollment['upload_token'],self.enrollment['certificate_sha256'],timeout=3)
-        self.assertEqual(send(sealed)['receipt'],record['bundle_id']);send(sealed)
+        send=lambda value:transport.send(endpoint,value,self.enrollment['upload_token'],timeout=3)
+        self.assertEqual(send(compressed)['receipt'],record['bundle_id']);send(compressed)
         self.assertEqual(len(list(Path(self.config['directory']).glob('*.json'))),1)
         changed=copy.deepcopy(record);changed['summary']['files']=200
-        with self.assertRaisesRegex(ValueError,'409'):send(transport.encrypt(gzip.compress(json.dumps(changed).encode()),self.enrollment['encryption_public_key']))
+        with self.assertRaisesRegex(ValueError,'409'):send(gzip.compress(json.dumps(changed).encode()))
         summary=server.summarize(self.config['directory']);self.assertEqual(summary['reports'],1)
         self.assertEqual(summary['review_groups'][0]['sha256'],'a'*64)
-    def test_wrong_pin_never_transmits_report_or_token(self):
-        endpoint=self.start_receiver();record,data=self.data();sealed=transport.encrypt(data,self.enrollment['encryption_public_key'])
-        with patch.object(http.client.HTTPSConnection,'request') as request,self.assertRaisesRegex(ValueError,'指纹'):
-            transport.send(endpoint,sealed,self.enrollment['upload_token'],'0'*64,timeout=3)
-        request.assert_not_called();self.assertEqual(self.receiver.bytes_used,0)
-    def test_wrong_token_refused_and_admin_data_separate(self):
-        endpoint=self.start_receiver();record,data=self.data();sealed=transport.encrypt(data,self.enrollment['encryption_public_key'])
-        with self.assertRaisesRegex(ValueError,'401'):
-            transport.send(endpoint,sealed,'bad-token',self.enrollment['certificate_sha256'],timeout=3)
+    def test_http_sends_raw_gzip_without_encryption_envelope(self):
+        endpoint=self.start_receiver();record,compressed=self.data()
+        with patch.object(http.client.HTTPConnection,'request',side_effect=RuntimeError('stop')) as request:
+            with self.assertRaises(RuntimeError):transport.send(endpoint,compressed,self.enrollment['upload_token'])
+        self.assertEqual(request.call_args.kwargs['body'],compressed)
+        self.assertEqual(request.call_args.kwargs['headers']['Content-Type'],'application/gzip')
+        self.assertEqual(gzip.decompress(compressed)[:1],b'{')
+    def test_payload_checksum_failure_refused(self):
+        endpoint=self.start_receiver();record,compressed=self.data()
+        connection=http.client.HTTPConnection('127.0.0.1',self.receiver.server_port,timeout=3)
+        connection.request('POST','/v1/diagnostics',body=compressed,headers={
+            'Authorization':'Bearer '+self.enrollment['upload_token'],'X-Content-SHA256':'0'*64})
+        self.assertEqual(connection.getresponse().status,400);connection.close()
         self.assertEqual(self.receiver.bytes_used,0)
-        context=ssl._create_unverified_context();connection=http.client.HTTPSConnection('127.0.0.1',self.receiver.server_port,context=context,timeout=3)
+    def test_wrong_token_refused_and_admin_data_separate(self):
+        endpoint=self.start_receiver();record,data=self.data()
+        with self.assertRaisesRegex(ValueError,'401'):
+            transport.send(endpoint,data,'bad-token',timeout=3)
+        self.assertEqual(self.receiver.bytes_used,0)
+        connection=http.client.HTTPConnection('127.0.0.1',self.receiver.server_port,timeout=3)
         connection.request('GET','/v1/status',headers={'Authorization':'Bearer '+self.enrollment['upload_token']})
         self.assertEqual(connection.getresponse().status,401);connection.close()
     def test_enrollment_protected_at_rest_and_queue_survives_outage(self):
@@ -123,9 +122,22 @@ class DiagnosticsTests(unittest.TestCase):
         self.start_receiver();self.assertFalse(old.exists());self.assertTrue(current.exists())
         self.assertEqual(self.receiver.bytes_used,2)
     def test_initialization_never_overwrites_keys(self):
-        before=(self.host/'collector-key.pem').read_bytes()
+        before=(self.host/'devices.enroll').read_bytes()
         with self.assertRaises(ValueError):server.initialize(self.host)
-        self.assertEqual(before,(self.host/'collector-key.pem').read_bytes())
+        self.assertEqual(before,(self.host/'devices.enroll').read_bytes())
+    def test_http_migration_preserves_authorization_and_backup(self):
+        old=dict(self.config,schema=1,certificate='old.pem',tls_key='old.key',encryption_private_key='retained-key')
+        device=dict(self.enrollment,schema=1,endpoints=['https://10.205.103.120:10888'],certificate_sha256='f'*64,encryption_public_key='old-public')
+        config_path=self.host/'collector-server.json';device_path=self.host/'devices.enroll'
+        config_path.write_text(json.dumps(old));device_path.write_text(json.dumps(device))
+        result=server.migrate_http(self.host)
+        migrated=json.loads(config_path.read_text());enrollment=json.loads(device_path.read_text())
+        self.assertTrue(result['changed']);self.assertEqual(migrated['schema'],2)
+        self.assertEqual(enrollment['upload_token'],self.enrollment['upload_token'])
+        self.assertEqual(enrollment['endpoints'],['http://10.205.103.120:10888'])
+        self.assertNotIn('encryption_private_key',migrated)
+        self.assertEqual(json.loads((self.host/'collector-server.json.v1-backup').read_text()),old)
+        self.assertFalse(server.migrate_http(self.host)['changed'])
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

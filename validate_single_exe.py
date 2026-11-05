@@ -47,6 +47,7 @@ def validate(executable, output, vba_fixture=None):
                 archive.writestr('xl/vbaProject.bin',project)
         before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs.iterdir()}
         env = os.environ.copy()
+        env['LOCALAPPDATA']=str(root/'test-userdata')
         for key in ('WORMRECOVERY_ENGINE_ROOT', 'PYTHONPATH', 'PYTHONHOME'):
             env.pop(key, None)
         env['PATH'] = 'C:/Windows/System32;C:/Windows'

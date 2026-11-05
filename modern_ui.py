@@ -542,7 +542,7 @@ class ModernWindow:
         from diagnostic_client import read_status,enroll,disable
         dialog=tk.Toplevel(self.root);dialog.title('诊断反馈');dialog.geometry('650x420');dialog.transient(self.root)
         tk.Label(dialog,text='诊断资料收集',font=(FONT,14,'bold')).pack(anchor='w',padx=24,pady=(24,12))
-        tk.Label(dialog,text='收集扫描报告、待核项依据、文件哈希、解析失败、引擎状态、处理结果及性能信息。\n本机账户名称会脱敏；不提交文档原件、正文、隔离样本、密码或访问令牌。\n\n导入服务端生成的配置后，每次检测或修复完成时自动提交。\n无法连接时保留加密队列，下次启动或手动重试时继续发送。',justify='left',wraplength=595).pack(anchor='w',padx=24)
+        tk.Label(dialog,text='收集扫描报告、待核项依据、文件哈希、解析失败、引擎状态、处理结果及性能信息。\n本机账户名称会脱敏；不提交文档原件、正文、隔离样本、密码或访问令牌。\n\n导入服务端生成的配置后，每次检测或修复完成时自动提交。\n无法连接时保留压缩队列，下次启动或手动重试时继续发送。',justify='left',wraplength=595).pack(anchor='w',padx=24)
         tk.Label(dialog,text='内网优先：10.205.103.120:10888\n外网备用：8.134.112.170:10888',justify='left',fg=MUTED).pack(anchor='w',padx=24,pady=14)
         record=read_status()
         self.diagnostic_state=tk.StringVar(value=('已启用' if record['enabled'] else '尚未配置')+' · 待提交 '+str(record['pending'])+' 份')
@@ -552,11 +552,11 @@ class ModernWindow:
             path=filedialog.askopenfilename(title='选择采集服务配置',filetypes=[('采集配置','*.enroll')],parent=dialog)
             if not path:return
             try:
-                enroll(path);self.diagnostic_state.set('已启用自动提交，设备配置已加密保存。')
+                enroll(path);self.diagnostic_state.set('已启用自动提交，设备授权已保存。')
                 self.submit_diagnostics()
             except Exception as ex:messagebox.showerror('配置未完成',str(ex),parent=dialog)
         def pause():
-            disable();self.diagnostic_state.set('自动提交已暂停，已有加密队列保留。')
+            disable();self.diagnostic_state.set('自动提交已暂停，已有待提交队列保留。')
         def submit():
             self.submit_diagnostics(self.cleaner.run/'report.json' if self.cleaner and not self.busy else None)
         ttk.Button(row,text='导入采集配置',command=configure).pack(side='left')

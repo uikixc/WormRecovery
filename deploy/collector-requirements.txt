@@ -1,1 +1,1 @@
-cryptography==50.0.2
+# HTTP receiver uses only the Python standard library.

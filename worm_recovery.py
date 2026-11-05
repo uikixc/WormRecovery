@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.0'
+VERSION = '1.7.1'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -1019,7 +1019,7 @@ def cli_main():
             if len(sys.argv)!=3:raise ValueError('请提供配置文件或扫描报告的完整路径。')
             result=diagnostics.enroll(sys.argv[2]) if option=='--enroll-diagnostics' else diagnostics.collect(sys.argv[2],manual=True)
         elif option=='--disable-diagnostics':
-            diagnostics.disable();result={'enabled':False,'message':'自动提交已暂停，已有加密队列保留。'}
+            diagnostics.disable();result={'enabled':False,'message':'自动提交已暂停，已有待提交队列保留。'}
         elif option=='--retry-diagnostics':result=diagnostics.retry()
         else:result=diagnostics.read_status()
         print(json.dumps(result,ensure_ascii=False));return 1 if result.get('error_type') or result.get('pending') else 0

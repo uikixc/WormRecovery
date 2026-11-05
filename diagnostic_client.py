@@ -1,5 +1,4 @@
 """Opt-in enrollment, protected client configuration and bounded upload queue."""
-import base64
 import ctypes
 from ctypes import wintypes as W
 import datetime
@@ -12,9 +11,9 @@ import threading
 import uuid
 
 from diagnostic_bundle import build_bundle,MAX_REPORT,scrub,read_bounded
-from diagnostic_transport import encrypt,send
+from diagnostic_transport import send
 
-DEFAULT_ENDPOINTS=('https://10.205.103.120:10888','https://8.134.112.170:10888')
+DEFAULT_ENDPOINTS=('http://10.205.103.120:10888','http://8.134.112.170:10888')
 LOCK=threading.Lock()
 UPLOAD_LOCK=threading.Lock()
 MAX_QUEUE=20
@@ -45,15 +44,13 @@ def protect(data,decrypt=False):
 
 def validate_config(config):
     from urllib.parse import urlsplit
-    if config.get('schema')!=1:raise ValueError('采集配置版本无效。')
+    if config.get('schema')!=2:raise ValueError('采集配置版本无效。')
     endpoints=config.get('endpoints')
     if not isinstance(endpoints,list) or not 1<=len(endpoints)<=4:raise ValueError('采集服务地址无效。')
     for endpoint in endpoints:
         url=urlsplit(endpoint)
-        if url.scheme!='https' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('','/'):
-            raise ValueError('采集服务必须使用 HTTPS 根地址。')
-    if not re.fullmatch('[0-9a-f]{64}',str(config.get('certificate_sha256'))):raise ValueError('采集服务证书指纹无效。')
-    if len(base64.b64decode(config.get('encryption_public_key',''),validate=True))!=32:raise ValueError('采集服务加密公钥无效。')
+        if url.scheme!='http' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('','/'):
+            raise ValueError('采集服务必须使用 HTTP 根地址。')
     if not re.fullmatch('[A-Za-z0-9_-]{32,160}',str(config.get('upload_token',''))):raise ValueError('设备上传授权无效。')
     return config
 
@@ -110,14 +107,14 @@ def flush_queue(config):
         payload=path.read_bytes();receipt=None
         for endpoint in config['endpoints']:
             try:
-                candidate=send(endpoint,payload,config['upload_token'],config['certificate_sha256'])
+                candidate=send(endpoint,payload,config['upload_token'])
                 if candidate['receipt']!=path.stem:raise ValueError('接收凭据与诊断包不匹配。')
                 receipt=candidate;break
             except Exception as ex:
                 record_event('diagnostic_transport_error',endpoint=endpoint,error_type=type(ex).__name__,message=str(ex)[:500])
                 continue
         if receipt is None:
-            return status('暂未连接采集服务，诊断包已加密保存在本机队列。',pending=len(list(root.glob('*.wrdiag'))),sent=sent)
+            return status('暂未连接采集服务，诊断包已压缩保存在本机队列。',pending=len(list(root.glob('*.wrdiag'))),sent=sent)
         received=state_root()/'receipts.jsonl'
         if received.exists() and received.stat().st_size>1024*1024:
             received.replace(received.with_suffix('.previous'))
@@ -140,11 +137,11 @@ def collect(report,manual=False,upload=True):
             if len(list(queue.glob('*.wrdiag')))>=MAX_QUEUE:
                 return status('采集队列已满，未覆盖已有诊断包；联网后重试。',pending=MAX_QUEUE)
             bundle,compressed=build_bundle(report,state=root)
-            payload=encrypt(compressed,config['encryption_public_key'])
+            payload=compressed
             path=queue/(bundle['bundle_id']+'.wrdiag');temporary=path.with_suffix('.partial')
             temporary.write_bytes(payload);os.replace(temporary,path)
             marker.write_text(fingerprint,encoding='ascii')
-        result=status('诊断包已加密保存，等待提交。',pending=len(list(queue.glob('*.wrdiag'))))
+        result=status('诊断包已压缩保存，等待提交。',pending=len(list(queue.glob('*.wrdiag'))))
     except Exception as ex:
         # Do not include config values, authorization headers or document content.
         return status('诊断任务未完成。',error_type=type(ex).__name__)

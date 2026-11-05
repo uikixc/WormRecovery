@@ -1,60 +1,58 @@
-"""Authenticated, encrypted diagnostics receiver. No specimen execution or remote commands."""
+"""Authorized gzip-over-HTTP diagnostics receiver. No specimen execution or remote commands."""
 import argparse
-import base64
 import collections
 import datetime
 import gzip
 import hashlib
 import hmac
-import ipaddress
 import io
 import json
 import os
 from pathlib import Path
 import secrets
-import ssl
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
-from diagnostic_transport import decrypt,MAX_WIRE
+from diagnostic_transport import MAX_WIRE
 
 
 def initialize(directory,endpoints=None):
-    from cryptography import x509
-    from cryptography.hazmat.primitives.asymmetric import ec,x25519
-    from cryptography.hazmat.primitives import hashes,serialization
-    from cryptography.x509.oid import NameOID
     directory=Path(directory);directory.mkdir(parents=True,exist_ok=True)
     config_path=directory/'collector-server.json'
-    if config_path.exists():raise ValueError('服务配置已存在，拒绝覆盖现有密钥。')
-    key=ec.generate_private_key(ec.SECP256R1());now=datetime.datetime.now(datetime.timezone.utc)
-    name=x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,'WormRecovery Diagnostics')])
-    certificate=x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key()).serial_number(x509.random_serial_number()).not_valid_before(now-datetime.timedelta(minutes=5)).not_valid_after(now+datetime.timedelta(days=730)).add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(x)) for x in ('8.134.112.170','10.205.103.120','127.0.0.1')]),critical=False).sign(key,hashes.SHA256())
-    private=x25519.X25519PrivateKey.generate()
+    if config_path.exists():raise ValueError('服务配置已存在，拒绝覆盖现有授权。')
     token=secrets.token_urlsafe(40);admin=secrets.token_urlsafe(40)
-    upload_hash=hashlib.sha256(token.encode()).hexdigest()
-    config={'schema':1,'bind':'0.0.0.0','port':10888,'directory':str(directory.resolve()/'received'),
-            'certificate':str(directory.resolve()/'collector-cert.pem'),'tls_key':str(directory.resolve()/'collector-key.pem'),
-            'encryption_private_key':base64.b64encode(private.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption())).decode(),
-            'upload_token_hash':upload_hash,'admin_token_hash':hashlib.sha256(admin.encode()).hexdigest(),
+    config={'schema':2,'bind':'0.0.0.0','port':10888,'directory':str(directory.resolve()/'received'),
+            'upload_token_hash':hashlib.sha256(token.encode()).hexdigest(),
+            'admin_token_hash':hashlib.sha256(admin.encode()).hexdigest(),
             'max_storage_bytes':10*1024*1024*1024,'retention_days':90}
-    enrollment={'schema':1,'endpoints':endpoints or ['https://10.205.103.120:10888','https://8.134.112.170:10888'],
-                'certificate_sha256':certificate.fingerprint(hashes.SHA256()).hex(),
-                'encryption_public_key':base64.b64encode(private.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)).decode(),
-                'upload_token':token}
+    enrollment={'schema':2,'endpoints':endpoints or ['http://10.205.103.120:10888','http://8.134.112.170:10888'],'upload_token':token}
     files={'collector-server.json':json.dumps(config,indent=2).encode(),
-           'collector-cert.pem':certificate.public_bytes(serialization.Encoding.PEM),
-           'collector-key.pem':key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()),
-           'devices.enroll':json.dumps(enrollment,indent=2).encode(),
-           'admin-access.txt':admin.encode()}
+           'devices.enroll':json.dumps(enrollment,indent=2).encode(),'admin-access.txt':admin.encode()}
     for filename,data in files.items():
         path=directory/filename
         with path.open('xb') as stream:stream.write(data)
         if os.name!='nt':path.chmod(0o600)
     if os.name!='nt':directory.chmod(0o700)
-    return {'config':str(config_path),'enrollment':str(directory/'devices.enroll'),'port':10888}
+    return {'config':str(config_path),'enrollment':str(directory/'devices.enroll'),'port':10888,'transport':'http-gzip'}
+
+
+def migrate_http(directory):
+    directory=Path(directory);config_path=directory/'collector-server.json';device_path=directory/'devices.enroll'
+    config=json.loads(config_path.read_text(encoding='utf-8'));device=json.loads(device_path.read_text(encoding='utf-8'))
+    if config.get('schema')==2:return {'transport':'http-gzip','changed':False}
+    if config.get('schema')!=1 or device.get('schema')!=1:raise ValueError('现有服务配置版本无效。')
+    for path in (config_path,device_path):
+        backup=path.with_name(path.name+'.v1-backup')
+        if not backup.exists():backup.write_bytes(path.read_bytes())
+    config={key:value for key,value in config.items() if key not in ('certificate','tls_key','encryption_private_key')}
+    config['schema']=2
+    device={key:value for key,value in device.items() if key not in ('certificate_sha256','encryption_public_key')}
+    device.update(schema=2,endpoints=[value.replace('https://','http://',1) for value in device['endpoints']])
+    for path,value in ((config_path,config),(device_path,device)):
+        temporary=path.with_suffix('.new');temporary.write_text(json.dumps(value,indent=2),encoding='utf-8');os.replace(temporary,path)
+    return {'transport':'http-gzip','changed':True,'enrollment':str(device_path)}
 
 
 def validate_bundle(data):
@@ -75,8 +73,7 @@ class Collector(ThreadingHTTPServer):
     def __init__(self,address,config):
         self.config=config;self.storage_lock=threading.Lock();self.slots=threading.BoundedSemaphore(8)
         self.rate={};self.rate_lock=threading.Lock()
-        self.tls=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);self.tls.minimum_version=ssl.TLSVersion.TLSv1_2
-        self.tls.load_cert_chain(config['certificate'],config['tls_key'])
+        if config.get('schema')!=2:raise ValueError('服务需要先迁移至 HTTP 配置。')
         self.directory=Path(config['directory']);self.directory.mkdir(parents=True,exist_ok=True)
         if os.name!='nt':self.directory.chmod(0o700)
         self.bytes_used=sum(p.stat().st_size for p in self.directory.glob('*.json'))
@@ -99,9 +96,8 @@ class Collector(ThreadingHTTPServer):
     def process_request_thread(self,request,address):
         try:
             request.settimeout(10)
-            secure=self.tls.wrap_socket(request,server_side=True)
-            super().process_request_thread(secure,address)
-        except (OSError,ssl.SSLError):request.close()
+            super().process_request_thread(request,address)
+        except OSError:request.close()
         finally:self.slots.release()
 
 
@@ -140,9 +136,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length=int(self.headers.get('Content-Length','0'))
             if self.headers.get('Transfer-Encoding') or not 0<length<=MAX_WIRE:raise ValueError('size')
-            encrypted=self.rfile.read(length)
-            if len(encrypted)!=length:raise ValueError('truncated')
-            record,raw=validate_bundle(decrypt(encrypted,self.server.config['encryption_private_key']))
+            payload=self.rfile.read(length)
+            if len(payload)!=length:raise ValueError('truncated')
+            expected=self.headers.get('X-Content-SHA256','')
+            if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(),expected):raise ValueError('digest')
+            record,raw=validate_bundle(payload)
             receipt=record['bundle_id'];path=self.server.directory/(receipt+'.json')
             self.server.cleanup()
             with self.server.storage_lock:
@@ -185,9 +183,11 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='command',required=True)
     init=sub.add_parser('init');init.add_argument('--directory',required=True)
     serve=sub.add_parser('serve');serve.add_argument('--config',required=True)
+    migrate=sub.add_parser('migrate-http');migrate.add_argument('--directory',required=True)
     summary=sub.add_parser('summary');summary.add_argument('--directory',required=True)
     args=parser.parse_args()
     if args.command=='init':print(json.dumps(initialize(args.directory)));return
+    if args.command=='migrate-http':print(json.dumps(migrate_http(args.directory)));return
     if args.command=='summary':print(json.dumps(summarize(args.directory),ensure_ascii=False,indent=2));return
     config=json.loads(Path(args.config).read_text(encoding='utf-8'))
     server=Collector((config.get('bind','0.0.0.0'),config.get('port',10888)),config)

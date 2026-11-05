@@ -82,4 +82,4 @@ def build_bundle(report,journal=None,state=None):
     bundle=scrub(bundle)
     encoded=json.dumps(bundle,ensure_ascii=True,separators=(',',':')).encode('ascii')
     if len(encoded)>MAX_PLAIN:raise ValueError('诊断数据超过总大小上限。')
-    return bundle,gzip.compress(encoded,compresslevel=6,mtime=0)
+    return bundle,gzip.compress(encoded,compresslevel=3,mtime=0)

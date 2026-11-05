@@ -28,7 +28,7 @@ def validate(receiver,client,output):
         with socket.socket() as listener:listener.bind(('127.0.0.1',0));port=listener.getsockname()[1]
         config.update(bind='127.0.0.1',port=port)
         configpath=data/'collector-server.json';configpath.write_text(json.dumps(config))
-        enrollment=json.loads((data/'devices.enroll').read_text());enrollment['endpoints']=['https://127.0.0.1:'+str(port)]
+        enrollment=json.loads((data/'devices.enroll').read_text());enrollment['endpoints']=['http://127.0.0.1:'+str(port)]
         enrollmentpath=data/'devices.enroll';enrollmentpath.write_text(json.dumps(enrollment))
         report=root/'report.json';report.write_text(json.dumps({'version':'1.7.0','files':3,'errors':[],
             'findings':[{'kind':'review_office','path':'C:/Users/FixtureUser/inert.xlsm','analysis_sha256':'a'*64,
@@ -65,7 +65,7 @@ def validate(receiver,client,output):
                     except psutil.NoSuchProcess:pass
                 process.terminate();process.wait(timeout=10);psutil.wait_procs(children,timeout=5)
     result={'passed':all(checks.values()),'checks':checks,'elapsed_seconds':round(time.monotonic()-started,3),
-            'scope':'Loopback HTTPS and inert report only; no external upload or document execution'}
+            'scope':'Loopback HTTP and inert report only; no external upload or document execution'}
     Path(output).write_text(json.dumps(result,indent=2),encoding='utf-8');print(json.dumps(result))
     return 0 if result['passed'] else 1
 

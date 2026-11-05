@@ -39,4 +39,5 @@ collector-server*.json
 *.wrdiag
 collector-data/
 admin-access.txt
+*.v1-backup
 device-protection.json

@@ -29,7 +29,7 @@ $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccou
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -StartWhenAvailable
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
 if (-not (Get-NetFirewallRule -Name 'WormRecoveryCollector10888' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -Name 'WormRecoveryCollector10888' -DisplayName 'WormRecovery Diagnostics HTTPS 10888' -Direction Inbound -Protocol TCP -LocalPort 10888 -Action Allow -Program $target | Out-Null
+    New-NetFirewallRule -Name 'WormRecoveryCollector10888' -DisplayName 'WormRecovery Diagnostics HTTP 10888' -Direction Inbound -Protocol TCP -LocalPort 10888 -Action Allow -Program $target | Out-Null
 }
 Start-ScheduledTask -TaskName $taskName
 Write-Host "采集任务已注册并启动。设备配置：$data\devices.enroll"

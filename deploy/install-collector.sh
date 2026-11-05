@@ -11,7 +11,6 @@ if ! id wormcollector >/dev/null 2>&1; then useradd --system --home-dir /var/lib
 install -d -m 755 "$ROOT"
 install -m 644 "$SOURCE/collector_server.py" "$SOURCE/diagnostic_transport.py" "$ROOT/"
 python3 -m venv "$ROOT/venv"
-"$ROOT/venv/bin/python" -m pip install --disable-pip-version-check -r "$SOURCE/deploy/collector-requirements.txt"
 install -d -o wormcollector -g wormcollector -m 700 /var/lib/wormrecovery-collector
 if [ ! -f /var/lib/wormrecovery-collector/collector-server.json ]; then
     runuser -u wormcollector -- "$ROOT/venv/bin/python" "$ROOT/collector_server.py" init --directory /var/lib/wormrecovery-collector
