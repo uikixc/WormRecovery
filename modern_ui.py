@@ -344,11 +344,12 @@ class ModernWindow:
             self.render_results()
             for metric in self.metrics.values():metric.set('0')
         self.status.set('正在检测' if mode=='scan' else '正在修复')
-        self.detail.set('正在识别扫描范围并执行文件检测。' if mode=='scan' else '正在备份、验证并修复感染文件。')
+        self.detail.set('正在检测并记录证据，本次扫描不执行修复。' if mode=='scan' else '正在备份、验证并修复感染文件。')
         self.set_busy(True)
         def output(text):self.queue.put((generation,'log',text))
         def worker():
             try:
+                from operation_capture import execute
                 if mode=='scan':
                     scope=self.engine.resolve_scan_scope(mode=scope_mode,manual=[selected] if scope_mode=='manual' else None)
                     c=self.engine.Cleaner(emit=output,force_close=True,restore_history=True,external_volumes=scope['external_volumes'],excluded_roots=scope['excluded_roots'])
@@ -356,14 +357,18 @@ class ModernWindow:
                     c.scope_summary=scope
                     if self.stop_requested.is_set():c.cancel.set()
                     output('扫描位置：'+'、'.join(scope['roots']))
-                    if not c.cancel.is_set():c.contain();c.registry();c.system_persistence();c.firewall()
-                    c.scan(scope['roots'])
+                    def inspect_only():
+                        if not c.cancel.is_set():c.contain();c.registry();c.system_persistence();c.firewall()
+                        c.scan(scope['roots'])
+                    execute(c,'scan',inspect_only)
                 else:
                     c=self.cleaner
                     c.cancel.clear();c.force_close=True;c.restore_history=True
-                    c.repair()
-                    self.queue.put((generation,'phase','正在复扫'))
-                    c.verify()
+                    def repair_and_verify():
+                        c.repair()
+                        self.queue.put((generation,'phase','正在复扫'))
+                        c.verify()
+                    execute(c,'repair',repair_and_verify)
                 self.queue.put((generation,'done',mode))
             except Exception as ex:self.queue.put((generation,'error',str(ex)))
         threading.Thread(target=worker,daemon=True).start()
@@ -421,7 +426,6 @@ class ModernWindow:
                     if self.cleaner:
                         try:
                             self.cleaner.save();self.report_button.configure(state='normal')
-                            self.submit_diagnostics(self.cleaner.run/'report.json')
                         except Exception:pass
                     self.set_busy(False);self.status.set('操作未完成');self.detail.set(payload)
                     self.append_log('未完成：'+payload)
@@ -445,7 +449,6 @@ class ModernWindow:
                         self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
                         self.detail.set('确认残留 %s 项；未确认文件 %s 项；已自动归类说明 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     self.append_log('报告：'+str(c.run/'report.json'))
-                    self.submit_diagnostics(c.run/'report.json')
                     if self.update_pending_install:
                         pending=self.update_pending_install;self.update_pending_install=None
                         self.root.after_idle(lambda value=pending:self.update_event('update_downloaded',value))
@@ -542,7 +545,7 @@ class ModernWindow:
         from diagnostic_client import read_status,enroll,disable
         dialog=tk.Toplevel(self.root);dialog.title('诊断反馈');dialog.geometry('650x420');dialog.transient(self.root)
         tk.Label(dialog,text='诊断资料收集',font=(FONT,14,'bold')).pack(anchor='w',padx=24,pady=(24,12))
-        tk.Label(dialog,text='收集扫描报告、待核项依据、文件哈希、解析失败、引擎状态、处理结果及性能信息。\n本机账户名称会脱敏；不提交文档原件、正文、隔离样本、密码或访问令牌。\n\n导入服务端生成的配置后，每次检测或修复完成时自动提交。\n无法连接时保留压缩队列，下次启动或手动重试时继续发送。',justify='left',wraplength=595).pack(anchor='w',padx=24)
+        tk.Label(dialog,text='分别收集扫描与处理日志、待核项依据、文件哈希、解析异常、恢复结果及性能信息。\n本机账户名称会脱敏；不提交文档原件、正文、隔离样本、密码或访问令牌。\n\n扫描后即可提交，无需先执行处理；处理前后的记录分别保留。\n完成、停止或异常结束均保存操作类型与状态，断网时保留待提交队列。',justify='left',wraplength=595).pack(anchor='w',padx=24)
         tk.Label(dialog,text='内网优先：10.205.103.120:10888\n外网备用：8.134.112.170:10888',justify='left',fg=MUTED).pack(anchor='w',padx=24,pady=14)
         record=read_status()
         self.diagnostic_state=tk.StringVar(value=('已启用' if record['enabled'] else '尚未配置')+' · 待提交 '+str(record['pending'])+' 份')

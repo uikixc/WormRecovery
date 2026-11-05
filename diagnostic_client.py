@@ -16,6 +16,7 @@ from diagnostic_transport import send
 DEFAULT_ENDPOINTS=('http://10.205.103.120:10888','http://8.134.112.170:10888')
 LOCK=threading.Lock()
 UPLOAD_LOCK=threading.Lock()
+QUEUE_CHANGED=threading.Event()
 MAX_QUEUE=20
 
 
@@ -140,6 +141,7 @@ def collect(report,manual=False,upload=True):
             payload=compressed
             path=queue/(bundle['bundle_id']+'.wrdiag');temporary=path.with_suffix('.partial')
             temporary.write_bytes(payload);os.replace(temporary,path)
+            QUEUE_CHANGED.set()
             marker.write_text(fingerprint,encoding='ascii')
         result=status('诊断包已压缩保存，等待提交。',pending=len(list(queue.glob('*.wrdiag'))))
     except Exception as ex:
@@ -149,13 +151,23 @@ def collect(report,manual=False,upload=True):
     return retry() if upload else result
 
 
-def retry():
-    if not UPLOAD_LOCK.acquire(blocking=False):return {'message':'后台提交正在执行，新诊断已保留在队列。'}
+def retry(wait=False):
+    acquired=UPLOAD_LOCK.acquire(timeout=10) if wait else UPLOAD_LOCK.acquire(blocking=False)
+    if not acquired:
+        QUEUE_CHANGED.set()
+        return {'message':'后台提交正在执行，新诊断已保留在队列。'}
     try:
         config=configuration()
-        return flush_queue(config) if config else {'message':'尚未导入采集服务配置。','enabled':False}
+        if not config:
+            QUEUE_CHANGED.clear()
+            return {'message':'尚未导入采集服务配置。','enabled':False}
+        while True:
+            QUEUE_CHANGED.clear();result=flush_queue(config)
+            if not QUEUE_CHANGED.is_set() or result.get('pending') and not result.get('sent'):return result
     except Exception as ex:return status('诊断任务未完成。',error_type=type(ex).__name__)
-    finally:UPLOAD_LOCK.release()
+    finally:
+        UPLOAD_LOCK.release()
+        if QUEUE_CHANGED.is_set():schedule()
 
 
 def schedule(report=None):

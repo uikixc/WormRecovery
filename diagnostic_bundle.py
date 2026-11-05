@@ -68,6 +68,7 @@ def build_bundle(report,journal=None,state=None):
     bundle={'schema':1,'bundle_id':str(uuid.uuid4()),'device_id':device,
             'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'application_version':document.get('version'),'report_sha256':hashlib.sha256(raw).hexdigest(),
+            'operation':document.get('operation',{'type':'legacy_unclassified'}),
             'system':{'os':platform.system(),'release':platform.release(),'version':platform.version(),
                       'architecture':platform.machine(),**runtime},
             'summary':{'files':document.get('files'),'scan_seconds':document.get('scan_seconds'),

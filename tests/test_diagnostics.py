@@ -110,6 +110,19 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertEqual(len(list((self.state/'queue').glob('*.wrdiag'))),1)
             self.assertIn('队列',result['message'])
         finally:client.UPLOAD_LOCK.release()
+    def test_active_upload_drains_reports_arriving_during_submission(self):
+        client.enroll(self.host/'devices.enroll');calls=[]
+        def flush(config):
+            calls.append(True)
+            if len(calls)==1:client.QUEUE_CHANGED.set()
+            return {'sent':1,'pending':0}
+        with patch.object(client,'flush_queue',side_effect=flush):client.retry()
+        self.assertEqual(len(calls),2)
+    def test_paused_queue_does_not_start_repeated_upload_threads(self):
+        client.QUEUE_CHANGED.set()
+        with patch.object(client,'schedule') as schedule:
+            result=client.retry()
+        self.assertFalse(result['enabled']);schedule.assert_not_called()
     def test_decompression_bomb_and_path_id_rejected(self):
         with self.assertRaises(ValueError):server.validate_bundle(gzip.compress(b'A'*(20*1024*1024+1)))
         record,data=self.data();record['bundle_id']='../../file'

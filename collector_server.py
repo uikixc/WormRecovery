@@ -163,19 +163,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def summarize(directory,limit=1000):
-    versions=collections.Counter();groups=collections.Counter();devices=set();reports=0
+    versions=collections.Counter();groups=collections.Counter();operations=collections.Counter();devices=set();reports=0
     paths=sorted(Path(directory).glob('*.json'),key=lambda p:p.stat().st_mtime,reverse=True)
     for path in paths[:limit]:
         if path.stat().st_size>20*1024**2:continue
         try:
             record=json.loads(path.read_text(encoding='utf-8'));reports+=1;devices.add(record['device_id']);versions[record.get('application_version','unknown')]+=1
+            operations[record.get('operation',{}).get('type','legacy_unclassified')]+=1
             for row in record.get('report',{}).get('findings',[]):
                 if row.get('kind','').startswith('review_'):
                     key=(row.get('analysis_sha256') or row.get('sha256') or row.get('vba_hash') or 'no_hash',
                          str(row.get('assessment') or row.get('reason','unknown')))
                     groups[key]+=1
         except (ValueError,KeyError,OSError,TypeError,AttributeError):continue
-    return {'reports':reports,'devices':len(devices),'versions':dict(versions),'report_limit':limit,'total_stored':len(paths),
+    return {'reports':reports,'devices':len(devices),'versions':dict(versions),'operations':dict(operations),'report_limit':limit,'total_stored':len(paths),
             'review_groups':[{'sha256':key[0],'assessment':key[1],'occurrences':n} for key,n in groups.most_common(200)]}
 
 

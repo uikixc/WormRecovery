@@ -86,6 +86,11 @@ def validate(executable, output, vba_fixture=None):
         if __import__('worm_recovery').VERSION>='1.6.0':
             checks['resources_classified_inside_exe']=all(findings.get(name,{}).get('kind')=='info_document' for name in ('inert-linked-resource.pptx','inert-external-data.xlsx'))
             checks['vba_behavior_engine_ran']=bool(findings.get('static-vba-regression.xlsm',{}).get('macro_analysis',{}).get('behavior_analysis')) if vba_fixture else True
+        if __import__('worm_recovery').VERSION>='1.7.2':
+            operation=scan.get('operation',{})
+            snapshots=list(paths[0].parent.glob('operations/*/report.json'))
+            checks['scan_only_operation_identified']=operation.get('type')=='scan' and operation.get('mutations_allowed') is False
+            checks['scan_snapshot_preserved']=len(snapshots)==1 and json.loads(snapshots[0].read_text(encoding='utf-8')).get('operation',{}).get('id')==operation.get('id')
         record = {'passed': all(checks.values()), 'checks': checks,
                   'elapsed_seconds': round(time.monotonic() - started, 2), 'exit_code': result.returncode,
                   'source_exe': str(Path(executable).resolve()), 'exe_bytes': portable.stat().st_size,

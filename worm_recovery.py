@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.1'
+VERSION = '1.7.2'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -996,6 +996,7 @@ class Cleaner:
     def save(self):
         summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
         summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
+        summary['operation']=dict(getattr(self,'operation',{'type':'legacy_unclassified'}))
         summary['scan_timing']={'file_scan_seconds':getattr(self,'file_scan_seconds',None),'secondary_analysis_seconds':getattr(self,'review_seconds',None)}
         summary['scan_progress']=dict(self.progress)
         from engine_assets import manifest
@@ -1054,13 +1055,17 @@ def cli_main():
     scope=resolve_scan_scope(args.scope,args.root)
     cleaner=Cleaner(args.report_dir,force_close=True,protected=args.exclude,restore_history=True,external_volumes=scope['external_volumes'],excluded_roots=scope['excluded_roots'])
     cleaner.scope_summary=scope
-    cleaner.contain(args.clean);cleaner.registry(args.clean);cleaner.system_persistence(args.clean)
-    if args.workers is None:cleaner.scan(scope['roots'])
-    else:cleaner.scan(scope['roots'],workers=args.workers)
-    if args.clean:cleaner.repair();cleaner.verify()
-    from diagnostic_client import collect,schedule
-    collect(cleaner.run/'report.json',upload=False)
-    schedule()
+    from operation_capture import execute
+    def inspect_only():
+        cleaner.contain(False);cleaner.registry(False);cleaner.system_persistence(False)
+        if args.workers is None:cleaner.scan(scope['roots'])
+        else:cleaner.scan(scope['roots'],workers=args.workers)
+    execute(cleaner,'scan',inspect_only)
+    if args.clean:
+        def repair_and_verify():cleaner.repair();cleaner.verify()
+        execute(cleaner,'repair',repair_and_verify)
+    from diagnostic_client import retry
+    retry(wait=True)
     failed=bool(cleaner.errors or cleaner.cancel.is_set() or cleaner.inspection_failed or any(x.get('status') in ('unverified','error','pending') for x in getattr(cleaner,'reparse_points',[])) or args.clean and not (cleaner.verification or {}).get('known_family_clear'))
     status=1 if failed else 2 if any(is_confirmed(x) for x in cleaner.findings) else 3 if any(x['kind'].startswith('review_') for x in cleaner.findings) else 0
     print(json.dumps({'report':str(cleaner.run/'report.json'),'files':cleaner.count,'findings':dict(collections.Counter(x['kind'] for x in cleaner.findings)),'errors':len(cleaner.errors),'skipped':len(cleaner.skipped),'exit_code':status},ensure_ascii=False))
