@@ -15,7 +15,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.4'
+VERSION = '1.7.5'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():

@@ -40,7 +40,7 @@ class ModernUITests(unittest.TestCase):
     def test_server_connection_button_checks_in_background_and_displays_route(self):
         result={'message':'日志服务器已连接 · 内网 · 上传授权有效。','routes':[
             {'route':'内网','endpoint':'http://10.205.103.120:10888','reachable':True,'authorization':'accepted','elapsed_ms':12},
-            {'route':'外网','endpoint':'http://8.134.112.170:10888','reachable':False,'reason':'连接失败','elapsed_ms':30}]}
+            {'route':'外网','endpoint':'http://8.134.112.170:35981','reachable':False,'reason':'连接失败','elapsed_ms':30}]}
         with patch('diagnostic_client.check_connection',return_value=result):
             self.app.check_log_server();deadline=time.monotonic()+3
             while self.app.connection_busy and time.monotonic()<deadline:
@@ -59,7 +59,7 @@ class ModernUITests(unittest.TestCase):
             except Exception:pass
             for child in widget.winfo_children():visit(child)
         visit(self.app.root);combined='\n'.join(texts)
-        for text in ('诊断资料收集','10.205.103.120:10888','8.134.112.170:10888','导入采集配置','提交诊断 / 重试'):
+        for text in ('诊断资料收集','10.205.103.120:10888','8.134.112.170:35981','导入采集配置','提交诊断 / 重试'):
             self.assertIn(text,combined)
 
     def test_read_limit_is_visible_without_becoming_infection(self):

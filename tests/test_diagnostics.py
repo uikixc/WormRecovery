@@ -152,6 +152,13 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual([x['route'] for x in result['routes']],['内网','外网'])
         self.assertFalse((self.state/'queue').exists())
 
+    def test_old_project_public_port_migrates_without_altering_other_servers(self):
+        config=dict(self.enrollment,endpoints=['http://10.205.103.120:10888','http://8.134.112.170:10888/','http://192.168.1.10:10888','http://8.134.112.170:45000'])
+        validated=client.validate_config(config)
+        self.assertEqual(validated['endpoints'],['http://10.205.103.120:10888','http://8.134.112.170:35981','http://192.168.1.10:10888','http://8.134.112.170:45000'])
+        self.assertEqual(validated['upload_token'],config['upload_token'])
+        self.assertIn('http://8.134.112.170:10888/',config['endpoints'])
+
     def test_connection_check_uses_external_when_internal_is_unavailable(self):
         def check(endpoint,**kwargs):
             if '10.205.' in endpoint:raise ConnectionRefusedError('offline')

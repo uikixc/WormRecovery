@@ -16,6 +16,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
 from diagnostic_transport import MAX_WIRE
+from diagnostic_routes import DEFAULT_ENDPOINTS
 
 
 def initialize(directory,endpoints=None):
@@ -27,7 +28,7 @@ def initialize(directory,endpoints=None):
             'upload_token_hash':hashlib.sha256(token.encode()).hexdigest(),
             'admin_token_hash':hashlib.sha256(admin.encode()).hexdigest(),
             'max_storage_bytes':10*1024*1024*1024,'retention_days':90}
-    enrollment={'schema':2,'endpoints':endpoints or ['http://10.205.103.120:10888','http://8.134.112.170:10888'],'upload_token':token}
+    enrollment={'schema':2,'endpoints':endpoints or list(DEFAULT_ENDPOINTS),'upload_token':token}
     files={'collector-server.json':json.dumps(config,indent=2).encode(),
            'devices.enroll':json.dumps(enrollment,indent=2).encode(),'admin-access.txt':admin.encode()}
     for filename,data in files.items():

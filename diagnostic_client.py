@@ -12,8 +12,8 @@ import uuid
 
 from diagnostic_bundle import build_bundle,MAX_REPORT,scrub,read_bounded
 from diagnostic_transport import send,probe
+from diagnostic_routes import DEFAULT_ENDPOINTS,current_endpoints
 
-DEFAULT_ENDPOINTS=('http://10.205.103.120:10888','http://8.134.112.170:10888')
 LOCK=threading.Lock()
 UPLOAD_LOCK=threading.Lock()
 QUEUE_CHANGED=threading.Event()
@@ -53,7 +53,7 @@ def validate_config(config):
         if url.scheme!='http' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('','/'):
             raise ValueError('采集服务必须使用 HTTP 根地址。')
     if not re.fullmatch('[A-Za-z0-9_-]{32,160}',str(config.get('upload_token',''))):raise ValueError('设备上传授权无效。')
-    return config
+    return dict(config,endpoints=current_endpoints(endpoints))
 
 
 def enroll(path):

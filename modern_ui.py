@@ -569,11 +569,14 @@ class ModernWindow:
         threading.Thread(target=worker,daemon=True,name='WormRecovery-Server-Check').start()
 
     def diagnostic_settings(self):
-        from diagnostic_client import read_status,enroll,disable
+        from diagnostic_client import read_status,enroll,disable,configuration,DEFAULT_ENDPOINTS
         dialog=tk.Toplevel(self.root);dialog.title('诊断反馈');dialog.geometry('700x510');dialog.transient(self.root)
         tk.Label(dialog,text='诊断资料收集',font=(FONT,14,'bold')).pack(anchor='w',padx=24,pady=(24,12))
         tk.Label(dialog,text='分别收集扫描与处理日志、待核项依据、文件哈希、解析异常、恢复结果及性能信息。\n本机账户名称会脱敏；不提交文档原件、正文、隔离样本、密码或访问令牌。\n\n扫描后即可提交，无需先执行处理；处理前后的记录分别保留。\n完成、停止或异常结束均保存操作类型与状态，断网时保留待提交队列。',justify='left',wraplength=595).pack(anchor='w',padx=24)
-        tk.Label(dialog,text='内网优先：10.205.103.120:10888\n外网备用：8.134.112.170:10888',justify='left',fg=MUTED).pack(anchor='w',padx=24,pady=14)
+        try:configured=configuration()
+        except Exception:configured=None
+        endpoints=configured['endpoints'] if configured else DEFAULT_ENDPOINTS
+        tk.Label(dialog,text='日志接收地址：\n'+'\n'.join(endpoints),justify='left',fg=MUTED).pack(anchor='w',padx=24,pady=14)
         record=read_status()
         self.diagnostic_state=tk.StringVar(value=('已启用' if record['enabled'] else '尚未配置')+' · 待提交 '+str(record['pending'])+' 份\n'+record.get('message','尚无服务器接收凭据。'))
         tk.Label(dialog,textvariable=self.diagnostic_state,fg=ACCENT,wraplength=595,justify='left').pack(anchor='w',padx=24,pady=8)
