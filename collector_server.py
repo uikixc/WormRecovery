@@ -24,7 +24,7 @@ def initialize(directory,endpoints=None):
     config_path=directory/'collector-server.json'
     if config_path.exists():raise ValueError('服务配置已存在，拒绝覆盖现有授权。')
     token=secrets.token_urlsafe(40);admin=secrets.token_urlsafe(40)
-    config={'schema':2,'bind':'0.0.0.0','port':10888,'directory':str(directory.resolve()/'received'),
+    config={'schema':2,'bind':'0.0.0.0','port':10888,'directory':str(directory.resolve()/'received'),'allow_anonymous_upload':True,
             'upload_token_hash':hashlib.sha256(token.encode()).hexdigest(),
             'admin_token_hash':hashlib.sha256(admin.encode()).hexdigest(),
             'max_storage_bytes':10*1024*1024*1024,'retention_days':90}
@@ -139,6 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         else:self.respond(404,{'error':'not_found'})
     def authorized(self,role):
         auth=self.headers.get('Authorization','')
+        if role=='upload_token_hash' and not auth and self.server.config.get('allow_anonymous_upload') is True:return True
         if not auth.startswith('Bearer '):return False
         token=auth[7:]
         return len(token)<=200 and hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),self.server.config[role])

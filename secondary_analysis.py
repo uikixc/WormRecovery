@@ -186,6 +186,18 @@ def worker_request(request):
 
 
 def parser_request(mode, path, timeout=25, cancel=None):
+    if mode=='legacy_office':
+        # Read with the caller's backup semantics once, then analyze a private
+        # immutable copy. The worker never needs the original's restrictive ACL.
+        import threading
+        with tempfile.TemporaryDirectory(prefix='office-parser-',dir=os.environ.get('WORMRECOVERY_WORK_ROOT')) as temporary:
+            snapshot=Path(temporary)/('document'+Path(path).suffix)
+            snapshot_file(path,snapshot,cancel or threading.Event())
+            return _parser_request(mode,snapshot,timeout,cancel)
+    return _parser_request(mode,path,timeout,cancel)
+
+
+def _parser_request(mode, path, timeout=25, cancel=None):
     frozen = getattr(sys, 'frozen', False)
     if frozen:
         from bundled_components import component_path
@@ -193,10 +205,9 @@ def parser_request(mode, path, timeout=25, cancel=None):
     else:
         command = [sys.executable, str(Path(__file__).with_name('analysis_entry.py'))]
     result = run_engine(command, input=json.dumps({'mode': mode, 'path': str(path)}).encode('utf-8'),
-        timeout=timeout, env=subprocess_environment(), cancel=cancel)
-    response = json.loads(result.stdout.decode('utf-8'))
-    if result.returncode or not response.get('ok'):
-        raise ValueError(response.get('error', '离线解析进程未完成。'))
+        timeout=timeout, env=subprocess_environment(independent=frozen), cancel=cancel)
+    from office_analysis import decode_worker_result
+    response = decode_worker_result(result)
     return response['result']
 
 

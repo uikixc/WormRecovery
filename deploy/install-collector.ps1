@@ -32,5 +32,5 @@ if (-not (Get-NetFirewallRule -Name 'WormRecoveryCollector10888' -ErrorAction Si
     New-NetFirewallRule -Name 'WormRecoveryCollector10888' -DisplayName 'WormRecovery Diagnostics HTTP 10888' -Direction Inbound -Protocol TCP -LocalPort 10888 -Action Allow -Program $target | Out-Null
 }
 Start-ScheduledTask -TaskName $taskName
-Write-Host "采集任务已注册并启动。设备配置：$data\devices.enroll"
-Write-Host '请妥善保管服务端密钥及管理授权；仅向使用者提供 devices.enroll。'
+Write-Host '采集任务已注册并启动。新版客户端使用内置地址自动提交，无需分发配置。'
+Write-Host "服务数据目录：$data。管理授权应保留在服务器。"

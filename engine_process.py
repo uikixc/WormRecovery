@@ -31,10 +31,15 @@ def _job(process):
     limits = Extended()
     limits.basic.flags = 0x2000 | 0x200  # Kill all children when closed; total memory cap.
     limits.job_memory = 2 * 1024 * 1024 * 1024
-    if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)) or not kernel.AssignProcessToJobObject(handle, W.HANDLE(int(process._handle))):
+    if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
         error = ctypes.get_last_error()
         kernel.CloseHandle(handle)
-        raise ctypes.WinError(error)
+        raise OSError(error,'分析进程资源限制设置失败：'+str(ctypes.WinError(error)))
+    if not kernel.AssignProcessToJobObject(handle, W.HANDLE(int(process._handle))):
+        error=ctypes.get_last_error();kernel.CloseHandle(handle)
+        # A fast worker may already have completed before job assignment.
+        if process.poll() is not None:return None,None
+        raise OSError(error,'分析进程隔离分配失败：'+str(ctypes.WinError(error)))
     return kernel, handle
 
 

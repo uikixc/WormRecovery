@@ -2,6 +2,7 @@
 import hashlib
 import ntpath
 import os
+from windows_read import open_read
 
 # Exact local files reviewed through extracted VBA and available compiled P-code.
 # These are assessment pins, not Microsoft signature or universal trust claims.
@@ -42,7 +43,7 @@ def installation_component(path):
 
 def content_hash(path):
     digest=hashlib.sha256()
-    with open(path,'rb') as stream:
+    with open_read(path) as stream:
         for block in iter(lambda:stream.read(1024*1024),b''):digest.update(block)
     return digest.hexdigest()
 

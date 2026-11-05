@@ -112,7 +112,7 @@ def analyze_project(data, timeout=ANALYSIS_TIMEOUT):
     entry = pathlib.Path(__file__).with_name('worm_recovery.py')
     frozen = getattr(sys, 'frozen', False)
     executable = pathlib.Path(sys.executable)
-    if frozen and not executable.name.casefold().endswith('-cli.exe'):
+    if frozen:
         from bundled_components import component_path
         executable = component_path('WormRecovery-Analysis.exe')
     command = [str(executable)] if frozen else [sys.executable, str(entry)]
@@ -121,20 +121,29 @@ def analyze_project(data, timeout=ANALYSIS_TIMEOUT):
         command = [str(executable)]
     result = subprocess.run(command, input=base64.b64encode(data), stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=timeout,
-                            env=__import__('engine_assets').subprocess_environment(),
+                            env=__import__('engine_assets').subprocess_environment(independent=frozen),
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    if result.returncode or len(result.stdout) > 1024 * 1024:
-        raise ValueError('宏分析进程未正常完成：' + result.stderr.decode('utf-8', 'replace')[:350])
-    try:
-        response = json.loads(result.stdout.decode('utf-8'))
-    except (ValueError, UnicodeError) as ex:
-        raise ValueError('宏分析进程返回无效结果。') from ex
-    if not response.get('ok'):
-        raise ValueError(response.get('error', '宏分析失败。'))
+    response=decode_worker_result(result,'宏分析',1024*1024)
     if len(_CACHE) >= 128:
         _CACHE.pop(next(iter(_CACHE)))
     _CACHE[fingerprint] = copy.deepcopy(response['result'])
     return response['result']
+
+
+def decode_worker_result(result,label='离线解析',limit=16*1024*1024):
+    """Check process completion before decoding JSON, retaining actual failures."""
+    from powershell_output import error_text
+    if result.returncode:
+        detail=error_text(result.stderr or b'').strip()
+        raise ValueError(label+'进程启动或执行失败，退出码 '+str(result.returncode)+'：'+(detail[:700] or '未返回错误说明。'))
+    if len(result.stdout)>limit:raise ValueError(label+'结果超过资源上限。')
+    if not result.stdout.strip():raise ValueError(label+'进程未返回结果：'+error_text(result.stderr or b'')[:500])
+    try:response=json.loads(result.stdout.decode('utf-8-sig'))
+    except (ValueError,UnicodeError) as ex:raise ValueError(label+'进程返回无效结果：'+error_text(result.stderr or b'')[:500]) from ex
+    if not isinstance(response,dict) or not isinstance(response.get('ok'),bool):raise ValueError(label+'进程返回的数据结构无效。')
+    if not response['ok']:raise ValueError(response.get('error') or label+'失败。')
+    if not isinstance(response.get('result'),dict):raise ValueError(label+'进程缺少分析结果。')
+    return response
 
 
 def worker_main():

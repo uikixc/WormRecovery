@@ -24,13 +24,12 @@ def probe(endpoint,token=None,timeout=3):
     status,body=request('/health')
     if status!=200 or body.get('status')!='ready' or body.get('protocol')!=1:
         raise ValueError('目标未返回有效的日志服务状态，HTTP '+str(status))
-    result={'reachable':True,'service':'ready','authorization':'not_configured' if not token else 'not_verified'}
-    if token:
-        status,body=request('/v1/upload-check',{'Authorization':'Bearer '+token})
-        if status==200 and body.get('authorized') is True:result['authorization']='accepted'
-        elif status==401:result['authorization']='rejected'
-        elif status==404:result['authorization']='check_unavailable'
-        else:raise ValueError('授权检测响应无效，HTTP '+str(status))
+    result={'reachable':True,'service':'ready','authorization':'not_verified'}
+    status,body=request('/v1/upload-check',{'Authorization':'Bearer '+token} if token else {})
+    if status==200 and body.get('authorized') is True:result['authorization']='accepted'
+    elif status==401:result['authorization']='rejected'
+    elif status==404:result['authorization']='check_unavailable'
+    else:raise ValueError('授权检测响应无效，HTTP '+str(status))
     return result
 
 
@@ -42,7 +41,7 @@ def send(endpoint,payload,token,timeout=4):
     connection=http.client.HTTPConnection(url.hostname,url.port or 80,timeout=timeout)
     try:
         connection.request('POST','/v1/diagnostics',body=payload,headers={
-            'Authorization':'Bearer '+token,'Content-Type':'application/gzip',
+            **({'Authorization':'Bearer '+token} if token else {}),'Content-Type':'application/gzip',
             'Content-Length':str(len(payload)),'X-Content-SHA256':hashlib.sha256(payload).hexdigest()})
         response=connection.getresponse();data=response.read(4097)
         if len(data)>4096 or response.status not in (200,201):raise ValueError('诊断服务拒绝接收，HTTP '+str(response.status))

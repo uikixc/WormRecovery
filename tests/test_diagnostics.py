@@ -22,6 +22,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.state=self.root/'client';self.state.mkdir()
         self.host=self.root/'server';server.initialize(self.host)
         self.config=json.loads((self.host/'collector-server.json').read_text())
+        self.config['allow_anonymous_upload']=False
         self.enrollment=json.loads((self.host/'devices.enroll').read_text())
         self.report=self.root/'report.json'
         self.report.write_text(json.dumps({'version':'1.7.0','computer':'PRIVATE-PC','files':100,'errors':[],
@@ -93,9 +94,9 @@ class DiagnosticsTests(unittest.TestCase):
         with patch.object(client,'configuration',return_value=config):result=client.retry()
         self.assertEqual(result['sent'],1);self.assertEqual(result['pending'],0)
         self.assertIn('receipt',json.loads((self.state/'receipts.jsonl').read_text()))
-    def test_no_config_performs_no_network_and_pause_preserves_queue(self):
+    def test_no_config_queues_automatically_and_pause_preserves_queue(self):
         with patch.object(client,'send') as send:
-            self.assertFalse(client.collect(self.report)['enabled']);send.assert_not_called()
+            self.assertEqual(client.collect(self.report,upload=False)['pending'],1);send.assert_not_called()
         client.enroll(self.host/'devices.enroll');client.collect(self.report,upload=False)
         client.disable();self.assertEqual(client.read_status()['pending'],1)
         self.assertFalse(client.read_status()['enabled'])
@@ -169,11 +170,11 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(result['selected_route'],'外网');self.assertTrue(result['upload_ready'])
         self.assertFalse(result['routes'][0]['reachable'])
 
-    def test_reachable_without_enrollment_cannot_claim_upload_ready(self):
-        with patch.object(client,'configuration',return_value=None),patch.object(client,'probe',return_value={'reachable':True,'authorization':'not_configured'}):
+    def test_reachable_but_paused_cannot_claim_upload_ready(self):
+        with patch.object(client,'configuration',return_value=None),patch.object(client,'probe',return_value={'reachable':True,'authorization':'rejected'}):
             result=client.check_connection()
         self.assertTrue(result['connected']);self.assertFalse(result['upload_ready'])
-        self.assertIn('尚未导入',result['message'])
+        self.assertIn('已暂停',result['message'])
     def test_busy_upload_still_enqueues_new_report(self):
         client.enroll(self.host/'devices.enroll');client.UPLOAD_LOCK.acquire()
         try:
@@ -190,10 +191,71 @@ class DiagnosticsTests(unittest.TestCase):
         with patch.object(client,'flush_queue',side_effect=flush):client.retry()
         self.assertEqual(len(calls),2)
     def test_paused_queue_does_not_start_repeated_upload_threads(self):
+        client.disable()
         client.QUEUE_CHANGED.set()
         with patch.object(client,'schedule') as schedule:
             result=client.retry()
         self.assertFalse(result['enabled']);schedule.assert_not_called()
+
+    def test_automatic_delivery_needs_no_import_or_device_registration(self):
+        self.config['allow_anonymous_upload']=True
+        endpoint=self.start_receiver()
+        with patch.object(client,'DEFAULT_ENDPOINTS',(endpoint,)):
+            self.assertEqual(client.configuration()['upload_token'],'')
+            self.assertTrue(client.check_connection()['upload_ready'])
+            result=client.collect(self.report)
+        self.assertEqual(result['sent'],1)
+        self.assertEqual(result['delivery'],'acknowledged')
+        self.assertFalse((self.state/'collector.dpapi').exists())
+        connection=http.client.HTTPConnection('127.0.0.1',self.receiver.server_port,timeout=3)
+        connection.request('GET','/v1/status');self.assertEqual(connection.getresponse().status,401);connection.close()
+
+    def test_automatic_backfill_submits_saved_report_once(self):
+        self.config['allow_anonymous_upload']=True;endpoint=self.start_receiver()
+        before=self.report.read_bytes()
+        with patch.object(client,'DEFAULT_ENDPOINTS',(endpoint,)),patch.object(client,'report_candidates',return_value=[self.report]):
+            first=client.retry(backfill=True);second=client.retry(backfill=True)
+        self.assertEqual(first['sent'],1);self.assertEqual(second['sent'],0)
+        self.assertEqual(len(list(Path(self.config['directory']).glob('*.json'))),1)
+        self.assertEqual(self.report.read_bytes(),before)
+
+    def test_backfill_keeps_scan_and_repair_and_excludes_running_report(self):
+        scan=self.root/'scan.json';repair=self.root/'repair.json';running=self.root/'running.json'
+        for path,kind,status in ((scan,'scan','completed'),(repair,'repair','completed'),(running,'scan','running')):
+            path.write_text(json.dumps({'version':'1.7.7','findings':[],'errors':[],'operation':{'type':kind,'status':status}}))
+        with patch.object(client,'report_candidates',return_value=[scan,repair,running]):client.backfill_reports()
+        records=[json.loads(gzip.decompress(p.read_bytes())) for p in (self.state/'queue').glob('*.wrdiag')]
+        self.assertEqual({x['operation']['type'] for x in records},{'scan','repair'})
+        self.assertEqual(len(records),2)
+
+    def test_anonymous_delivery_still_checks_envelope_digest_and_size(self):
+        self.config['allow_anonymous_upload']=True;endpoint=self.start_receiver()
+        _,payload=self.data();connection=http.client.HTTPConnection('127.0.0.1',self.receiver.server_port,timeout=3)
+        connection.request('POST','/v1/diagnostics',body=payload,headers={'X-Content-SHA256':'0'*64})
+        self.assertEqual(connection.getresponse().status,400);connection.close()
+        self.assertEqual(self.receiver.bytes_used,0)
+
+    def test_report_discovery_prefers_operation_snapshots_and_includes_failures(self):
+        programdata=self.root/'programdata';session=programdata/'WormRecovery/fixture-session'
+        operation=session/'operations/fixture-operation';operation.mkdir(parents=True)
+        (session/'report.json').write_text('{}');(operation/'report.json').write_text('{}')
+        failure=self.state/'failures/fixture-failure';failure.mkdir(parents=True);(failure/'report.json').write_text('{}')
+        with patch.dict('os.environ',{'PROGRAMDATA':str(programdata)}):paths=client.report_candidates()
+        self.assertEqual(set(paths),{operation/'report.json',failure/'report.json'})
+
+    def test_cached_backfill_does_not_reread_or_requeue_unchanged_reports(self):
+        with patch.object(client,'report_candidates',return_value=[self.report]):
+            client.backfill_reports()
+            with patch.object(client,'read_bounded',side_effect=AssertionError('unchanged report must not be read again')):
+                self.assertEqual(client.backfill_reports(),0)
+        self.assertEqual(len(list((self.state/'queue').glob('*.wrdiag'))),1)
+
+    def test_success_receipt_survives_idle_background_retry(self):
+        self.config['allow_anonymous_upload']=True;endpoint=self.start_receiver()
+        with patch.object(client,'DEFAULT_ENDPOINTS',(endpoint,)):
+            first=client.collect(self.report);second=client.retry()
+        self.assertEqual(first['last_receipt'],second['last_receipt'])
+        self.assertEqual(second['delivery'],'acknowledged')
     def test_decompression_bomb_and_path_id_rejected(self):
         with self.assertRaises(ValueError):server.validate_bundle(gzip.compress(b'A'*(20*1024*1024+1)))
         record,data=self.data();record['bundle_id']='../../file'

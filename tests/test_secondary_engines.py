@@ -177,6 +177,27 @@ class EngineResultTests(unittest.TestCase):
             self.assertIn('HALT(', result['actions'])
             self.assertEqual(path.read_bytes(), before)
 
+    def test_legacy_parser_uses_verified_private_copy_and_preserves_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'restricted.xls';path.write_bytes(b'inert OLE fixture')
+            captured=[]
+            def worker(mode,snapshot,timeout,cancel):
+                captured.append(snapshot)
+                self.assertNotEqual(snapshot,path)
+                self.assertEqual(snapshot.read_bytes(),path.read_bytes())
+                return {'status':'review','macro':True}
+            before=path.read_bytes()
+            with patch.object(engines,'_parser_request',side_effect=worker):
+                self.assertTrue(engines.parser_request('legacy_office',path)['macro'])
+            self.assertEqual(path.read_bytes(),before)
+            self.assertFalse(captured[0].exists())
+
+    def test_parser_launch_failure_is_not_reported_as_json_syntax_error(self):
+        result=SimpleNamespace(returncode=1,stdout=b'',stderr=b'Failed to create child process')
+        with patch.object(engines,'run_engine',return_value=result):
+            with self.assertRaisesRegex(ValueError,'Failed to create child process'):
+                engines._parser_request('xlm',Path('fixture'))
+
     def test_unknown_macro_survives_second_opinion_unchanged(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

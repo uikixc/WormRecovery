@@ -27,8 +27,14 @@ def manifest():
     return _manifest(str(engine_root()))
 
 
-def subprocess_environment():
+def subprocess_environment(independent=False):
     environment = os.environ.copy()
+    if independent:
+        # A different packaged program must not inherit another bootloader's
+        # private process level, archive or DLL extraction state.
+        for name in list(environment):
+            if name.startswith('_PYI_') or name=='_MEIPASS2':environment.pop(name,None)
+        environment['PYINSTALLER_RESET_ENVIRONMENT']='1'
     environment['WORMRECOVERY_ENGINE_ROOT'] = str(engine_root())
     environment['PYTHONIOENCODING'] = 'utf-8'
     work_root = environment.get('WORMRECOVERY_WORK_ROOT')

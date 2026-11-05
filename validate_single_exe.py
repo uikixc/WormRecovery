@@ -48,6 +48,9 @@ def validate(executable, output, vba_fixture=None):
         before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs.iterdir()}
         env = os.environ.copy()
         env['LOCALAPPDATA']=str(root/'test-userdata')
+        # Engine fixtures must stay local even when normal delivery is automatic.
+        state=root/'test-userdata/WormRecovery/diagnostics';state.mkdir(parents=True)
+        (state/'paused').write_text('fixture-only',encoding='ascii')
         for key in ('WORMRECOVERY_ENGINE_ROOT', 'PYTHONPATH', 'PYTHONHOME'):
             env.pop(key, None)
         env['PATH'] = 'C:/Windows/System32;C:/Windows'

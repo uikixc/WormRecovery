@@ -12,11 +12,12 @@ $collect = @('--collect-all', 'oletools', '--collect-all', 'pcodedmp', '--collec
 $runtimeData = @(& $Python (Join-Path $PSScriptRoot 'packaging_support.py'))
 if ($LASTEXITCODE -ne 0) { throw 'Cannot locate Python runtime certificate resources.' }
 $base = @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile', '--noupx') + $runtimeData
-Invoke-Python -Arguments ($base + @('--console', '--name', 'WormRecovery-Analysis', '--distpath', $privateDist) + $collect + @('analysis_entry.py'))
+$analysisBase = @('-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--noupx') + $runtimeData
+Invoke-Python -Arguments ($analysisBase + @('--console', '--name', 'WormRecovery-Analysis', '--distpath', $privateDist) + $collect + @('analysis_entry.py'))
 Invoke-Python -Arguments ($base + @('--console', '--uac-admin', '--name', 'WormRecovery-CLI', '--distpath', $privateDist) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'cli_entry.py'))
-$analysis = Join-Path $privateDist 'WormRecovery-Analysis.exe'
+$analysis = Join-Path $privateDist 'WormRecovery-Analysis'
 $cli = Join-Path $privateDist 'WormRecovery-CLI.exe'
 $engineAssets = Join-Path $PSScriptRoot 'build/engine-assets/engines'
 if (-not (Test-Path -LiteralPath (Join-Path $engineAssets 'manifest.json'))) { throw 'Prepare verified offline engine assets before building.' }
-Invoke-Python -Arguments ($base + @('--windowed', '--uac-admin', '--name', 'WormRecovery', '--add-binary', ($analysis + ':engines'), '--add-binary', ($cli + ':engines'), '--add-data', ($engineAssets + ':engines')) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'worm_recovery.py'))
+Invoke-Python -Arguments ($base + @('--windowed', '--uac-admin', '--name', 'WormRecovery', '--add-data', ($analysis + ':engines/analysis'), '--add-binary', ($cli + ':engines'), '--add-data', ($engineAssets + ':engines')) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'worm_recovery.py'))
 Write-Host "Build completed: $PSScriptRoot/dist/WormRecovery.exe (single-file distribution)"

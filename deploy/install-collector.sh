@@ -20,4 +20,4 @@ systemctl daemon-reload
 systemctl enable --now wormrecovery-collector.service
 systemctl --no-pager --full status wormrecovery-collector.service
 echo 'Allow inbound TCP 10888 in the server firewall and cloud security group.'
-echo 'Device enrollment: /var/lib/wormrecovery-collector/devices.enroll'
+echo 'New clients submit automatically to their built-in collector routes; no device enrollment is required.'

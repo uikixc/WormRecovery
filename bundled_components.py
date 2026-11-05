@@ -9,9 +9,15 @@ def component_path(name):
     roots = []
     if getattr(sys, '_MEIPASS', None):
         roots.append(Path(sys._MEIPASS) / 'engines')
+        from engine_assets import engine_root
+        inherited=engine_root()
+        if inherited not in roots:roots.append(inherited)
     if getattr(sys, 'frozen', False):
         roots.append(Path(sys.executable).resolve().parent)
     for root in roots:
+        if name=='WormRecovery-Analysis.exe':
+            for candidate in (root/'analysis'/name,root/'WormRecovery-Analysis'/name):
+                if candidate.is_file():return candidate
         candidate = root / name
         if candidate.is_file():
             return candidate

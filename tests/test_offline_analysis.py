@@ -170,6 +170,21 @@ class AnalysisTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '无效结果'):
                 analysis.analyze_project(b'inert')
 
+    def test_process_failure_is_checked_before_empty_json(self):
+        failed=SimpleNamespace(returncode=1,stdout=b'',stderr=b'[PYI:ERROR] Failed to create child process!')
+        with self.assertRaisesRegex(ValueError,'Failed to create child process'):
+            analysis.decode_worker_result(failed)
+        with self.assertRaisesRegex(ValueError,'未返回结果'):
+            analysis.decode_worker_result(SimpleNamespace(returncode=0,stdout=b'',stderr=b'fixture diagnostic'))
+
+    def test_frozen_cli_uses_private_analysis_worker_instead_of_self_spawn(self):
+        response={'ok':True,'result':{'family_modules':[],'other_modules':[]}}
+        helper=Path('C:/private/analysis/WormRecovery-Analysis.exe')
+        with patch.object(analysis.sys,'frozen',True,create=True),patch.object(analysis.sys,'executable','C:/private/WormRecovery-CLI.exe'),patch('bundled_components.component_path',return_value=helper),patch.object(analysis.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout=json.dumps(response).encode(),stderr=b'')) as run:
+            analysis.analyze_project(b'fresh frozen cli worker fixture')
+        self.assertEqual(run.call_args.args[0],[str(helper)])
+        self.assertEqual(run.call_args.kwargs['env']['PYINSTALLER_RESET_ENVIRONMENT'],'1')
+
     def test_source_and_pcode_output_limits_are_enforced(self):
         output = analysis.LimitedText(4)
         output.write('abcd')

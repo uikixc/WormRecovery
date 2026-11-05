@@ -15,7 +15,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.6'
+VERSION = '1.7.8'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -282,7 +282,9 @@ def _office_check(path):
                     'reason':'文件内容不是可识别的 Office 容器或 RTF，可能为扩展名不符、损坏或其他格式；未判为病毒。'}
         try:
             from oletools.olevba import VBA_Parser
-            v=VBA_Parser(str(p))
+            with open_read(p) as source:data=source.read(128*1024*1024+1)
+            if len(data)>128*1024*1024:raise ValueError('旧版 Office 文件超过静态解析上限。')
+            v=VBA_Parser(str(p),data=data)
             try:
                 has=v.detect_vba_macros()
                 if has:
@@ -1044,7 +1046,7 @@ def cli_main():
             result=diagnostics.enroll(sys.argv[2]) if option=='--enroll-diagnostics' else diagnostics.collect(sys.argv[2],manual=True)
         elif option=='--disable-diagnostics':
             diagnostics.disable();result={'enabled':False,'message':'自动提交已暂停，已有待提交队列保留。'}
-        elif option=='--retry-diagnostics':result=diagnostics.retry()
+        elif option=='--retry-diagnostics':result=diagnostics.retry(backfill=True)
         elif option=='--check-diagnostics-connection':result=diagnostics.check_connection()
         else:result=diagnostics.read_status()
         print(json.dumps(result,ensure_ascii=False));return 1 if result.get('error_type') or result.get('pending') else 0

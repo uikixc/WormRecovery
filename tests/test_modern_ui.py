@@ -59,8 +59,9 @@ class ModernUITests(unittest.TestCase):
             except Exception:pass
             for child in widget.winfo_children():visit(child)
         visit(self.app.root);combined='\n'.join(texts)
-        for text in ('诊断资料收集','10.205.103.120:10888','8.134.112.170:35981','导入采集配置','提交诊断 / 重试'):
+        for text in ('诊断资料收集','10.205.103.120:10888','8.134.112.170:35981','立即同步'):
             self.assertIn(text,combined)
+        self.assertNotIn('导入采集配置',combined);self.assertNotIn('暂停自动提交',combined)
 
     def test_read_limit_is_visible_without_becoming_infection(self):
         record={'kind':'coverage_error','_coverage_error':True,'path':'C:/pagefile.sys',
@@ -81,9 +82,10 @@ class ModernUITests(unittest.TestCase):
                 self.assertEqual(modern_ui.review_state({'secondary_analysis':{'status':result}}),state)
 
     def setUp(self):
+        self.background_patch=patch('diagnostic_client.start_background');self.background_patch.start()
         self.app=modern_ui.ModernWindow(types.SimpleNamespace(VERSION='test',Cleaner=FakeCleaner,resolve_scan_scope=lambda **kwargs:{'roots':['C:/test'],'external_volumes':{},'excluded_roots':[]}))
         self.app.root.update()
-    def tearDown(self):self.app.close()
+    def tearDown(self):self.app.close();self.background_patch.stop()
     def test_background_update_check_does_not_disable_scan(self):
         a=self.app;release={'available':False,'version':'1.5.0','private':True}
         with patch('app_update.check_update',return_value=release):
