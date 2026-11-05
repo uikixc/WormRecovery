@@ -37,6 +37,17 @@ class FakeCleaner:
 
 
 class ModernUITests(unittest.TestCase):
+    def test_diagnostic_dialog_shows_scope_and_routes(self):
+        self.app.diagnostic_settings();self.app.root.update()
+        texts=[]
+        def visit(widget):
+            try:texts.append(str(widget.cget('text')))
+            except Exception:pass
+            for child in widget.winfo_children():visit(child)
+        visit(self.app.root);combined='\n'.join(texts)
+        for text in ('诊断资料收集','10.205.103.120:10888','8.134.112.170:10888','导入采集配置','提交诊断 / 重试'):
+            self.assertIn(text,combined)
+
     def test_read_limit_is_visible_without_becoming_infection(self):
         record={'kind':'coverage_error','_coverage_error':True,'path':'C:/pagefile.sys',
                 'category':'active_pagefile_unreadable','reason':'活动分页文件无法在线读取。',

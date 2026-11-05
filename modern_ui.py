@@ -73,6 +73,8 @@ class ModernWindow:
         self.root.protocol('WM_DELETE_WINDOW',self.close)
         self.timer=self.root.after(150,self.pump)
         self.update_timer=self.root.after(3500,lambda:self.check_for_updates(True)) if getattr(sys,'frozen',False) else None
+        from diagnostic_client import schedule
+        schedule()
 
     def style(self):
         self.root.option_add('*Font',(FONT,10))
@@ -126,6 +128,9 @@ class ModernWindow:
             bg=NAV,fg='#ACBED3',activebackground='#1E344C',activeforeground='white',
             relief='flat',bd=0,padx=18,pady=12,font=(FONT,10),cursor='hand2')
         self.nav_log.pack(fill='x',padx=12,pady=4)
+        tk.Button(sidebar,text='  诊断反馈',anchor='w',command=self.diagnostic_settings,
+            bg=NAV,fg='#ACBED3',activebackground='#1E344C',activeforeground='white',
+            relief='flat',bd=0,padx=18,pady=12,font=(FONT,10),cursor='hand2').pack(fill='x',padx=12,pady=4)
         bottom=tk.Frame(sidebar,bg=NAV)
         bottom.pack(side='bottom',fill='x',padx=24,pady=24)
         tk.Label(bottom,textvariable=self.update_state,bg=NAV,fg='#9DADC2',font=(FONT,8),wraplength=150,justify='left').pack(anchor='w',pady=(0,8))
@@ -405,12 +410,18 @@ class ModernWindow:
                 if kind.startswith('update_'):
                     self.update_event(kind,payload)
                     continue
+                if kind=='diagnostics':
+                    self.append_log('诊断反馈：'+payload.get('message','任务结束'))
+                    if hasattr(self,'diagnostic_state'):self.diagnostic_state.set(payload.get('message','任务结束'))
+                    continue
                 if generation!=self.generation:continue
                 if kind=='log':self.append_log(payload)
                 elif kind=='phase':self.status.set(payload);self.detail.set('重新检查文件和已知持久化位置，确认是否还有残留。')
                 elif kind=='error':
                     if self.cleaner:
-                        try:self.cleaner.save();self.report_button.configure(state='normal')
+                        try:
+                            self.cleaner.save();self.report_button.configure(state='normal')
+                            self.submit_diagnostics(self.cleaner.run/'report.json')
                         except Exception:pass
                     self.set_busy(False);self.status.set('操作未完成');self.detail.set(payload)
                     self.append_log('未完成：'+payload)
@@ -434,6 +445,7 @@ class ModernWindow:
                         self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
                         self.detail.set('确认残留 %s 项；未确认文件 %s 项；已自动归类说明 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
                     self.append_log('报告：'+str(c.run/'report.json'))
+                    self.submit_diagnostics(c.run/'report.json')
                     if self.update_pending_install:
                         pending=self.update_pending_install;self.update_pending_install=None
                         self.root.after_idle(lambda value=pending:self.update_event('update_downloaded',value))
@@ -519,6 +531,38 @@ class ModernWindow:
         ttk.Button(row,text='保存授权并检查',command=save).pack(side='left')
         ttk.Button(row,text='移除授权',command=remove).pack(side='right')
 
+    def submit_diagnostics(self,report=None):
+        def worker():
+            from diagnostic_client import collect,retry
+            result=collect(report,manual=True) if report else retry()
+            self.queue.put((None,'diagnostics',result))
+        threading.Thread(target=worker,daemon=True,name='WormRecovery-Diagnostics-UI').start()
+
+    def diagnostic_settings(self):
+        from diagnostic_client import read_status,enroll,disable
+        dialog=tk.Toplevel(self.root);dialog.title('诊断反馈');dialog.geometry('650x420');dialog.transient(self.root)
+        tk.Label(dialog,text='诊断资料收集',font=(FONT,14,'bold')).pack(anchor='w',padx=24,pady=(24,12))
+        tk.Label(dialog,text='收集扫描报告、待核项依据、文件哈希、解析失败、引擎状态、处理结果及性能信息。\n本机账户名称会脱敏；不提交文档原件、正文、隔离样本、密码或访问令牌。\n\n导入服务端生成的配置后，每次检测或修复完成时自动提交。\n无法连接时保留加密队列，下次启动或手动重试时继续发送。',justify='left',wraplength=595).pack(anchor='w',padx=24)
+        tk.Label(dialog,text='内网优先：10.205.103.120:10888\n外网备用：8.134.112.170:10888',justify='left',fg=MUTED).pack(anchor='w',padx=24,pady=14)
+        record=read_status()
+        self.diagnostic_state=tk.StringVar(value=('已启用' if record['enabled'] else '尚未配置')+' · 待提交 '+str(record['pending'])+' 份')
+        tk.Label(dialog,textvariable=self.diagnostic_state,fg=ACCENT,wraplength=595,justify='left').pack(anchor='w',padx=24,pady=8)
+        row=tk.Frame(dialog);row.pack(fill='x',padx=24,pady=16)
+        def configure():
+            path=filedialog.askopenfilename(title='选择采集服务配置',filetypes=[('采集配置','*.enroll')],parent=dialog)
+            if not path:return
+            try:
+                enroll(path);self.diagnostic_state.set('已启用自动提交，设备配置已加密保存。')
+                self.submit_diagnostics()
+            except Exception as ex:messagebox.showerror('配置未完成',str(ex),parent=dialog)
+        def pause():
+            disable();self.diagnostic_state.set('自动提交已暂停，已有加密队列保留。')
+        def submit():
+            self.submit_diagnostics(self.cleaner.run/'report.json' if self.cleaner and not self.busy else None)
+        ttk.Button(row,text='导入采集配置',command=configure).pack(side='left')
+        ttk.Button(row,text='提交诊断 / 重试',command=submit).pack(side='left',padx=8)
+        ttk.Button(row,text='暂停自动提交',command=pause).pack(side='right')
+
     def check_for_updates(self,automatic=False):
         if self.update_timer:self.root.after_cancel(self.update_timer)
         self.update_timer=None
@@ -557,6 +601,8 @@ class ModernWindow:
             return
         self.update_busy=False;self.update_button.configure(state='normal')
         if kind=='update_error':
+            from diagnostic_client import record_event
+            record_event('update_error',message=payload['message'])
             self.update_state.set('更新检查或下载未完成')
             self.append_log('更新：'+payload['message'])
             if not payload.get('automatic'):messagebox.showinfo('更新未完成',payload['message'],parent=self.root)

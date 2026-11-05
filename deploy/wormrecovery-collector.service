@@ -1,0 +1,23 @@
+[Unit]
+Description=WormRecovery Diagnostics Receiver
+After=network.target
+
+[Service]
+Type=simple
+User=wormcollector
+Group=wormcollector
+WorkingDirectory=/opt/wormrecovery-collector
+ExecStart=/opt/wormrecovery-collector/venv/bin/python /opt/wormrecovery-collector/collector_server.py serve --config /var/lib/wormrecovery-collector/collector-server.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wormrecovery-collector
+MemoryMax=1G
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

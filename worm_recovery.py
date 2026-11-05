@@ -14,7 +14,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.6.0'
+VERSION = '1.7.0'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -22,6 +22,8 @@ def ensure_standard_streams():
     for name in ('stdout', 'stderr'):
         if getattr(sys, name) is None:
             setattr(sys, name, open(os.devnull, 'w', encoding='utf-8', errors='replace'))
+        elif hasattr(getattr(sys,name),'reconfigure'):
+            getattr(sys,name).reconfigure(encoding='utf-8',errors='replace')
 
 ensure_standard_streams()
 STUB_CODE_SHA256 = '9251b16208e38d5de48130230d5f51036c979843ac33bc52cd31c298dd9cb105'
@@ -1007,6 +1009,20 @@ def resolve_scan_scope(mode='internal',manual=None):
     return resolve_scope(powershell,mode,manual)
 
 def cli_main():
+    if sys.argv[1:]==['--check-update']:
+        from app_update import check_update
+        print(json.dumps(check_update(VERSION),ensure_ascii=False));return 0
+    if sys.argv[1:2] in (['--enroll-diagnostics'],['--submit-diagnostics'],['--diagnostics-status'],['--disable-diagnostics'],['--retry-diagnostics']):
+        import diagnostic_client as diagnostics
+        option=sys.argv[1]
+        if option in ('--enroll-diagnostics','--submit-diagnostics'):
+            if len(sys.argv)!=3:raise ValueError('请提供配置文件或扫描报告的完整路径。')
+            result=diagnostics.enroll(sys.argv[2]) if option=='--enroll-diagnostics' else diagnostics.collect(sys.argv[2],manual=True)
+        elif option=='--disable-diagnostics':
+            diagnostics.disable();result={'enabled':False,'message':'自动提交已暂停，已有加密队列保留。'}
+        elif option=='--retry-diagnostics':result=diagnostics.retry()
+        else:result=diagnostics.read_status()
+        print(json.dumps(result,ensure_ascii=False));return 1 if result.get('error_type') or result.get('pending') else 0
     if len(sys.argv)==3 and sys.argv[1]=='--apply-update':
         from update_install import run_job
         return run_job(sys.argv[2])
@@ -1042,6 +1058,9 @@ def cli_main():
     if args.workers is None:cleaner.scan(scope['roots'])
     else:cleaner.scan(scope['roots'],workers=args.workers)
     if args.clean:cleaner.repair();cleaner.verify()
+    from diagnostic_client import collect,schedule
+    collect(cleaner.run/'report.json',upload=False)
+    schedule()
     failed=bool(cleaner.errors or cleaner.cancel.is_set() or cleaner.inspection_failed or any(x.get('status') in ('unverified','error','pending') for x in getattr(cleaner,'reparse_points',[])) or args.clean and not (cleaner.verification or {}).get('known_family_clear'))
     status=1 if failed else 2 if any(is_confirmed(x) for x in cleaner.findings) else 3 if any(x['kind'].startswith('review_') for x in cleaner.findings) else 0
     print(json.dumps({'report':str(cleaner.run/'report.json'),'files':cleaner.count,'findings':dict(collections.Counter(x['kind'] for x in cleaner.findings)),'errors':len(cleaner.errors),'skipped':len(cleaner.skipped),'exit_code':status},ensure_ascii=False))

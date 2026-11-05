@@ -33,4 +33,10 @@ reports/
 *.key
 *.dpapi
 update-signing-key*
+collector-config*.json
+collector-server*.json
+*.enroll
+*.wrdiag
+collector-data/
+admin-access.txt
 device-protection.json
