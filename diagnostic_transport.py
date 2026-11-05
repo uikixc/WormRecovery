@@ -6,6 +6,34 @@ from urllib.parse import urlsplit
 
 MAX_WIRE=12*1024*1024
 
+def probe(endpoint,token=None,timeout=3):
+    """Read-only service and upload-authorization check; sends no report."""
+    url=urlsplit(endpoint)
+    if url.scheme!='http' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('','/'):
+        raise ValueError('诊断地址必须为 HTTP 服务根地址。')
+    def request(path,headers=None):
+        connection=http.client.HTTPConnection(url.hostname,url.port or 80,timeout=timeout)
+        try:
+            connection.request('GET',path,headers=headers or {})
+            response=connection.getresponse();raw=response.read(4097)
+            if len(raw)>4096:raise ValueError('连接检测返回内容超过上限。')
+            try:body=json.loads(raw)
+            except (ValueError,UnicodeError):body={}
+            return response.status,body
+        finally:connection.close()
+    status,body=request('/health')
+    if status!=200 or body.get('status')!='ready' or body.get('protocol')!=1:
+        raise ValueError('目标未返回有效的日志服务状态，HTTP '+str(status))
+    result={'reachable':True,'service':'ready','authorization':'not_configured' if not token else 'not_verified'}
+    if token:
+        status,body=request('/v1/upload-check',{'Authorization':'Bearer '+token})
+        if status==200 and body.get('authorized') is True:result['authorization']='accepted'
+        elif status==401:result['authorization']='rejected'
+        elif status==404:result['authorization']='check_unavailable'
+        else:raise ValueError('授权检测响应无效，HTTP '+str(status))
+    return result
+
+
 def send(endpoint,payload,token,timeout=4):
     url=urlsplit(endpoint)
     if url.scheme!='http' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('','/'):

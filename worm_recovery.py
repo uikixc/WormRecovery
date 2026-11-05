@@ -15,7 +15,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.3'
+VERSION = '1.7.4'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -1028,7 +1028,7 @@ def cli_main():
     if sys.argv[1:]==['--check-update']:
         from app_update import check_update
         print(json.dumps(check_update(VERSION),ensure_ascii=False));return 0
-    if sys.argv[1:2] in (['--enroll-diagnostics'],['--submit-diagnostics'],['--diagnostics-status'],['--disable-diagnostics'],['--retry-diagnostics']):
+    if sys.argv[1:2] in (['--enroll-diagnostics'],['--submit-diagnostics'],['--diagnostics-status'],['--disable-diagnostics'],['--retry-diagnostics'],['--check-diagnostics-connection']):
         import diagnostic_client as diagnostics
         option=sys.argv[1]
         if option in ('--enroll-diagnostics','--submit-diagnostics'):
@@ -1037,6 +1037,7 @@ def cli_main():
         elif option=='--disable-diagnostics':
             diagnostics.disable();result={'enabled':False,'message':'自动提交已暂停，已有待提交队列保留。'}
         elif option=='--retry-diagnostics':result=diagnostics.retry()
+        elif option=='--check-diagnostics-connection':result=diagnostics.check_connection()
         else:result=diagnostics.read_status()
         print(json.dumps(result,ensure_ascii=False));return 1 if result.get('error_type') or result.get('pending') else 0
     if len(sys.argv)==3 and sys.argv[1]=='--apply-update':

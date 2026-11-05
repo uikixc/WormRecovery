@@ -11,7 +11,7 @@ import threading
 import uuid
 
 from diagnostic_bundle import build_bundle,MAX_REPORT,scrub,read_bounded
-from diagnostic_transport import send
+from diagnostic_transport import send,probe
 
 DEFAULT_ENDPOINTS=('http://10.205.103.120:10888','http://8.134.112.170:10888')
 LOCK=threading.Lock()
@@ -100,28 +100,61 @@ def status(message,**fields):
     return record
 
 
+def check_connection():
+    """Probe configured routes without queue changes or diagnostic uploads."""
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import urlsplit
+    import ipaddress,time
+    config=configuration();endpoints=config['endpoints'] if config else list(DEFAULT_ENDPOINTS)
+    token=config.get('upload_token') if config else None
+    def check(endpoint):
+        host=urlsplit(endpoint).hostname
+        try:route='内网' if ipaddress.ip_address(host).is_private else '外网'
+        except ValueError:route='指定地址'
+        started=time.monotonic();row={'endpoint':endpoint,'route':route}
+        try:row.update(probe(endpoint,token=token,timeout=3))
+        except Exception as ex:row.update(reachable=False,error_type=type(ex).__name__,reason=scrub(str(ex))[:250])
+        row['elapsed_ms']=round((time.monotonic()-started)*1000);return row
+    with ThreadPoolExecutor(max_workers=min(4,len(endpoints))) as pool:rows=list(pool.map(check,endpoints))
+    selected=next((row for row in rows if row.get('reachable') and row.get('authorization')=='accepted'),None)
+    reachable=next((row for row in rows if row.get('reachable')),None)
+    if selected:message='日志服务器已连接 · '+selected['route']+' · 上传授权有效。'
+    elif reachable:message='日志服务器可连接 · '+reachable['route']+' · '+('尚未导入采集配置。' if not config else '上传授权未通过或服务尚不支持授权检测。')
+    else:message='日志服务器未连接：内网、外网检测均未成功。'
+    result={'checked_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'configured':bool(config),
+            'connected':bool(reachable),'upload_ready':bool(selected),'selected_route':selected['route'] if selected else reachable['route'] if reachable else None,
+            'message':message,'routes':rows}
+    root=state_root();path=root/'connection.json';temporary=path.with_suffix('.'+uuid.uuid4().hex+'.new')
+    temporary.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8');os.replace(temporary,path)
+    return result
+
+
 def flush_queue(config):
-    root=state_root()/'queue';root.mkdir(exist_ok=True);sent=0
+    root=state_root()/'queue';root.mkdir(exist_ok=True);sent=0;last_receipt=None;last_endpoint=None
     for path in sorted(root.glob('*.wrdiag'))[:MAX_QUEUE]:
         if not (state_root()/'collector.dpapi').is_file():return status('自动提交已暂停。',pending=len(list(root.glob('*.wrdiag'))),sent=sent)
         if path.stat().st_size>12*1024*1024:return status('队列文件超过传输上限。',pending=len(list(root.glob('*.wrdiag'))),sent=sent)
-        payload=path.read_bytes();receipt=None
+        payload=path.read_bytes();receipt=None;transport_errors=[]
         for endpoint in config['endpoints']:
             try:
                 candidate=send(endpoint,payload,config['upload_token'])
                 if candidate['receipt']!=path.stem:raise ValueError('接收凭据与诊断包不匹配。')
-                receipt=candidate;break
+                receipt=candidate;last_endpoint=endpoint;break
             except Exception as ex:
+                transport_errors.append({'endpoint':endpoint,'error_type':type(ex).__name__,'message':scrub(str(ex))[:300]})
                 record_event('diagnostic_transport_error',endpoint=endpoint,error_type=type(ex).__name__,message=str(ex)[:500])
                 continue
         if receipt is None:
-            return status('暂未连接采集服务，诊断包已压缩保存在本机队列。',pending=len(list(root.glob('*.wrdiag'))),sent=sent)
+            return status('上传未完成：采集服务未返回有效接收凭据，诊断包仍保存在本机队列。',pending=len(list(root.glob('*.wrdiag'))),sent=sent,delivery='pending',transport_errors=transport_errors,
+                          last_receipt=last_receipt,last_endpoint=last_endpoint)
         received=state_root()/'receipts.jsonl'
         if received.exists() and received.stat().st_size>1024*1024:
             received.replace(received.with_suffix('.previous'))
         with received.open('a',encoding='utf-8') as stream:stream.write(json.dumps(receipt,ensure_ascii=True)+'\n')
-        path.unlink();sent+=1
-    return status('诊断资料已提交。',pending=len(list(root.glob('*.wrdiag'))),sent=sent)
+        path.unlink();sent+=1;last_receipt=receipt
+    if not sent:
+        return status('当前没有待提交资料；本次未发送报告，不代表当前扫描已上传。',pending=0,sent=0,delivery='no_pending_reports')
+    return status('已提交 %s 份诊断资料，服务器已确认接收。'%sent,pending=len(list(root.glob('*.wrdiag'))),sent=sent,delivery='acknowledged',last_receipt=last_receipt,last_endpoint=last_endpoint)
 
 
 def collect(report,manual=False,upload=True):

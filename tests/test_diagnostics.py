@@ -103,6 +103,70 @@ class DiagnosticsTests(unittest.TestCase):
         client.enroll(self.host/'devices.enroll')
         with patch.object(client,'send',return_value={'accepted':True,'receipt':'different'}):result=client.collect(self.report)
         self.assertEqual(result['pending'],1)
+        self.assertEqual(result['delivery'],'pending')
+        self.assertIn('接收凭据',result['message'])
+
+    def test_empty_queue_cannot_claim_report_uploaded(self):
+        client.enroll(self.host/'devices.enroll')
+        with patch.object(client,'send',side_effect=AssertionError('empty queue must not upload')):
+            result=client.retry()
+        self.assertEqual(result['sent'],0);self.assertEqual(result['pending'],0)
+        self.assertEqual(result['delivery'],'no_pending_reports')
+        self.assertNotIn('已提交',result['message'])
+
+    def test_success_includes_matching_receipt_and_selected_endpoint(self):
+        client.enroll(self.host/'devices.enroll');endpoint=self.start_receiver()
+        config=dict(self.enrollment,endpoints=[endpoint])
+        with patch.object(client,'configuration',return_value=config):result=client.collect(self.report)
+        self.assertEqual(result['delivery'],'acknowledged')
+        self.assertEqual(result['last_endpoint'],endpoint)
+        receipt=result['last_receipt']['receipt']
+        self.assertTrue((Path(self.config['directory'])/(receipt+'.json')).is_file())
+        records=[json.loads(line) for line in (self.host/'receiver-requests.jsonl').read_text().splitlines()]
+        self.assertEqual(records[-1]['status'],201);self.assertEqual(records[-1]['receipt'],receipt)
+        text=json.dumps(records)
+        self.assertNotIn(self.enrollment['upload_token'],text)
+        self.assertNotIn('PRIVATE CONTENT',text)
+
+    def test_rejected_request_is_logged_without_authorization(self):
+        endpoint=self.start_receiver();record,compressed=self.data()
+        with self.assertRaisesRegex(ValueError,'401'):transport.send(endpoint,compressed,'private-bad-token')
+        records=[json.loads(line) for line in (self.host/'receiver-requests.jsonl').read_text().splitlines()]
+        self.assertEqual(records[-1]['status'],401)
+        self.assertEqual(records[-1]['error'],'unauthorized')
+        self.assertNotIn('private-bad-token',json.dumps(records))
+
+    def test_read_only_connection_probe_verifies_service_and_upload_permission(self):
+        endpoint=self.start_receiver();before=len(list(Path(self.config['directory']).glob('*.json')))
+        result=transport.probe(endpoint,token=self.enrollment['upload_token'])
+        self.assertTrue(result['reachable']);self.assertEqual(result['authorization'],'accepted')
+        rejected=transport.probe(endpoint,token='wrong-token')
+        self.assertTrue(rejected['reachable']);self.assertEqual(rejected['authorization'],'rejected')
+        self.assertEqual(len(list(Path(self.config['directory']).glob('*.json'))),before)
+
+    def test_connection_check_labels_routes_and_prefers_authorized_internal_route(self):
+        config=dict(self.enrollment,endpoints=list(client.DEFAULT_ENDPOINTS))
+        with patch.object(client,'configuration',return_value=config),patch.object(client,'probe',return_value={'reachable':True,'authorization':'accepted'}),patch.object(client,'send',side_effect=AssertionError('probe must not upload')):
+            result=client.check_connection()
+        self.assertTrue(result['upload_ready']);self.assertEqual(result['selected_route'],'内网')
+        self.assertEqual([x['route'] for x in result['routes']],['内网','外网'])
+        self.assertFalse((self.state/'queue').exists())
+
+    def test_connection_check_uses_external_when_internal_is_unavailable(self):
+        def check(endpoint,**kwargs):
+            if '10.205.' in endpoint:raise ConnectionRefusedError('offline')
+            return {'reachable':True,'authorization':'accepted'}
+        config=dict(self.enrollment,endpoints=list(client.DEFAULT_ENDPOINTS))
+        with patch.object(client,'configuration',return_value=config),patch.object(client,'probe',side_effect=check):
+            result=client.check_connection()
+        self.assertEqual(result['selected_route'],'外网');self.assertTrue(result['upload_ready'])
+        self.assertFalse(result['routes'][0]['reachable'])
+
+    def test_reachable_without_enrollment_cannot_claim_upload_ready(self):
+        with patch.object(client,'configuration',return_value=None),patch.object(client,'probe',return_value={'reachable':True,'authorization':'not_configured'}):
+            result=client.check_connection()
+        self.assertTrue(result['connected']);self.assertFalse(result['upload_ready'])
+        self.assertIn('尚未导入',result['message'])
     def test_busy_upload_still_enqueues_new_report(self):
         client.enroll(self.host/'devices.enroll');client.UPLOAD_LOCK.acquire()
         try:

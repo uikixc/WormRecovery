@@ -59,6 +59,8 @@ class ModernWindow:
         self.update_info=None
         self.update_pending_install=None
         self.update_cancel=threading.Event()
+        self.connection_busy=False
+        self.connection_state=tk.StringVar(value='日志服务器：尚未检测')
         self.update_state=tk.StringVar(value='更新服务：等待检查')
         self.scope=tk.StringVar()
         self.scope_mode=tk.StringVar(value='internal')
@@ -133,6 +135,9 @@ class ModernWindow:
             relief='flat',bd=0,padx=18,pady=12,font=(FONT,10),cursor='hand2').pack(fill='x',padx=12,pady=4)
         bottom=tk.Frame(sidebar,bg=NAV)
         bottom.pack(side='bottom',fill='x',padx=24,pady=24)
+        tk.Label(bottom,textvariable=self.connection_state,bg=NAV,fg='#9DADC2',font=(FONT,8),wraplength=150,justify='left').pack(anchor='w',pady=(0,6))
+        self.connection_button=tk.Button(bottom,text='检测日志服务器',command=self.check_log_server,bg='#1E344C',fg='white',relief='flat',bd=0,padx=8,pady=7)
+        self.connection_button.pack(fill='x',pady=(0,12))
         tk.Label(bottom,textvariable=self.update_state,bg=NAV,fg='#9DADC2',font=(FONT,8),wraplength=150,justify='left').pack(anchor='w',pady=(0,8))
         self.update_button=tk.Button(bottom,text='检查更新',command=self.check_for_updates,bg='#1E344C',fg='white',relief='flat',bd=0,padx=12,pady=7)
         self.update_button.pack(fill='x',pady=3)
@@ -419,6 +424,14 @@ class ModernWindow:
                     self.append_log('诊断反馈：'+payload.get('message','任务结束'))
                     if hasattr(self,'diagnostic_state'):self.diagnostic_state.set(payload.get('message','任务结束'))
                     continue
+                if kind=='diagnostic_connection':
+                    self.connection_busy=False;self.connection_button.configure(state='normal')
+                    self.connection_state.set(payload.get('message','连接检测未完成。'))
+                    self.append_log('日志服务器连接检测：'+payload.get('message','未完成'))
+                    names={'accepted':'上传授权有效','rejected':'上传授权被拒绝','not_configured':'未导入采集配置','check_unavailable':'服务端未提供授权检测','not_verified':'授权未验证'}
+                    for route in payload.get('routes',[]):
+                        self.append_log('%s %s：%s · %s 毫秒'%(route['route'],route['endpoint'],names.get(route.get('authorization'),'可连接') if route.get('reachable') else route.get('reason','连接失败'),route.get('elapsed_ms',0)))
+                    continue
                 if generation!=self.generation:continue
                 if kind=='log':self.append_log(payload)
                 elif kind=='phase':self.status.set(payload);self.detail.set('重新检查文件和已知持久化位置，确认是否还有残留。')
@@ -543,15 +556,28 @@ class ModernWindow:
             self.queue.put((None,'diagnostics',result))
         threading.Thread(target=worker,daemon=True,name='WormRecovery-Diagnostics-UI').start()
 
+    def check_log_server(self):
+        if self.connection_busy:return
+        self.connection_busy=True;self.connection_state.set('日志服务器：正在检测内网与外网…')
+        self.connection_button.configure(state='disabled')
+        def worker():
+            try:
+                from diagnostic_client import check_connection
+                result=check_connection()
+            except Exception as ex:result={'message':'连接检测未完成：'+type(ex).__name__,'routes':[]}
+            self.queue.put((None,'diagnostic_connection',result))
+        threading.Thread(target=worker,daemon=True,name='WormRecovery-Server-Check').start()
+
     def diagnostic_settings(self):
         from diagnostic_client import read_status,enroll,disable
-        dialog=tk.Toplevel(self.root);dialog.title('诊断反馈');dialog.geometry('650x420');dialog.transient(self.root)
+        dialog=tk.Toplevel(self.root);dialog.title('诊断反馈');dialog.geometry('700x510');dialog.transient(self.root)
         tk.Label(dialog,text='诊断资料收集',font=(FONT,14,'bold')).pack(anchor='w',padx=24,pady=(24,12))
         tk.Label(dialog,text='分别收集扫描与处理日志、待核项依据、文件哈希、解析异常、恢复结果及性能信息。\n本机账户名称会脱敏；不提交文档原件、正文、隔离样本、密码或访问令牌。\n\n扫描后即可提交，无需先执行处理；处理前后的记录分别保留。\n完成、停止或异常结束均保存操作类型与状态，断网时保留待提交队列。',justify='left',wraplength=595).pack(anchor='w',padx=24)
         tk.Label(dialog,text='内网优先：10.205.103.120:10888\n外网备用：8.134.112.170:10888',justify='left',fg=MUTED).pack(anchor='w',padx=24,pady=14)
         record=read_status()
-        self.diagnostic_state=tk.StringVar(value=('已启用' if record['enabled'] else '尚未配置')+' · 待提交 '+str(record['pending'])+' 份')
+        self.diagnostic_state=tk.StringVar(value=('已启用' if record['enabled'] else '尚未配置')+' · 待提交 '+str(record['pending'])+' 份\n'+record.get('message','尚无服务器接收凭据。'))
         tk.Label(dialog,textvariable=self.diagnostic_state,fg=ACCENT,wraplength=595,justify='left').pack(anchor='w',padx=24,pady=8)
+        tk.Label(dialog,textvariable=self.connection_state,fg=ACCENT,wraplength=640,justify='left').pack(anchor='w',padx=24,pady=4)
         row=tk.Frame(dialog);row.pack(fill='x',padx=24,pady=16)
         def configure():
             path=filedialog.askopenfilename(title='选择采集服务配置',filetypes=[('采集配置','*.enroll')],parent=dialog)
@@ -566,6 +592,7 @@ class ModernWindow:
             self.submit_diagnostics(self.cleaner.run/'report.json' if self.cleaner and not self.busy else None)
         ttk.Button(row,text='导入采集配置',command=configure).pack(side='left')
         ttk.Button(row,text='提交诊断 / 重试',command=submit).pack(side='left',padx=8)
+        ttk.Button(row,text='检测服务器连接',command=self.check_log_server).pack(side='left')
         ttk.Button(row,text='暂停自动提交',command=pause).pack(side='right')
 
     def check_for_updates(self,automatic=False):

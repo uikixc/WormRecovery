@@ -71,7 +71,7 @@ def validate_bundle(data):
 class Collector(ThreadingHTTPServer):
     daemon_threads=True
     def __init__(self,address,config):
-        self.config=config;self.storage_lock=threading.Lock();self.slots=threading.BoundedSemaphore(8)
+        self.config=config;self.storage_lock=threading.Lock();self.request_lock=threading.Lock();self.slots=threading.BoundedSemaphore(8)
         self.rate={};self.rate_lock=threading.Lock()
         if config.get('schema')!=2:raise ValueError('服务需要先迁移至 HTTP 配置。')
         self.directory=Path(config['directory']);self.directory.mkdir(parents=True,exist_ok=True)
@@ -79,6 +79,14 @@ class Collector(ThreadingHTTPServer):
         self.bytes_used=sum(p.stat().st_size for p in self.directory.glob('*.json'))
         self.next_cleanup=0;self.cleanup()
         super().__init__(address,Handler)
+    def record_request(self,record):
+        # No payload, Authorization header, user-agent, or query string is retained.
+        path=self.directory.parent/'receiver-requests.jsonl'
+        with self.request_lock:
+            if path.exists() and path.stat().st_size>2*1024*1024:
+                os.replace(path,path.with_suffix('.previous'))
+            with path.open('a',encoding='utf-8') as stream:
+                stream.write(json.dumps(record,ensure_ascii=True)+'\n')
     def cleanup(self):
         with self.storage_lock:
             if time.monotonic()<self.next_cleanup:return
@@ -106,11 +114,22 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):super().setup();self.connection.settimeout(20)
     def log_message(self,*args):pass
     def respond(self,status,body):
+        if self.command=='POST':
+            record={'time':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'remote_address':self.client_address[0],'status':status,'method':'POST',
+                    'endpoint':'diagnostics' if self.path=='/v1/diagnostics' else 'other'}
+            if body.get('receipt'):record['receipt']=body['receipt']
+            if body.get('error'):record['error']=body['error']
+            try:self.server.record_request(record)
+            except OSError:pass
         data=json.dumps(body,separators=(',',':')).encode()
         self.send_response(status);self.send_header('Content-Type','application/json')
         self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(data)
     def do_GET(self):
         if self.path=='/health':self.respond(200,{'status':'ready','protocol':1})
+        elif self.path=='/v1/upload-check':
+            if not self.authorized('upload_token_hash'):self.respond(401,{'error':'unauthorized'});return
+            self.respond(200,{'status':'ready','protocol':1,'authorized':True})
         elif self.path=='/v1/status':
             if not self.authorized('admin_token_hash'):self.respond(401,{'error':'unauthorized'});return
             self.respond(200,{'status':'ready','stored_bytes':self.server.bytes_used,

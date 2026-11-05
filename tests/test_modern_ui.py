@@ -37,6 +37,20 @@ class FakeCleaner:
 
 
 class ModernUITests(unittest.TestCase):
+    def test_server_connection_button_checks_in_background_and_displays_route(self):
+        result={'message':'日志服务器已连接 · 内网 · 上传授权有效。','routes':[
+            {'route':'内网','endpoint':'http://10.205.103.120:10888','reachable':True,'authorization':'accepted','elapsed_ms':12},
+            {'route':'外网','endpoint':'http://8.134.112.170:10888','reachable':False,'reason':'连接失败','elapsed_ms':30}]}
+        with patch('diagnostic_client.check_connection',return_value=result):
+            self.app.check_log_server();deadline=time.monotonic()+3
+            while self.app.connection_busy and time.monotonic()<deadline:
+                self.app.root.update();time.sleep(.01)
+        self.assertFalse(self.app.connection_busy)
+        self.assertIn('内网',self.app.connection_state.get())
+        self.assertIn('上传授权有效',self.app.connection_state.get())
+        self.assertIn('外网',self.app.log.get('1.0','end'))
+        self.assertEqual(str(self.app.connection_button.cget('state')),'normal')
+
     def test_diagnostic_dialog_shows_scope_and_routes(self):
         self.app.diagnostic_settings();self.app.root.update()
         texts=[]
