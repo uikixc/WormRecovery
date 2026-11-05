@@ -1,9 +1,16 @@
 """Deterministic offline document decisions; unknowns never become safe by default."""
 import ntpath
 import re
+import hashlib
 from urllib.parse import unquote, urlsplit
 
-VERSION='2026.11.05.2'
+VERSION='2026.11.05.3'
+
+
+def content_id_image(target):
+    """RFC 2392 Content-ID references; deliberately accept a narrow image subset."""
+    value=str(target)
+    return bool(re.fullmatch(r'cid:[A-Za-z0-9_.+-]+\.(?:png|jpg|jpeg|gif|bmp|tiff?)@[A-Za-z0-9_.-]+',value,re.I))
 
 
 def local_reference(target,extensions):
@@ -33,6 +40,12 @@ def assess_document(row):
     evidence=row.get('secondary_analysis',{})
     if evidence.get('clamav',{}).get('status')=='detected':
         return result('detected','antivirus_detection','病毒引擎已检出，保留检出与恢复要求。','ClamAV detection')
+    rules=evidence.get('yara_x',{})
+    if row.get('kind')=='review_office' and row.get('document_format')=='empty' and row.get('macro') is False and not row.get('macro_analysis') and not row.get('active_content_unresolved') and row.get('analysis_sha256')==hashlib.sha256(b'').hexdigest() and rules.get('matches')==[] and not row.get('structural_evidence') and evidence.get('clamav',{}).get('status') in ('no_match','no_content'):
+        decision=result('informational','empty_document_data_loss','零字节文件：没有可执行内容，但原有正文缺失，需要另行恢复文件内容。',
+                        '校验副本的完整 SHA-256 等于空字节序列；此结论不表示已恢复正文')
+        decision['action']='保留该位置；原有正文无法从零字节中重建，需要可验证的历史原件或备份。'
+        return decision
     if row.get('analysis_error') or evidence.get('status')=='incomplete':
         return result('incomplete','analysis_incomplete','文件分析未完成，不能判定无威胁。','解析错误或引擎未完成')
     if row.get('kind')!='review_office':
@@ -43,14 +56,23 @@ def assess_document(row):
     if behavior.get('classification')=='suspicious':
         return result('suspicious','macro_behavior_combination','宏命中高风险行为组合：'+'、'.join(behavior.get('rules',[]))+'。',
                       '源码及可读编译指令中的行为组合；保留原件，禁止据此删除全部宏')
-    rules=evidence.get('yara_x',{})
     if evidence.get('clamav',{}).get('status')!='no_match' or rules.get('matches')!=[]:
         return result('unresolved','insufficient_engine_evidence','现有证据不足以自动降级。','缺少完成的病毒检查或内容规则命中')
+    if row.get('passive_text_verified') is True and row.get('macro') is False and not row.get('structural_evidence') and row.get('format_sha256')==row.get('analysis_sha256') and evidence.get('office_parser',{}).get('status')=='analyzed':
+        return result('informational','passive_text_document','文件实际为纯文本，没有 Office 宏或活动内容结构，当前病毒库及内容规则未检出威胁。',
+                      '完整文本解码及非标记格式检查、格式哈希与复核副本一致、病毒检查及内容规则完成')
     from office_triage import installation_component, REVIEWED_COMPONENTS
     known=REVIEWED_COMPONENTS.get(row.get('analysis_sha256'))
     if known and installation_component(row['path']) and ntpath.basename(row['path']).casefold()==known[0].casefold() and not row.get('active_content_unresolved'):
         return result('informational','reviewed_office_component',known[1]+'：完整文件与已核对组件一致，未检出已知威胁。',
                       '安装目录结构、文件名、完整 SHA-256、当前病毒检查及内容规则同时匹配')
+    inventory=row.get('macro_analysis',{}).get('module_inventory',{})
+    legacy=row.get('legacy_structure',{})
+    supported_container=(row.get('document_format')=='ooxml' and row.get('package_structure_checked') is True and not inventory.get('container_streams')) or (
+        row.get('document_format')=='ole' and legacy.get('status')=='complete' and legacy.get('active_or_unclassified_features')==[])
+    if inventory.get('status')=='complete' and inventory.get('empty_project_verified') is True and inventory.get('module_count',0)>0 and supported_container and row.get('analysis_sha256') and row.get('snapshot_analysis_sha256')==row.get('analysis_sha256') and not row.get('structural_evidence') and not row.get('active_content_unresolved'):
+        return result('informational','empty_vba_project','文档保留了 VBA 项目，但所有已核验模块均为空实现，且不存在编译缓存；无需进行宏清理。',
+                      '严格模块清单覆盖全部源码、逐模块源码偏移与缓存检查、容器活动内容检查、病毒库与内容规则共同完成')
     if row.get('parser_recovery',{}).get('status')=='completed' and row.get('status')=='clean' and row.get('macro') is False and not row.get('structural_evidence') and evidence.get('office_parser',{}).get('status')=='analyzed':
         return result('informational','recovered_document_analysis','文档重试分析完成，未发现宏或已检查类型的活动内容，当前病毒库与内容规则未检出威胁。',
                       '完整哈希校验的只读副本、文档解析成功、当前病毒检查及内容规则均完成')
@@ -64,6 +86,8 @@ def assess_document(row):
             return result('unresolved','truncated_target','目标地址超过记录上限，不能自动归类。','地址记录不完整')
         if kind=='external_relationship' and relation=='image' and local_reference(item.get('target'),{'.png','.jpg','.jpeg','.gif','.bmp','.tif','.tiff','.webp'}):
             ordinary.append('本地图片引用')
+        elif kind=='external_relationship' and relation=='image' and content_id_image(item.get('target')):
+            ordinary.append('图片内容 ID 引用')
         elif kind=='external_relationship' and relation in ('externallinkpath','xlpathmissing') and local_reference(item.get('target'),{'.xls','.xlsx'}):
             ordinary.append('本地工作簿数据链接')
         elif kind in ('external_data','external_book_link'):

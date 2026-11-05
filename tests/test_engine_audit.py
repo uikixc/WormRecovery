@@ -12,11 +12,18 @@ from secondary_analysis import enrich_reviews
 
 class EngineAuditTests(unittest.TestCase):
     def test_installed_assets_do_not_count_as_execution(self):
-        audit=build_audit({'yara_x':123,'vba_source':3,'vba_pcode':3},{'status':'not_needed','candidates':0},[])
+        audit=build_audit({'yara_x':123,'vba_source_analysis':3,'vba_pcode':3},{'status':'not_needed','candidates':0},[])
         self.assertEqual(audit['engine_usage']['rea']['status'],'not_invoked')
         self.assertEqual(audit['engine_usage']['yara_x']['first_pass_files'],123)
         self.assertEqual(audit['engine_usage']['vba_pcode']['status'],'executed')
         self.assertIn('未调用',dispatch_message(audit['dispatch']))
+
+    def test_source_engine_counts_survive_diagnostic_redaction_without_source(self):
+        from diagnostic_bundle import scrub
+        audit=build_audit({'vba_source_analysis':7},{},[])
+        clean=scrub({'audit':audit,'vba_source':'private document code'})
+        self.assertEqual(clean['audit']['engine_usage']['vba_source_analysis']['first_pass_files'],7)
+        self.assertNotIn('vba_source',clean)
 
     def test_failure_and_completed_evidence_remain_distinct(self):
         rows=[{'secondary_analysis':{'rea':{'status':'analyzed'},'capa':{'status':'incomplete'},'clamav':{'status':'no_match'}}}]

@@ -60,7 +60,7 @@ def inspect_project(data, full_document=False):
                 count += len(code)
                 if count > MAX_SOURCE_CHARS or len(modules) >= 512:
                     raise ValueError('宏源码超过分析资源上限。')
-                modules.append({'name': name, 'stream': stream})
+                modules.append({'name': name, 'stream': stream,'source_sha256':hashlib.sha256(code.encode('utf-8')).hexdigest()})
                 sources.append(code)
                 low = code.casefold()
                 if all(token in low for token in ('synaptics', '~$cache1', 'regkeysave', 'workbook_open')):
@@ -68,7 +68,12 @@ def inspect_project(data, full_document=False):
                 elif any(line.strip() and not line.strip().casefold().startswith(
                         ('attribute ', 'option ', 'private sub', 'end sub', "'")) for line in code.splitlines()):
                     others.append(name)
-            pcodedmp.processProject(parser, SimpleNamespace(disasmOnly=True, verbose=False), output_file=output)
+            from vba_inventory import inspect_inventory
+            with contextlib.redirect_stderr(LimitedText(8192)):
+                inventory=inspect_inventory(parser,modules)
+            module_cache_absent=inventory.get('status')=='complete' and all(row['cache_bytes']==0 for row in inventory['modules'])
+            if not module_cache_absent:
+                pcodedmp.processProject(parser, SimpleNamespace(disasmOnly=True, verbose=False), output_file=output)
         if errors.getvalue().strip():
             raise ValueError('宏编译代码解析未完成：' + errors.getvalue().strip()[:700])
         if not modules:
@@ -89,7 +94,8 @@ def inspect_project(data, full_document=False):
             if re.search(r'\b' + re.escape(keyword) + r'\b', pcode, re.I):
                 indicators.append(keyword)
         return {'modules': modules, 'family_modules': matches, 'other_modules': others,
-                'pcode_status': 'instructions_read' if 'Line #' in pcode else 'no_instructions_returned',
+                'pcode_status': 'cache_absent' if inventory.get('compiled_cache_absent') else 'no_module_cache' if module_cache_absent else 'instructions_read' if 'Line #' in pcode else 'no_instructions_returned',
+                'module_inventory':inventory,
                 'pcode_family_match': all(token in pcode.casefold() for token in
                                          ('synaptics', '~$cache1', 'regkeysave', 'workbook_open')),
                 'source_sha256': hashlib.sha256(source.encode('utf-8')).hexdigest(),
@@ -163,11 +169,14 @@ def decode_worker_result(result,label='离线解析',limit=16*1024*1024):
 def _legacy_bytes(data):
     from oletools.olevba import VBA_Parser
     parser=VBA_Parser('legacy-document.ole',data=data,disable_pcode=True)
-    try:has=parser.detect_vba_macros()
+    try:
+        has=parser.detect_vba_macros()
+        from vba_inventory import inspect_legacy_workbook
+        structure=inspect_legacy_workbook(parser.ole_file) if parser.ole_file else {'status':'unavailable'}
     finally:parser.close()
     if not has:return {'status':'clean','macro':False,'document_format':'ole'}
     analysis=inspect_project(data,full_document=True)
-    return {'status':'review','macro':True,'document_format':'ole','macro_analysis':analysis,
+    return {'status':'review','macro':True,'document_format':'ole','macro_analysis':analysis,'legacy_structure':structure,
             'has_family_macro':bool(analysis.get('family_modules')),
             'other_modules':analysis.get('other_modules',[]),
             'reason':'旧版 Office 宏已完成源码、编译指令和内容特征检查。'}

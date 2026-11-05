@@ -314,7 +314,7 @@ class ModernWindow:
             secondary=record.get('secondary_analysis',{})
             if secondary:
                 names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA','office_parser':'Office 解析'}
-                statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持'}
+                statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','no_content':'文件为空，无可检查内容','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持'}
                 text+='\n离线复核：'+'；'.join(names[k]+' '+statuses.get(v.get('status'), '已执行规则检查') for k,v in secondary.items() if k in names and isinstance(v,dict))
                 if secondary.get('clamav',{}).get('detections'):text+='\n检出名称：'+'、'.join(secondary['clamav']['detections'])
                 if record.get('analysis_incomplete_engines'):text+='\n未完成引擎：'+ '、'.join(record['analysis_incomplete_engines'])
@@ -416,7 +416,7 @@ class ModernWindow:
                 continue
             if self.filter=='errors':continue
             if self.filter=='review' and not review or self.filter=='confirmed' and not is_confirmed(r) or self.filter=='info' and not informational:continue
-            state='保留，无需处理' if informational else review_state(r) if review else '待修复'
+            state='正文缺失' if r.get('data_integrity_issue') else '保留，无需处理' if informational else review_state(r) if review else '待修复'
             category=LABELS.get(r['kind'],r['kind'])
             if review and r.get('reason'):category+='：'+r['reason']
             if informational:category=r.get('component',category)
@@ -471,6 +471,7 @@ class ModernWindow:
                     confirmed=sum(is_confirmed(r) for r in c.findings)
                     review_count=sum(r['kind'].startswith('review_') for r in c.findings)
                     info_count=sum(r['kind'].startswith('info_') for r in c.findings)
+                    data_loss=sum(bool(r.get('data_integrity_issue')) for r in c.findings)
                     if c.cancel.is_set():self.status.set('已停止');self.detail.set('已完成的文件事务已保存；重新扫描后再修复。')
                     elif payload=='scan':
                         self.status.set('检测完成')
@@ -478,7 +479,8 @@ class ModernWindow:
                     else:
                         complete=(getattr(c,'verification',None) or {}).get('known_family_clear',False)
                         self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
-                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；已自动归类说明 %s 项无需删除；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
+                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；已自动归类说明 %s 项；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
+                    if data_loss and not c.cancel.is_set():self.detail.set(self.detail.get()+' 其中 %s 份文件正文缺失，需要历史原件或备份。'%data_loss)
                     self.append_log('报告：'+str(c.run/'report.json'))
                     from engine_audit import dispatch_message
                     self.append_log(dispatch_message(getattr(c,'secondary_dispatch',{})))

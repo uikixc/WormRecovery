@@ -15,7 +15,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.7.9'
+VERSION = '1.8.0'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -258,7 +258,7 @@ def _office_check(path):
                 'analysis_error':True,'error_details':details}
     try:
         with open_read(p) as header:prefix=header.read(16)
-        if not prefix:return {'status':'review','reason':'文件内容为空，无法恢复缺失正文；需要原文件或备份。','document_format':'empty','analysis_error':True,'error_category':'empty_document'}
+        if not prefix:return {'status':'review','macro':False,'reason':'文件内容为空，原有正文缺失；没有可供宏分析的字节，需要另行恢复内容。','document_format':'empty','data_integrity_issue':'empty_document'}
         stage='read_container'
         with open_read(p) as package,zipfile.ZipFile(package) as z:
             stage='package_structure'
@@ -278,7 +278,7 @@ def _office_check(path):
             stage='macro_worker'
             analysis=analyze_project(data)
             matches=analysis['family_modules'];others=analysis['other_modules']
-            result={'status':'review','reason':'未识别宏已完成源码及编译指令特征检查，尚未确认感染。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h,'macro_analysis':analysis}
+            result={'status':'review','document_format':'ooxml','package_structure_checked':True,'reason':'未识别宏已完成源码及编译指令特征检查，尚未确认感染。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h,'macro_analysis':analysis}
             if matches and not others and analysis.get('pcode_family_match') and macro[0].filename=='xl/vbaProject.bin':
                 result.update(status='infected',family='Synaptics-Excel',vba_part=macro[0].filename,
                               reason='宏源码与编译指令均匹配 Synaptics-Excel 感染特征，已确认感染。')
@@ -289,6 +289,9 @@ def _office_check(path):
             from document_formats import inspect_rtf
             return inspect_rtf(p)
         if not prefix.startswith(bytes.fromhex('d0cf11e0a1b11ae1')):
+            from document_formats import inspect_plain_document
+            passive=inspect_plain_document(p)
+            if passive:return passive
             return {'status':'review','analysis_error':True,'document_format':'unrecognized',
                     'reason':'文件内容不是可识别的 Office 容器或 RTF，可能为扩展名不符、损坏或其他格式；未判为病毒。'}
         try:
@@ -423,7 +426,7 @@ def inspect_file_content(path,st):
     elif ext in OFFICE_EXTS:
         result['office']=1;info=office_check(path)
         analysis=info.get('macro_analysis',{});checks={}
-        if analysis.get('source_sha256'):checks['vba_source']=1
+        if analysis.get('source_sha256'):checks['vba_source_analysis']=1
         if analysis.get('pcode_status')=='instructions_read':checks['vba_pcode']=1
         if analysis.get('content_rules'):checks['yara_x']=1
         if checks:result['engine_checks']=checks

@@ -104,6 +104,9 @@ def clam_batch(paths, work, timeout=180, cancel=None):
         messages = [line[len(prefix):] for line in text.splitlines() if line.startswith(prefix)]
         detections = [line[:-6] for line in messages if line.endswith(' FOUND')]
         incomplete = [line for line in messages if 'ERROR' in line or 'Heuristics.Limits.Exceeded' in line]
+        if path.stat().st_size==0 and not detections and not incomplete:
+            rows[str(path)]={'status':'no_content','detections':[],'reason':'校验副本为零字节，没有可供病毒库检查的内容。'}
+            continue
         if incomplete or not messages:
             rows[str(path)] = {'status': 'incomplete', 'detections': detections,
                 'reason': '; '.join(incomplete) or '引擎未返回该文件的独立结果。'}
@@ -277,6 +280,18 @@ def enrich_reviews(cleaner):
                 digest = snapshot_file(path,snapshot,cleaner.cancel)
                 row['analysis_sha256'] = digest
                 details=row.get('error_details',{})
+                if row.get('kind')=='review_office' and row.get('macro_analysis',{}).get('module_inventory',{}).get('empty_project_verified'):
+                    # Bind a positive source/cache proof to the exact snapshot
+                    # used by the other engines, including its outer container.
+                    phase('正在核验空宏项目与文档副本',path,index,25)
+                    from worm_recovery import _office_check
+                    parsed=_office_check(snapshot)
+                    for key in ('macro_analysis','macro','other_modules','has_family_macro','structural_evidence',
+                                'active_content_unresolved','document_format','package_structure_checked','legacy_structure'):
+                        row.pop(key,None)
+                    row.update(parsed)
+                    if parsed.get('analysis_error'):raise ValueError(parsed.get('reason','校验副本文档分析未完成。'))
+                    row['snapshot_analysis_sha256']=digest
                 if row.get('kind')=='review_office' and row.get('analysis_error') and details.get('phase') in (
                         'macro_worker','legacy_worker','process_start','read_header','read_macro_bytes','read_legacy_bytes'):
                     phase('正在重试文档分析',path,index,25)

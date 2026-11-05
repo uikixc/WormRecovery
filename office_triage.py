@@ -83,6 +83,6 @@ def decide_after_engines(row):
         row.update(reason=decision['reason'],action='保留原件并禁用活动内容；已有行为证据，不能按无害资源忽略。')
     if decision['classification']=='informational':
         row.update(kind='info_office' if decision['rule']=='reviewed_office_component' else 'info_document',status='info',assessment=decision['rule'],reason=decision['reason'],
-                   action='保留，无需删除、转换格式或移除内容。',assessment_basis=decision['basis'],
+                   action=decision.get('action','保留，无需删除、转换格式或移除内容。'),assessment_basis=decision['basis'],
                    assessment_limit=decision['scope'])
     return decision

@@ -119,7 +119,8 @@ class DocumentDecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);empty=root/'empty.docx';empty.touch()
             result=recovery.office_check(empty)
-            self.assertEqual(result['document_format'],'empty');self.assertTrue(result['analysis_error'])
+            self.assertEqual(result['document_format'],'empty');self.assertFalse(result.get('analysis_error'))
+            self.assertEqual(result['data_integrity_issue'],'empty_document')
             rtf=root/'rtf.docx';rtf.write_bytes(b'{\\rtf1 Hello plain text}')
             result=recovery.office_check(rtf)
             self.assertEqual(result['document_format'],'rtf');self.assertFalse(result.get('analysis_error'))

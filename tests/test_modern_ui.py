@@ -234,6 +234,12 @@ class ModernUITests(unittest.TestCase):
         self.assertIn('当前项目处理',self.app.detail.get())
         self.app.busy=False
 
+    def test_empty_document_shows_content_loss_instead_of_no_action(self):
+        self.app.result_records=[{'kind':'info_document','path':'C:/docs/empty.docx',
+            'data_integrity_issue':'empty_document','reason':'原有正文缺失','action':'需要历史原件或备份。'}]
+        self.app.select_filter('all');self.app.render_results()
+        self.assertEqual(self.app.tree.item('0','values')[0],'正文缺失')
+
     def test_review_progress_is_visible_after_file_count_stops(self):
         c=FakeCleaner(emit=lambda _:None);c.count=500;c.scan_active=False
         c.progress={'phase':'review','stage':'REA 程序结构分析','started':time.monotonic()-6,
