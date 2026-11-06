@@ -92,7 +92,7 @@ def inspect_large_file(path,expected_stat=None):
                 coverage.update(rule_scan='complete',rule_scan_bytes=before.st_size)
                 verify_identity(path,stream,expected,change_times)
                 analysis=inspect_mapped_pe(mapping,rules)
-                if not isinstance(analysis,dict) or analysis.get('status') not in ('detected','incomplete','no_known_match'):
+                if not isinstance(analysis,dict) or analysis.get('status') not in ('detected','identified','incomplete','no_known_match'):
                     raise ValueError('映射程序家族检查未返回有效结果。')
                 result.update(analysis);result['content_rules']=rules;result['coverage']=coverage
                 if result['status']=='detected' and not result.get('source_sha256'):result['source_sha256']=_hash_mapping(mapping)
@@ -100,6 +100,7 @@ def inspect_large_file(path,expected_stat=None):
             verify_identity(path,stream,expected,change_times);coverage['source_identity']='stable'
     except Exception as error:
         result.pop('source_sha256',None);result['detections']=[];result['status']='incomplete'
+        result.pop('identifications',None);result.pop('contained_payloads',None)
         result['reason']='大型程序完整检查未完成：'+str(error)[:400]
         coverage['source_identity']='changed' if isinstance(error,SourceChanged) else 'unverified'
         result['error_type']=type(error).__name__

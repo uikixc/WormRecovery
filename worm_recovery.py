@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.3'
+VERSION = '1.8.4'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -442,6 +442,11 @@ def inspect_file_content(path,st):
         result['engine_checks']['family_static']=1
         if analysis.get('role'):
             result['family_observations']=[{'path':str(path),'role':analysis['role'],'sha256':analysis['source_sha256']}]
+        if analysis['status']=='identified':
+            add('review_binary',path,sha256=analysis['source_sha256'],family_analysis=analysis,
+                assessment='known_payload_content',reason=analysis['reason'],
+                action='仅识别内容；嵌入载荷不赋予父文件恶意身份，不自动清理或隔离。')
+            return True
         if analysis['status']=='detected':
             names=sorted({hit['family'] for hit in analysis['detections']})
             # Infection code in an unusual PE layout still requires the

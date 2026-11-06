@@ -37,6 +37,34 @@ class FakeCleaner:
 
 
 class ModernUITests(unittest.TestCase):
+    def test_unresponsive_update_check_does_not_hold_window_close(self):
+        release=threading.Event();started=threading.Event()
+        def check(version):
+            started.set();release.wait(2)
+            return {'available':False,'version':'1.8.3','private':False}
+        try:
+            with patch('app_update.check_update',side_effect=check):
+                self.app.check_for_updates(True);self.assertTrue(started.wait(1))
+                tick=[];self.app.root.after(0,lambda:tick.append(True));self.app.root.update()
+                self.assertTrue(tick)
+                with patch.object(self.app.root,'destroy',wraps=self.app.root.destroy) as destroy:
+                    self.app.close()
+                destroy.assert_called_once()
+        finally:
+            release.set();self.app.update_busy=False
+            # tearDown still calls close; make that second close harmless.
+            self.app.close=lambda:None
+
+    def test_identified_tsco_remains_review_and_shows_content_basis(self):
+        record={'kind':'review_binary','path':'C:/fixture/renamed.bin','reason':'TSCO 内容已识别，归属待核',
+                'family_analysis':{'status':'identified','identifications':[{'identity':'TSCO_known_payload_container'}],
+                                   'contained_payloads':[{'offset':512,'bytes':2048}]}}
+        self.app.result_records=[record];self.app.select_filter('review')
+        self.app.tree.selection_set('0');self.app.selected()
+        text=self.app.selected_path.get()
+        self.assertIn('4 条完整压缩流',text);self.assertIn('不判定父文件恶意',text)
+        self.app.select_filter('confirmed');self.assertEqual(self.app.tree.get_children(),())
+
     def test_confirmed_carrier_displays_decoding_basis(self):
         record={'kind':'malware_component','path':'C:/fixture/anything.bin','reason':'已确认恶意代码',
                 'family_analysis':{'status':'detected','detections':[],

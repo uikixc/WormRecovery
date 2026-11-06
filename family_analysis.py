@@ -18,7 +18,6 @@ MAX_INPUT=16*1024*1024
 MAX_CARRIER=4*1024*1024
 SYNAPTICS_CODE='9251b16208e38d5de48130230d5f51036c979843ac33bc52cd31c298dd9cb105'
 KNOWN_RUNTIME='c49da0039e1a10d9c9ab686744a169c1308326c1a26ce631f89c8a29ea6eb8c7'
-UNRESOLVED_PROTECTED='ecbd7b3bf1104f57ff5f679d03f8654c57a94054dad982a9123bcd41e49a9106'
 # Observed runtime/archive and shellcode constants, not a user credential.
 PROJECT_PASSWORD=b'99B2328D3FDF4E9E98559B4414F7ACB9'
 PNG_KEY=bytes.fromhex('504073737730336400de9cabfeccd012')
@@ -194,6 +193,9 @@ def _inspect(data,rules=None,*,mapped_pe=False):
     observed_rules=rules if rules is not None else scan_bytes(data)
     result['detections']=_hits(data,observed_rules)
     if pe:
+        from tsco_analysis import identify
+        tsco=identify(data,pe)
+        result.update(tsco)
         for _,size,offset,_ in pe.sections:
             if size==629760 and hashlib.sha256(data[offset:offset+size]).hexdigest()==SYNAPTICS_CODE:
                 result['detections'].append({'signature':'WR_Synaptics_Code_Section','family':'Synaptics',
@@ -235,10 +237,13 @@ def _inspect(data,rules=None,*,mapped_pe=False):
         result.update(status='incomplete',reason='发现代码特征组合，但无法确认其属于外层程序的执行代码；可能位于嵌入资源，已保留原文件。')
     if result['detections']:
         result.update(status='detected',source_sha256=hashlib.sha256(data).hexdigest())
-    # Preserve the unresolved protected sample as a review, not a fabricated
-    # malicious verdict. Its name/path are intentionally absent from this test.
-    if len(data)==2949632 and hashlib.sha256(data).hexdigest()==UNRESOLVED_PROTECTED:
-        result.update(status='incomplete',reason='匹配已留存的受保护载荷内容；内部业务代码尚未完整还原。')
+    if not result['detections'] and (result.get('identifications') or result.get('contained_payloads')):
+        # Content identification does not establish a miner/worm classification
+        # or authorize quarantine of a carrier containing a research sample.
+        result.update(status='identified',source_sha256=hashlib.sha256(data).hexdigest(),
+                      reason='已识别 TSCO 已知载荷内容；挖矿或文档蠕虫归属未证实，保留原件待核。')
+    elif result.get('diagnostics') and not result['detections']:
+        result.update(status='incomplete',reason='；'.join(result['diagnostics']))
     if len(data)==486832 and hashlib.sha256(data).hexdigest()==KNOWN_RUNTIME:
         result['role']='observed_trueupdate_runtime';result['source_sha256']=KNOWN_RUNTIME
     return result

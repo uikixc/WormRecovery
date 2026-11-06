@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY,patch
 import urllib.request
 import urllib.error
 
@@ -73,6 +73,33 @@ class UpdateSecurityTests(unittest.TestCase):
 
 
 class ServiceUpdateTests(unittest.TestCase):
+    def test_service_success_does_not_load_device_credentials(self):
+        expected={'available':False,'version':'1.8.3','private':False}
+        with patch.object(update,'service_manifest_check',return_value=expected),patch.object(update,'load_token',side_effect=AssertionError('unnecessary token access')):
+            self.assertEqual(update.check_update('1.8.3'),expected)
+
+    def test_saved_token_still_uses_credential_free_signed_service(self):
+        _,document,key=signed_fixture(version='1.8.3')
+        with patch('update_trust.UPDATE_PUBLIC_KEY',key),patch.object(update,'read_json',return_value=document) as read,patch.object(update,'_api_check',side_effect=AssertionError('token bypassed service')):
+            info=update.check_update('1.8.2',token='stale-device-token')
+        self.assertEqual(info['version'],'1.8.3')
+        self.assertTrue(all(call.kwargs.get('token')=='' for call in read.call_args_list))
+
+    def test_metadata_race_has_wall_clock_deadline(self):
+        import time
+        release=threading.Event()
+        try:
+            started=time.monotonic()
+            with self.assertRaisesRegex(update.UpdateError,'总时限'):
+                update._first_verified([('hung','a')],lambda route:release.wait(2),timeout=.05)
+            self.assertLess(time.monotonic()-started,.5)
+        finally:release.set()
+
+    def test_service_http_error_identifies_service(self):
+        url=update.UPDATE_ORIGINS[0]+update.METADATA_PATH
+        with patch.object(update,'open_url',side_effect=urllib.error.HTTPError(url,503,'unavailable',{},None)):
+            with self.assertRaisesRegex(update.UpdateError,'自用更新服务.*503'):update.read_json(url)
+
     def test_http_service_is_fixed_and_rejects_redirects(self):
         valid=update.UPDATE_ORIGINS[0]+update.METADATA_PATH
         self.assertTrue(update.first_party_url(valid))
@@ -100,7 +127,7 @@ class ServiceUpdateTests(unittest.TestCase):
         expected={'available':False,'version':'1.8.2','private':False}
         with patch.object(update,'service_manifest_check',side_effect=update.UpdateError('offline')),patch.object(update,'_api_check',return_value=expected) as github:
             self.assertEqual(update.check_update('1.8.2',token=''),expected)
-            github.assert_called_once_with('1.8.2','')
+            github.assert_called_once_with('1.8.2','',visibility=ANY)
 
     def test_no_token_prefers_signed_service_without_api_or_mirror_probe(self):
         content,document,key=signed_fixture(version='1.8.3')
@@ -130,6 +157,40 @@ class ServiceUpdateTests(unittest.TestCase):
 
 
 class UpdateFlowTests(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise GitHub only after both first-party routes fail.
+        service=patch.object(update,'service_manifest_check',side_effect=update.UpdateError('fixture offline'))
+        service.start();self.addCleanup(service.stop)
+
+    def test_hung_public_api_falls_back_after_total_deadline(self):
+        release=threading.Event();race=update._first_verified
+        expected={'available':False,'version':'1.8.3','private':False}
+        def hung(*args,**kwargs):release.wait(2);raise update.UpdateError('late')
+        try:
+            with patch.object(update,'_api_check',side_effect=hung),patch.object(update,'_first_verified',side_effect=lambda routes,fetch,**kw:race(routes,fetch,timeout=.05)),patch.object(update,'public_manifest_check',return_value=expected) as fallback:
+                self.assertEqual(update.check_update('1.8.3',token='fixture'),expected)
+            fallback.assert_called_once()
+        finally:release.set()
+
+    def test_private_visibility_survives_api_deadline_without_public_probe(self):
+        release=threading.Event();race=update._first_verified
+        def read(url,*args,**kwargs):
+            if url==update.API:return {'private':True}
+            release.wait(2);raise update.UpdateError('late')
+        try:
+            with patch.object(update,'read_json',side_effect=read),patch.object(update,'_first_verified',side_effect=lambda routes,fetch,**kw:race(routes,fetch,timeout=.05)),patch.object(update,'public_manifest_check') as fallback:
+                with self.assertRaisesRegex(update.UpdateError,'总时限') as error:update.check_update('1.8.3',token='fixture')
+            self.assertTrue(error.exception.private);fallback.assert_not_called()
+        finally:release.set()
+
+    def test_private_invalid_signature_never_uses_public_metadata(self):
+        release={'tag_name':'v1.8.4','assets':[
+            {'name':'WormRecovery.exe','state':'uploaded','id':1},
+            {'name':'update-manifest.json','state':'uploaded','id':2}]}
+        with patch.object(update,'read_json',side_effect=[{'private':True},release,{'payload':{},'signature':'bad'}]),patch.object(update,'public_manifest_check') as fallback:
+            with self.assertRaises(update.UpdateError) as error:update.check_update('1.8.3',token='fixture')
+        self.assertTrue(error.exception.private);fallback.assert_not_called()
+
     def test_api_failure_uses_signed_public_metadata_without_sending_token(self):
         _,document,key=signed_fixture(version='1.6.0')
         def read(url,token=None,asset=False):

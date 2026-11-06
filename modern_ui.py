@@ -68,6 +68,7 @@ class ModernWindow:
         self.displayed=0
         self.result_records=[]
         self.update_busy=False
+        self.update_downloading=False
         self.update_info=None
         self.update_pending_install=None
         self.update_cancel=threading.Event()
@@ -89,7 +90,7 @@ class ModernWindow:
         self.update_timer=self.root.after(3500,lambda:self.check_for_updates(True)) if getattr(sys,'frozen',False) else None
         from diagnostic_client import start_background
         start_background(lambda result:self.queue.put((None,'diagnostics',result)))
-        self.root.after(1200,self.check_log_server)
+        self.connection_timer=self.root.after(1200,self.check_log_server)
 
     def style(self):
         self.root.option_add('*Font',(FONT,10))
@@ -311,6 +312,13 @@ class ModernWindow:
             family=record.get('family_analysis',{})
             if family:
                 if family.get('status')=='detected':text+='\n判定依据：已匹配恶意代码组合特征。'
+                for identity in family.get('identifications',[]):
+                    if identity.get('identity')=='TSCO_known_payload_container':
+                        text+='\n内容识别：TSCO 已知容器；活动入口、4 条完整压缩流及 4 个内部 PE 身份一致。'
+                    elif identity.get('identity')=='TSCO_recovered_payload':
+                        text+='\n内容识别：TSCO 已知内部 DLL；完整内容指纹与 PE 结构一致。'
+                for contained in family.get('contained_payloads',[]):
+                    text+='\n嵌入载荷：偏移 '+str(contained['offset'])+'，长度 '+str(contained['bytes'])+'；仅属于内部 PE，不判定父文件恶意。'
                 methods={'observed_xor32_nrv2e':'已解析压缩层并检查内部代码',
                          'png_prefix64_rc4':'已解密图片载荷并检查内部程序'}
                 for decoded in family.get('decodings',[]):
@@ -545,7 +553,7 @@ class ModernWindow:
         if self.cleaner:os.startfile(str(self.cleaner.run))
 
     def close(self):
-        if self.update_busy:
+        if self.update_busy and self.update_downloading:
             self.update_cancel.set()
             self.update_state.set('正在停止更新下载')
             return
@@ -556,6 +564,9 @@ class ModernWindow:
             if self.update_timer:
                 self.root.after_cancel(self.update_timer)
                 self.update_timer=None
+            if self.connection_timer:
+                self.root.after_cancel(self.connection_timer)
+                self.connection_timer=None
             self.root.after_cancel(self.timer)
             from diagnostic_client import stop_background
             stop_background()
@@ -591,6 +602,7 @@ class ModernWindow:
         threading.Thread(target=worker,daemon=True,name='WormRecovery-Diagnostics-UI').start()
 
     def check_log_server(self):
+        self.connection_timer=None
         if self.connection_busy:return
         self.connection_busy=True;self.connection_state.set('日志服务器：正在检测内网与外网…')
         self.connection_button.configure(state='disabled')
@@ -640,7 +652,7 @@ class ModernWindow:
 
     def download_new_version(self):
         if self.busy or self.update_busy or not self.update_info:return
-        self.update_busy=True;self.update_cancel.clear();self.update_button.configure(state='disabled')
+        self.update_busy=True;self.update_downloading=True;self.update_cancel.clear();self.update_button.configure(state='disabled')
         info=self.update_info
         def download():
             try:
@@ -657,7 +669,7 @@ class ModernWindow:
                 self.update_state.set('下载 %.1f%% · %s'%(percent,payload.get('route','')))
             else:self.update_state.set(payload.get('message','正在准备更新'))
             return
-        self.update_busy=False;self.update_button.configure(state='normal')
+        self.update_busy=False;self.update_downloading=False;self.update_button.configure(state='normal')
         if kind=='update_error':
             from diagnostic_client import record_event
             record_event('update_error',message=payload['message'])

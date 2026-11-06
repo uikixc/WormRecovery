@@ -25,6 +25,7 @@ MAX_METADATA=256*1024
 # Ed25519 key and complete file hash, while transport does not need a proxy.
 UPDATE_ORIGINS=('http://10.205.103.120:10888','http://8.134.112.170:35981')
 METADATA_PATH='/updates/stable/update-manifest.json'
+METADATA_DEADLINE=8
 
 
 def first_party_url(url):
@@ -78,6 +79,8 @@ def read_json(url,token=None,asset=False,timeout=6):
         if not isinstance(document,dict):raise ValueError('metadata object expected')
         return document
     except urllib.error.HTTPError as ex:
+        if first_party_url(url):
+            raise UpdateError('自用更新服务请求失败：HTTP '+str(ex.code)) from None
         if ex.code in (401,403):raise UpdateError('GitHub 授权无效、权限不足或访问频率受限，请检查更新设置。') from None
         if ex.code==404:raise UpdateError('尚无正式 Release，或当前设备无权读取此私有仓库。') from None
         raise UpdateError('GitHub 请求失败：HTTP '+str(ex.code)) from None
@@ -100,10 +103,11 @@ def validate_asset_url(url,tag):
     return url
 
 
-def _api_check(current_version,token=None):
+def _api_check(current_version,token=None,visibility=None):
     repository=read_json(API,token)
     private=repository.get('private')
     if type(private) is not bool:raise UpdateError('无法确认仓库可见性。')
+    if visibility is not None:visibility['private']=private
     try:release=read_json(API+'/releases/latest',token)
     except UpdateError as ex:
         ex.private=private;raise
@@ -126,24 +130,34 @@ def _api_check(current_version,token=None):
         'notes':str(release.get('body',''))[:12000]}
 
 
-def _first_verified(routes,fetch):
+def _first_verified(routes,fetch,timeout=METADATA_DEADLINE):
     """Return as soon as one authenticated route works; slow routes are bounded.
 
     Daemon workers do not hold GUI shutdown or wait for a failed remote server.
     At most the fixed route count is launched per check.
     """
     import queue
+    routes=list(routes)
+    deadline=time.monotonic()+timeout
     results=queue.Queue()
     def worker(route):
         try:results.put((route,fetch(route),None))
         except Exception as ex:results.put((route,None,ex))
     for route in routes:threading.Thread(target=worker,args=(route,),daemon=True).start()
-    failures=[]
+    failures=[];errors=[];pending={route[0] for route in routes}
     for _ in routes:
-        route,result,error=results.get()
+        try:route,result,error=results.get(timeout=max(0,deadline-time.monotonic()))
+        except queue.Empty:
+            failures.extend(name+'：连接超时（版本检查总时限）' for name in sorted(pending))
+            break
+        pending.discard(route[0])
         if error is None:return route,result
+        errors.append(error)
         failures.append(route[0]+'：'+(str(error) if isinstance(error,UpdateError) else '发布签名或清单校验失败'))
-    raise UpdateError('；'.join(failures))
+    failure=UpdateError('；'.join(failures))
+    # Preserve private-repository isolation when wrapping an API failure.
+    failure.private=any(getattr(error,'private',False) for error in errors)
+    raise failure
 
 
 def service_manifest_check(current_version):
@@ -151,7 +165,7 @@ def service_manifest_check(current_version):
     def fetch(route):
         signed=read_json(route[1],token='',asset=True,timeout=3)
         return signed,verify_manifest(signed)
-    (name,url),(signed,payload)=_first_verified(routes,fetch)
+    (name,url),(signed,payload)=_first_verified(routes,fetch,timeout=4)
     return {'available':version_tuple(payload['version'])>version_tuple(current_version),
         'version':payload['version'],'private':False,'manifest':signed,'asset_id':None,
         'public_url':'https://github.com/'+REPOSITORY+'/releases/download/v'+payload['version']+'/WormRecovery.exe',
@@ -177,16 +191,26 @@ def public_manifest_check(current_version,api_error):
 
 
 def check_update(current_version,token=None):
+    # An old/invalid device token must not bypass the signed first-party
+    # service. The service receives no credentials, even on enrolled devices.
+    try:return service_manifest_check(current_version)
+    except UpdateError as ex:service_error=str(ex)
     if token is None:
         try:token=load_token()
         except OSError:token=''
-    if not token:
-        try:return service_manifest_check(current_version)
-        except UpdateError:pass
-    try:return _api_check(current_version,token)
+    visibility={}
+    try:
+        _,info=_first_verified([('GitHub API',API)],lambda route:_api_check(current_version,token,visibility=visibility),timeout=12)
+        return info
     except UpdateError as ex:
-        if getattr(ex,'private',False):raise
-        return public_manifest_check(current_version,ex)
+        # A stalled API worker may already have established private visibility
+        # without returning an exception through the race queue.
+        if visibility.get('private') or getattr(ex,'private',False):
+            failure=UpdateError('自用服务：'+service_error+'；'+str(ex));failure.private=True
+            raise failure from None
+        try:return public_manifest_check(current_version,ex)
+        except UpdateError as fallback:
+            raise UpdateError('自用服务：'+service_error+'；'+str(fallback)) from None
 
 
 def routes_for(info):
