@@ -1,6 +1,12 @@
-param([string]$Python = "python")
+param([string]$Python = "python", [string]$OutputDirectory = "")
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
+$version = & $Python -c 'from worm_recovery import VERSION; print(VERSION)'
+if ($LASTEXITCODE -ne 0) { throw 'Cannot read application version.' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $PSScriptRoot ('release/WormRecovery-' + $version) }
+$OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+if (Test-Path -LiteralPath (Join-Path $OutputDirectory 'WormRecovery.exe')) { throw 'Output executable already exists. Select a new output directory to preserve it.' }
+New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 function Invoke-Python {
     param([string[]]$Arguments)
     & $Python @Arguments
@@ -19,5 +25,6 @@ $analysis = Join-Path $privateDist 'WormRecovery-Analysis'
 $cli = Join-Path $privateDist 'WormRecovery-CLI.exe'
 $engineAssets = Join-Path $PSScriptRoot 'build/engine-assets/engines'
 if (-not (Test-Path -LiteralPath (Join-Path $engineAssets 'manifest.json'))) { throw 'Prepare verified offline engine assets before building.' }
-Invoke-Python -Arguments ($base + @('--windowed', '--uac-admin', '--name', 'WormRecovery', '--add-data', ($analysis + ':engines/analysis'), '--add-binary', ($cli + ':engines'), '--add-data', ($engineAssets + ':engines')) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'worm_recovery.py'))
-Write-Host "Build completed: $PSScriptRoot/dist/WormRecovery.exe (single-file distribution)"
+Invoke-Python -Arguments ($analysisBase + @('--windowed', '--uac-admin', '--name', 'WormRecovery', '--distpath', (Join-Path $privateDist 'runtime'), '--add-data', ($analysis + ':engines/analysis'), '--add-binary', ($cli + ':engines'), '--add-data', ($engineAssets + ':engines')) + $collect + @('--hidden-import', 'olefile', '--hidden-import', 'psutil', '--hidden-import', 'winreg', 'worm_recovery.py'))
+Invoke-Python -Arguments @('build_runtime_launcher.py', '--source', (Join-Path $privateDist 'runtime/WormRecovery'), '--destination', (Join-Path $OutputDirectory 'WormRecovery.exe'), '--work', (Join-Path $privateDist 'launcher'))
+Write-Host "Build completed: $OutputDirectory/WormRecovery.exe (single-file distribution)"

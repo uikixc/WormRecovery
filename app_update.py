@@ -1,5 +1,5 @@
-"""GitHub release checks, authenticated private downloads and public mirrors."""
-from concurrent.futures import ThreadPoolExecutor,as_completed
+"""Signed first-party updates with credential-isolated GitHub fallback."""
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -21,6 +21,19 @@ PUBLIC_MIRRORS=(('GitHub 直连',''),('GH-Proxy','https://gh-proxy.com/'),
                 ('GHFast','https://ghfast.top/'),('GHProxy.net','https://ghproxy.net/'))
 MIRROR_HOSTS={'gh-proxy.com','gh-proxy.org','ghfast.top','ghproxy.net'}
 MAX_METADATA=256*1024
+# These are intentionally HTTP: release authenticity comes from the pinned
+# Ed25519 key and complete file hash, while transport does not need a proxy.
+UPDATE_ORIGINS=('http://10.205.103.120:10888','http://8.134.112.170:35981')
+METADATA_PATH='/updates/stable/update-manifest.json'
+
+
+def first_party_url(url):
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:return False
+    if parsed.scheme+'://'+parsed.netloc not in UPDATE_ORIGINS:return False
+    if parsed.path==METADATA_PATH:return True
+    import re
+    return bool(re.fullmatch(r'/updates/releases/v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)/WormRecovery\.exe',parsed.path))
 
 
 class UpdateError(Exception):pass
@@ -32,6 +45,7 @@ def trusted_github_host(host):
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,request,fp,code,message,headers,newurl):
+        if first_party_url(request.full_url):raise UpdateError('自用更新服务不允许重定向。')
         target=urllib.parse.urlsplit(newurl)
         if target.scheme!='https' or target.username or target.password or not (trusted_github_host(target.hostname or '') or target.hostname in MIRROR_HOSTS):
             raise UpdateError('更新下载跳转到未允许的地址。')
@@ -43,19 +57,21 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 def open_url(url,token=None,accept='application/vnd.github+json',extra_headers=None,timeout=10):
     parsed=urllib.parse.urlsplit(url)
-    if parsed.scheme!='https' or parsed.username or parsed.password:raise UpdateError('更新地址无效。')
+    if (parsed.scheme!='https' and not first_party_url(url)) or parsed.username or parsed.password:raise UpdateError('更新地址无效。')
     headers={'User-Agent':'WormRecovery-Updater','Accept':accept}
     if token:
         if parsed.hostname!='api.github.com':raise UpdateError('私有凭据只能发送给 GitHub API。')
         headers['Authorization']='Bearer '+token
+    if any(name.casefold() in ('authorization','proxy-authorization','cookie') for name in (extra_headers or {})):
+        raise UpdateError('更新请求不能附加凭据。')
     headers.update(extra_headers or {})
     request=urllib.request.Request(url,headers=headers)
-    return urllib.request.build_opener(SafeRedirect()).open(request,timeout=timeout)
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}),SafeRedirect()).open(request,timeout=timeout)
 
 
-def read_json(url,token=None,asset=False):
+def read_json(url,token=None,asset=False,timeout=6):
     try:
-        with open_url(url,token,accept='application/octet-stream' if asset else 'application/vnd.github+json') as response:
+        with open_url(url,token,accept='application/octet-stream' if asset else 'application/vnd.github+json',timeout=timeout) as response:
             data=response.read(MAX_METADATA+1)
         if len(data)>MAX_METADATA:raise UpdateError('更新元数据超过限制。')
         document=json.loads(data.decode('utf-8-sig'))
@@ -110,29 +126,51 @@ def _api_check(current_version,token=None):
         'notes':str(release.get('body',''))[:12000]}
 
 
+def _first_verified(routes,fetch):
+    """Return as soon as one authenticated route works; slow routes are bounded.
+
+    Daemon workers do not hold GUI shutdown or wait for a failed remote server.
+    At most the fixed route count is launched per check.
+    """
+    import queue
+    results=queue.Queue()
+    def worker(route):
+        try:results.put((route,fetch(route),None))
+        except Exception as ex:results.put((route,None,ex))
+    for route in routes:threading.Thread(target=worker,args=(route,),daemon=True).start()
+    failures=[]
+    for _ in routes:
+        route,result,error=results.get()
+        if error is None:return route,result
+        failures.append(route[0]+'：'+(str(error) if isinstance(error,UpdateError) else '发布签名或清单校验失败'))
+    raise UpdateError('；'.join(failures))
+
+
+def service_manifest_check(current_version):
+    routes=[('自用内网',UPDATE_ORIGINS[0]+METADATA_PATH),('自用公网',UPDATE_ORIGINS[1]+METADATA_PATH)]
+    def fetch(route):
+        signed=read_json(route[1],token='',asset=True,timeout=3)
+        return signed,verify_manifest(signed)
+    (name,url),(signed,payload)=_first_verified(routes,fetch)
+    return {'available':version_tuple(payload['version'])>version_tuple(current_version),
+        'version':payload['version'],'private':False,'manifest':signed,'asset_id':None,
+        'public_url':'https://github.com/'+REPOSITORY+'/releases/download/v'+payload['version']+'/WormRecovery.exe',
+        'service_origin':url[:-len(METADATA_PATH)],'notes':'','metadata_route':name,
+        'diagnostics':'已直连自用更新服务，发布签名校验通过。'}
+
+
 def public_manifest_check(current_version,api_error):
-    """Public channel fallback independent of API availability; always verify signature."""
+    """Public fallback verifies every accepted response with the release key."""
     url='https://github.com/'+REPOSITORY+'/releases/latest/download/update-manifest.json'
     routes=[(name,prefix+url) for name,prefix in PUBLIC_MIRRORS]
-    successes=[];failures=[]
     def fetch(route):
-        name,target=route
-        try:
-            signed=read_json(target,token='',asset=True)
-            payload=verify_manifest(signed)
-            return name,signed,payload,None
-        except Exception as ex:
-            return name,None,None,str(ex) if isinstance(ex,UpdateError) else '发布签名或清单校验失败'
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        for future in as_completed([executor.submit(fetch,route) for route in routes]):
-            name,signed,payload,error=future.result()
-            if payload:successes.append((version_tuple(payload['version']),name,signed,payload))
-            else:failures.append(name+'：'+error)
-    if not successes:
-        raise UpdateError('版本检查未完成。GitHub API：'+str(api_error)+'；备用线路：'+'；'.join(failures))
-    latest,name,signed,payload=max(successes,key=lambda item:item[0])
-    available=latest>version_tuple(current_version)
-    return {'available':available,'version':payload['version'],'private':False,'manifest':signed,
+        signed=read_json(route[1],token='',asset=True)
+        return signed,verify_manifest(signed)
+    try:(name,_),(signed,payload)=_first_verified(routes,fetch)
+    except UpdateError as ex:
+        raise UpdateError('版本检查未完成。GitHub API：'+str(api_error)+'；备用线路：'+str(ex)) from None
+    return {'available':version_tuple(payload['version'])>version_tuple(current_version),
+            'version':payload['version'],'private':False,'manifest':signed,
             'asset_id':None,'public_url':'https://github.com/'+REPOSITORY+'/releases/download/v'+payload['version']+'/WormRecovery.exe',
             'notes':'','metadata_route':name,'metadata_fallback':True,
             'diagnostics':'GitHub API 未完成，已通过备用线路获取并验证发布清单。'}
@@ -142,6 +180,9 @@ def check_update(current_version,token=None):
     if token is None:
         try:token=load_token()
         except OSError:token=''
+    if not token:
+        try:return service_manifest_check(current_version)
+        except UpdateError:pass
     try:return _api_check(current_version,token)
     except UpdateError as ex:
         if getattr(ex,'private',False):raise
@@ -151,7 +192,12 @@ def check_update(current_version,token=None):
 def routes_for(info):
     # Never disclose private URLs, signed redirects or tokens to public mirrors.
     if info['private']:return [('GitHub 私有直连',API+'/releases/assets/'+str(info['asset_id']))]
-    return [(name,prefix+info['public_url']) for name,prefix in PUBLIC_MIRRORS]
+    routes=[]
+    if info.get('service_origin') in UPDATE_ORIGINS:
+        origins=[info['service_origin']]+[origin for origin in UPDATE_ORIGINS if origin!=info['service_origin']]
+        payload=verify_manifest(info['manifest'])
+        routes=[('自用更新服务',origin+'/updates/releases/v'+payload['version']+'/WormRecovery.exe') for origin in origins]
+    return routes+[(name,prefix+info['public_url']) for name,prefix in PUBLIC_MIRRORS]
 
 
 def probe_route(route,size):
@@ -179,7 +225,7 @@ def download_update(info,progress=lambda value:None,cancel=None,token=None):
         try:verify_file(destination,payload);return destination
         except ValueError:destination.unlink()
     routes=routes_for(info)
-    if not info['private']:
+    if not info['private'] and not info.get('service_origin'):
         progress({'phase':'routes','message':'正在测试下载线路'})
         with ThreadPoolExecutor(max_workers=4) as executor:
             probes=list(executor.map(lambda route:probe_route(route,payload['bytes']),routes))

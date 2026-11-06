@@ -223,7 +223,12 @@ def _legacy_bytes(data):
         from vba_inventory import inspect_legacy_workbook
         structure=inspect_legacy_workbook(parser.ole_file) if parser.ole_file else {'status':'unavailable'}
     finally:parser.close()
-    if not has:return {'status':'clean','macro':False,'document_format':'ole'}
+    if not has:
+        complete=structure.get('status')=='complete' and structure.get('active_or_unclassified_features')==[]
+        return {'status':'clean' if complete else 'review','macro':False,'document_format':'ole',
+                'legacy_structure':structure,'active_content_unresolved':not complete,
+                'reason':'旧版工作簿结构已完成检查，未发现 VBA 或未分类活动记录。' if complete else
+                         '未发现 VBA，但旧版文档包含未分类活动内容或结构检查尚未完成。'}
     analysis=inspect_project(data,full_document=True)
     return {'status':'review','macro':True,'document_format':'ole','macro_analysis':analysis,'legacy_structure':structure,
             'has_family_macro':bool(analysis.get('family_modules')),

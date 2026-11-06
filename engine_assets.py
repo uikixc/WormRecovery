@@ -4,6 +4,9 @@ import json
 import functools
 import os
 import sys
+import tempfile
+import atexit
+import shutil
 
 
 def engine_root():
@@ -27,6 +30,13 @@ def manifest():
     return _manifest(str(engine_root()))
 
 
+@functools.lru_cache(maxsize=1)
+def _cached_runtime_work():
+    root=tempfile.mkdtemp(prefix='WormRecovery-worker-')
+    atexit.register(shutil.rmtree,root,ignore_errors=True)
+    return root
+
+
 def subprocess_environment(independent=False):
     environment = os.environ.copy()
     if independent:
@@ -39,7 +49,7 @@ def subprocess_environment(independent=False):
     environment['PYTHONIOENCODING'] = 'utf-8'
     work_root = environment.get('WORMRECOVERY_WORK_ROOT')
     if not work_root and getattr(sys, '_MEIPASS', None):
-        work_root = str(Path(sys._MEIPASS) / 'worker-temp')
+        work_root = _cached_runtime_work() if environment.get('WORMRECOVERY_RUNTIME_ROOT') else str(Path(sys._MEIPASS) / 'worker-temp')
     if work_root:
         Path(work_root).mkdir(parents=True, exist_ok=True)
         environment['WORMRECOVERY_WORK_ROOT'] = work_root

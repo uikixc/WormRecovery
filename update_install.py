@@ -73,7 +73,7 @@ def run_job(job_path):
         try:
             if job.get('relaunch',True):
                 environment=os.environ.copy();environment['PYINSTALLER_RESET_ENVIRONMENT']='1'
-                for key in ('WORMRECOVERY_ENGINE_ROOT','WORMRECOVERY_WORK_ROOT'):environment.pop(key,None)
+                for key in ('WORMRECOVERY_ENGINE_ROOT','WORMRECOVERY_WORK_ROOT','WORMRECOVERY_LAUNCHER_PATH','WORMRECOVERY_LAUNCHER_PID','WORMRECOVERY_RUNTIME_ROOT'):environment.pop(key,None)
                 subprocess.Popen([job['target']],cwd=str(Path(job['target']).parent),env=environment,
                     creationflags=getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|getattr(subprocess,'CREATE_NO_WINDOW',0))
         except Exception:
@@ -89,10 +89,11 @@ def run_job(job_path):
 def start_install(downloaded,manifest,target=None):
     if not getattr(sys,'frozen',False):raise ValueError('源码运行模式不替换 Python，请使用发行版安装更新。')
     from bundled_components import component_path
-    downloaded=Path(downloaded).resolve();target=check_plain_path(Path(target or sys.executable).resolve())
+    from runtime_identity import application_path
+    downloaded=Path(downloaded).resolve();target=check_plain_path(Path(target or application_path()).resolve())
     payload=verify_manifest(manifest);verify_file(downloaded,payload)
     identities=[]
-    for process in (psutil.Process(),psutil.Process().parent()):
+    for process in [psutil.Process(),*psutil.Process().parents()]:
         if process and os.path.normcase(process.exe())==os.path.normcase(str(target)):
             identities.append({'pid':process.pid,'created':process.create_time()})
     helper=downloaded.parent/'WormRecovery-Updater.exe'
@@ -102,7 +103,7 @@ def start_install(downloaded,manifest,target=None):
          'manifest':manifest,'parents':identities,'relaunch':True}
     job_path.write_text(json.dumps(job,ensure_ascii=True),encoding='utf-8')
     environment=os.environ.copy();environment['PYINSTALLER_RESET_ENVIRONMENT']='1'
-    for key in ('WORMRECOVERY_ENGINE_ROOT','WORMRECOVERY_WORK_ROOT'):environment.pop(key,None)
+    for key in ('WORMRECOVERY_ENGINE_ROOT','WORMRECOVERY_WORK_ROOT','WORMRECOVERY_LAUNCHER_PATH','WORMRECOVERY_LAUNCHER_PID','WORMRECOVERY_RUNTIME_ROOT'):environment.pop(key,None)
     subprocess.Popen([str(helper),'--apply-update',str(job_path)],cwd=str(downloaded.parent),env=environment,
         stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0))

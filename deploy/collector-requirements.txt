@@ -1,1 +1,2 @@
-# HTTP receiver uses only the Python standard library.
+# Signed update delivery uses the same pinned verifier as the Windows client.
+cryptography==50.0.2

@@ -20,6 +20,7 @@ FONT='Microsoft YaHei UI'
 LABELS={
     'infected_office':'Excel 宏感染', 'infected_executable':'程序被包裹',
     'malicious_shortcut':'恶意快捷方式', 'worm_payload':'病毒载荷',
+    'malware_component':'恶意代码载荷', 'malware_deployment':'恶意加载部署',
     'worm_script':'恶意 AutoIt 脚本', 'worm_runtime':'病毒缓存',
     'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'Office 活动内容', 'info_office':'已核对的 Office 组件','info_document':'已分析的文档资源',
     'review_autoit':'AutoIt 脚本','review_script':'脚本行为','review_binary':'程序行为'}
@@ -307,6 +308,17 @@ class ModernWindow:
             text=record['path']
             for key in ('reason','action','assessment_limit','error'):
                 if record.get(key):text+='\n'+record[key]
+            family=record.get('family_analysis',{})
+            if family:
+                if family.get('status')=='detected':text+='\n判定依据：已匹配恶意代码组合特征。'
+                methods={'observed_xor32_nrv2e':'已解析压缩层并检查内部代码',
+                         'png_prefix64_rc4':'已解密图片载荷并检查内部程序'}
+                for decoded in family.get('decodings',[]):
+                    text+='\n'+methods.get(decoded.get('method'),'已执行静态内容解析')
+                if any(hit.get('signature')=='WR_Encrypted_Project_Loader' for hit in family.get('detections',[])):
+                    text+='\n已校验加密项目及其内存加载代码。'
+            if record.get('related_evidence'):
+                text+='\n关联证据：'+str(len(record['related_evidence']))+' 个内容已确认的同目录文件。'
             details=record.get('error_details',{})
             if details.get('source_bytes_read'):text+='\n文件字节：已成功读取，后续分析未完成。'
             decision=record.get('decision',{})
@@ -616,7 +628,7 @@ class ModernWindow:
         if self.busy:
             self.update_state.set('当前任务完成后可检查更新')
             return
-        self.update_busy=True;self.update_cancel.clear();self.update_state.set('正在检查 GitHub Release')
+        self.update_busy=True;self.update_cancel.clear();self.update_state.set('正在检查更新服务')
         self.update_button.configure(state='disabled')
         def check():
             try:
@@ -654,7 +666,7 @@ class ModernWindow:
             if not payload.get('automatic'):messagebox.showinfo('更新未完成',payload['message'],parent=self.root)
         elif kind=='update_checked':
             info=payload['info'];self.update_info=info if info['available'] else None
-            if info.get('metadata_fallback'):self.append_log(info.get('diagnostics','已通过备用线路验证更新清单。')+' 线路：'+info.get('metadata_route',''))
+            if info.get('metadata_fallback') or info.get('service_origin'):self.append_log(info.get('diagnostics','已通过备用线路验证更新清单。')+' 线路：'+info.get('metadata_route',''))
             self.update_state.set('发现新版本 '+info['version'] if info['available'] else '已是最新版本 '+info['version'])
             if info['available'] and not self.busy:
                 text='发现 WormRecovery '+info['version']+'。\n下载完成并验证发布签名后，可原位更新。\n\n现在下载？'

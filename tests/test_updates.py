@@ -72,6 +72,63 @@ class UpdateSecurityTests(unittest.TestCase):
         with self.assertRaises(update.UpdateError):update.validate_asset_url(valid.replace('v1.5.1','v1.5.0'),'v1.5.1')
 
 
+class ServiceUpdateTests(unittest.TestCase):
+    def test_http_service_is_fixed_and_rejects_redirects(self):
+        valid=update.UPDATE_ORIGINS[0]+update.METADATA_PATH
+        self.assertTrue(update.first_party_url(valid))
+        for suffix in ('?token=x','#x','/../secret'):
+            self.assertFalse(update.first_party_url(valid+suffix))
+        self.assertFalse(update.first_party_url('http://attacker.example'+update.METADATA_PATH))
+        self.assertFalse(update.first_party_url('http://user@10.205.103.120:10888'+update.METADATA_PATH))
+        with self.assertRaises(update.UpdateError):
+            update.SafeRedirect().redirect_request(urllib.request.Request(valid),None,302,'Found',{},valid)
+
+    def test_service_explicitly_disables_all_proxy_discovery_and_credentials(self):
+        url=update.UPDATE_ORIGINS[0]+update.METADATA_PATH
+        with patch.object(update.urllib.request,'build_opener') as build:
+            update.open_url(url)
+            self.assertEqual(build.call_args.args[0].proxies,{})
+        with self.assertRaises(update.UpdateError):update.open_url(url,token='private')
+        with self.assertRaises(update.UpdateError):update.open_url(url,extra_headers={'Authorization':'secret'})
+
+    def test_github_fallback_also_ignores_system_proxy(self):
+        with patch.object(update.urllib.request,'build_opener') as build:
+            update.open_url(update.API)
+            self.assertEqual(build.call_args.args[0].proxies,{})
+
+    def test_unavailable_service_falls_back_to_github(self):
+        expected={'available':False,'version':'1.8.2','private':False}
+        with patch.object(update,'service_manifest_check',side_effect=update.UpdateError('offline')),patch.object(update,'_api_check',return_value=expected) as github:
+            self.assertEqual(update.check_update('1.8.2',token=''),expected)
+            github.assert_called_once_with('1.8.2','')
+
+    def test_no_token_prefers_signed_service_without_api_or_mirror_probe(self):
+        content,document,key=signed_fixture(version='1.8.3')
+        with patch('update_trust.UPDATE_PUBLIC_KEY',key),patch.object(update,'read_json',return_value=document),patch.object(update,'_api_check',side_effect=AssertionError('unnecessary API')):
+            info=update.check_update('1.8.2',token='')
+        self.assertTrue(info['available']);self.assertIn(info['service_origin'],update.UPDATE_ORIGINS)
+        with tempfile.TemporaryDirectory() as temp,patch('update_trust.UPDATE_PUBLIC_KEY',key),patch.object(update,'cache_root',return_value=Path(temp)),patch.object(update,'open_url',return_value=io.BytesIO(content)) as opened,patch.object(update,'probe_route',side_effect=AssertionError('unnecessary probe')):
+            result=update.download_update(info,token='')
+            self.assertEqual(result.read_bytes(),content)
+            self.assertTrue(update.first_party_url(opened.call_args.args[0]))
+            self.assertIsNone(opened.call_args.args[1])
+
+    def test_bad_service_signature_cannot_be_accepted(self):
+        with patch.object(update,'read_json',return_value={'payload':{},'signature':'bad'}):
+            with self.assertRaises(update.UpdateError):update.service_manifest_check('1.8.2')
+
+    def test_success_does_not_wait_for_slow_route(self):
+        import time
+        slow_started=threading.Event();release=threading.Event()
+        def fetch(route):
+            if route[0]=='slow':slow_started.set();release.wait(2);return 'slow'
+            slow_started.wait(1);return 'fast'
+        try:
+            started=time.monotonic();route,result=update._first_verified([('slow','a'),('fast','b')],fetch)
+            self.assertEqual(result,'fast');self.assertLess(time.monotonic()-started,.5)
+        finally:release.set()
+
+
 class UpdateFlowTests(unittest.TestCase):
     def test_api_failure_uses_signed_public_metadata_without_sending_token(self):
         _,document,key=signed_fixture(version='1.6.0')
@@ -137,6 +194,23 @@ class UpdateFlowTests(unittest.TestCase):
             source.write_bytes(content);old=b'MZold inert program';target.write_bytes(old)
             backup=install.replace_verified(source,target,document,hashlib.sha256(old).hexdigest())
             self.assertEqual(target.read_bytes(),content);self.assertEqual(backup.read_bytes(),old)
+
+    def test_cached_runtime_update_targets_outer_executable_and_waits_for_launcher(self):
+        from types import SimpleNamespace
+        import runtime_identity
+        content,document,key=signed_fixture()
+        with tempfile.TemporaryDirectory() as temp,patch('update_trust.UPDATE_PUBLIC_KEY',key):
+            root=Path(temp);source=root/'WormRecovery.exe';source.write_bytes(content)
+            outer=root/'Portable.exe';outer.write_bytes(b'MZold outer')
+            helper=root/'CLI.exe';helper.write_bytes(b'MZinert helper')
+            launcher=SimpleNamespace(pid=501,exe=lambda:str(outer),create_time=lambda:12.5)
+            current=SimpleNamespace(pid=502,exe=lambda:str(root/'cache'/'WormRecovery.exe'),parents=lambda:[launcher])
+            with patch.object(install.sys,'frozen',True,create=True),patch.object(runtime_identity,'application_path',return_value=outer),patch('bundled_components.component_path',return_value=helper),patch.object(install.psutil,'Process',return_value=current),patch.object(install.subprocess,'Popen') as spawn:
+                job_path=install.start_install(source,document)
+            job=json.loads(job_path.read_text(encoding='utf8'))
+            self.assertEqual(job['target'],str(outer))
+            self.assertEqual(job['parents'],[{'pid':501,'created':12.5}])
+            self.assertNotIn('WORMRECOVERY_RUNTIME_ROOT',spawn.call_args.kwargs['env'])
 
     def test_changed_original_refuses_replacement(self):
         content,document,key=signed_fixture()

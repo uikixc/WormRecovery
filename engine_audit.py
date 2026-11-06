@@ -2,7 +2,7 @@
 def build_audit(first_pass,dispatch,findings):
     engines={name:{'first_pass_files':int(first_pass.get(name,0)),
                    'second_pass_results':{},'status':'not_invoked'}
-             for name in ('yara_x','vba_source_analysis','vba_pcode','clamav','capa','rea','autoit','xlm')}
+             for name in ('file_header','family_static','family_size_limited','yara_x','vba_source_analysis','vba_pcode','clamav','capa','rea','autoit','xlm')}
     for row in findings:
         evidence=row.get('secondary_analysis',{})
         for name,engine in engines.items():

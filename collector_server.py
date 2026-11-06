@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
 from diagnostic_transport import MAX_WIRE
 from diagnostic_routes import DEFAULT_ENDPOINTS
+from collector_updates import UpdateStore, serve_update
 
 
 def initialize(directory,endpoints=None):
@@ -76,6 +77,7 @@ class Collector(ThreadingHTTPServer):
         self.rate={};self.rate_lock=threading.Lock()
         if config.get('schema')!=2:raise ValueError('服务需要先迁移至 HTTP 配置。')
         self.directory=Path(config['directory']);self.directory.mkdir(parents=True,exist_ok=True)
+        self.updates=UpdateStore(config.get('updates_directory',self.directory.parent/'updates'))
         if os.name!='nt':self.directory.chmod(0o700)
         self.bytes_used=sum(p.stat().st_size for p in self.directory.glob('*.json'))
         self.next_cleanup=0;self.cleanup()
@@ -125,8 +127,11 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:pass
         data=json.dumps(body,separators=(',',':')).encode()
         self.send_response(status);self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(data)
+        self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store');self.end_headers()
+        if self.command!='HEAD':self.wfile.write(data)
+    def do_HEAD(self):self.do_GET()
     def do_GET(self):
+        if serve_update(self):return
         if self.path=='/health':self.respond(200,{'status':'ready','protocol':1})
         elif self.path=='/v1/upload-check':
             if not self.authorized('upload_token_hash'):self.respond(401,{'error':'unauthorized'});return

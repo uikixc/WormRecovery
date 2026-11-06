@@ -1,8 +1,8 @@
 # WormRecovery
 
-Windows 蠕虫检测与原位恢复工具，当前版本为 **1.8.1**。针对已分析的 AutoIt / Synaptics 感染特征，提供文件检测、确认感染项修复和复核。
+Windows 蠕虫与挖矿载荷检测、原位恢复工具，当前版本为 **1.8.2**。针对已分析的感染代码及加载链提供内容检测、确认感染项处理和复核。
 
-1.8.1 修复 ClamAV 整批超时导致全部候选丢失已完成结果的问题。按文件记录检查进展、保留独立结果并只重试未完成项；识别云盘过滤目录、严格解析元数据附属文件和回收站索引，新增嵌入 Office 文档与 OLE 包装的有界静态检查。VBA 源码检查与编译缓存覆盖分别报告，不再把缓存解码失败等同于整份文档无法读取。详见 [1.8.1 说明](docs/RELEASE_1.8.1.md)。
+1.8.2 将 REA 已核实的恶意代码组合接入离线检测：支持改造 NRV2E 压缩层、加密更新项目和 PNG 内控制载荷的有界静态解析。全部选中文件先检查文件头，改名或更换扩展名不会绕过 PE 和已知载体检查；正常更新程序需要同时关联内容已证实的恶意项目与载荷才确认该部署。详见 [1.8.2 说明](docs/RELEASE_1.8.2.md)。
 
 1.8.0 增加基于文档实际内容的离线判断：识别误用 `.doc` 扩展名的纯文本、受限图片内容 ID 引用、零字节正文缺失，以及经严格模块清单、源码、缓存与容器检查证明的空 VBA 项目。非空宏、未分类缓存、公式或外部对象仍按实际证据保留；不会因杀毒引擎未命中而全部判为安全。详见 [1.8.0 说明](docs/RELEASE_1.8.0.md)。
 
@@ -24,7 +24,7 @@ Windows 蠕虫检测与原位恢复工具，当前版本为 **1.8.1**。针对�
 
 1.4.1 修复新增 XLM 库的导入提示污染 VBA 分析 JSON 通信，导致正常宏被误报“解析失败”的回归问题。引擎提示单独记录，未知结构和真实解析错误仍保留失败状态；不通过放宽白名单消除异常。另将内部工作进程临时目录收拢到已保护的工作区，并修复脚本扩展名未进入内容检测队列的问题。详见 docs/RELEASE_1.4.1.md。
 
-只需复制 WormRecovery.exe。宏分析、命令行、ClamAV 病毒库、capa 和 REA 本地运行组件已嵌入，目标电脑不需要 Python、Node、Codex 或网络连接。运行时自动解包内部组件，因此启动速度和临时磁盘占用与原来的轻量版本不同。
+只需复制 WormRecovery.exe。宏分析、命令行、ClamAV 病毒库、capa 和 REA 本地运行组件已嵌入，目标电脑不需要 Python、Node、Codex 或网络连接。首次启动把内部组件展开到 Windows ProgramData 下的 WormRecoveryRuntime 缓存，后续启动复用同一内容版本。每次启动仍核对所有文件的完整 SHA-256、目录权限及重解析点，并持有只读句柄至主程序退出。首次展开需要额外磁盘空间；GUI 会立即显示组件准备/校验进度，可关闭进度窗口取消启动。长路径使用显式扩展路径，不修改系统长路径策略。实际速度取决于磁盘与安全软件。
 
 离线分析现已实际接入 YARA-X 内容组合规则、AutoIt 静态提取、XLMMacroDeobfuscator 有界模拟、ClamAV 批量复核、capa 程序能力分析和 REA PE 导入分析。VBA 继续提取源码、MacroRaptor 标记及 pcodedmp 编译指令。复杂分析只针对筛选后的未解决候选文件，不逐文件启动全部引擎。
 
@@ -42,13 +42,13 @@ Windows 蠕虫检测与原位恢复工具，当前版本为 **1.8.1**。针对�
 
 ## 软件更新
 
-发行版启动约 3.5 秒后自动检查正式 Release；也可点击侧栏“检查更新”。发现新版后确认下载，校验通过后确认安装。程序退出后在原路径替换并重启，旧程序保留为同目录备份。下载失败、内容被修改或发布签名不正确时拒绝安装；替换或启动失败时尝试恢复旧程序。
+发行版启动约 3.5 秒后自动检查已签名发布版本；也可点击侧栏“检查更新”。发现新版后确认下载，校验通过后确认安装。程序退出后在原路径替换并重启，旧程序保留为同目录备份。下载失败、内容被修改或发布签名不正确时拒绝安装；替换或启动失败时尝试恢复旧程序。
 
-当前 uikixc/WormRecovery 是公开仓库，无需令牌即可检查和下载更新，并自动测试公共下载线路。仅在需要授权访问时使用“更新设置”；令牌应仅限本仓库并授予 Contents 只读权限，保存在当前 Windows 用户的凭据管理器，不写入程序、报告或更新任务，也不发送给公共加速站。离线设备仍可检测和恢复文件。
+无需令牌时，优先并行直连自用内网与公网更新服务，取得有效签名清单后即可返回；服务不可用时回退 GitHub。更新请求禁用系统及环境代理发现，不需要代理软件。自用服务下载不进行公共加速站测速，失败后再尝试备用线路。仅在需要授权访问时使用“更新设置”；令牌应仅限本仓库并授予 Contents 只读权限，保存在当前 Windows 用户的凭据管理器，不写入程序、报告或更新任务，也不发送给公共加速站。离线设备仍可检测和恢复文件。
 
 1.4.2 及以前的程序没有更新入口，首次需手动换成 1.5.0。后续版本才可通过新入口更新。单文件发行版包含内部更新执行组件，不需要把额外程序放在主程序旁边。
 
-下载包使用 Ed25519 发布签名和 SHA-256 校验；这是项目发布校验，不等同于 Windows Authenticode 签名。当前没有后台服务、定时任务或扫描期间的自动安装。公共加速站可能更换服务地址，程序每次下载以当前连通性和短传输测试选择线路，不承诺固定速度。
+下载包使用 Ed25519 发布签名和 SHA-256 校验；这是项目发布校验，不等同于 Windows Authenticode 签名。当前没有后台服务、定时任务或扫描期间的自动安装。自用更新服务的 HTTP 传输只接受固定地址与路径，拒绝重定向、不附加任何凭据；安装前必须验证固定公钥的 Ed25519 签名及完整文件 SHA-256。GitHub 备用下载仍可使用公共加速线路，不承诺固定速度。
 
 ### 发布维护
 
@@ -62,7 +62,7 @@ Windows 蠕虫检测与原位恢复工具，当前版本为 **1.8.1**。针对�
 
 线程数更多并不保证更快，实际效果取决于文件数量、磁盘延迟、系统缓存和解析开销。停止后取消尚未开始的工作，等待正在执行的读取返回，不将未完成扫描报告为完成。
 
-- 集成发行版需要 Windows 10 / 11 64 位系统。
+- 集成发行版需要 Windows 10 / 11 64 位系统及 .NET Framework 4.6.2 或更新版本。
 - 从源码运行或构建时需要 Python 3.12、Tcl/Tk 和离线组件；使用发行版无需自行安装。
 - 修复操作需要管理员权限。
 
@@ -123,14 +123,14 @@ python -m unittest discover -s tests -v
 
     python prepare_engine_assets.py --tool-root C:/Build/offline-engines --rea-root C:/Build/rea --database-root C:/Build/clamdb --destination build/engine-assets/engines
 
-运行时不下载依赖。新增源码包括 secondary_analysis.py（候选复核）、local_rules.py（内容规则）、engine_assets.py（引擎定位）、engine_process.py（进程生命周期）、prepare_engine_assets.py（组件准备）和 validate_offline_engines.py（真实引擎无害验证）。
+运行时不下载依赖。源码包括 family_analysis.py（家族内容判定与加密载体解析）、packed_content.py（有界压缩字节解码）、secondary_analysis.py（候选复核）、local_rules.py（内容规则）、engine_assets.py（引擎定位）、engine_process.py（进程生命周期）、prepare_engine_assets.py（组件准备）和 validate_offline_engines.py（真实引擎无害验证）。
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\python.exe
 ```
 
-最终交付文件为 `dist\WormRecovery.exe`。命令行与宏分析组件在构建中先生成到 `build\embedded`，再嵌入主程序的 `engines` 目录；用户只需复制最终主程序。运行时自动解包到临时工作目录，内部仍采用独立进程；单文件指交付方式，不表示执行期间不产生工作文件。命令行参数也可以传给同一个主程序，报告按原规则保存。分发构建需要在干净 Windows 环境中验证。
+最终交付文件默认为 `release\WormRecovery-1.8.2\WormRecovery.exe`；可通过 `-OutputDirectory` 指定独立版本目录。命令行与宏分析组件在构建中先生成到 `build\embedded`，再嵌入主程序的 `engines` 目录；用户只需复制最终主程序。发行主程序是 .NET Framework 启动器，内嵌完整运行时和引擎。首次展开到 ProgramData 的管理员专用内容缓存；分析进程独立运行，工作临时文件与只读缓存分开。构建拒绝覆盖目标目录内已有的 WormRecovery.exe，旧版 dist 保留。单文件指交付方式，不表示执行期间不产生工作文件。命令行参数也可以传给同一个主程序，报告按原规则保存。分发构建需要在干净 Windows 环境中验证。
 
 ## 源码结构
 
@@ -141,6 +141,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Python .\.venv\Scripts\pyt
 | `device_scope.py` | 物理设备识别和扫描范围管理 |
 | `reparse_scan.py` | 重解析点解析和目标检查 |
 | `worm_residue.py` | 已确认家族残留指纹和精确路径匹配 |
+| `family_analysis.py`、`packed_content.py`、`local_rules.py` | 内容特征、静态解包解密及同目录加载链判定 |
 | `scan_concurrency.py` | 有界扫描队列、物理磁盘识别与并发限制 |
 | `office_triage.py` | 精确 Office 组件核对、未确认文件分类与处理建议 |
 | `office_structure.py` | OOXML 活动内容与结构检查 |

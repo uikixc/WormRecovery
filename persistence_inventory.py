@@ -14,7 +14,7 @@ function Get-ConsumerReference($item){
 $tasks=@(foreach($t in Get-ScheduledTask){foreach($a in $t.Actions){
   if($a.Execute){@{name=$t.TaskName;path=$t.TaskPath;execute=$a.Execute;arguments=$a.Arguments;working_directory=$a.WorkingDirectory;xml=(Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath)}}
 }});
-$services=@(Get-CimInstance Win32_Service | Select-Object Name,PathName,State,StartMode);
+$services=@(Get-CimInstance Win32_Service | Select-Object Name,PathName,State,StartMode,StartName,ServiceType);
 $commands=@(Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer | ForEach-Object {
   @{class='CommandLineEventConsumer';Name=$_.Name;command=($_.ExecutablePath+' '+$_.CommandLineTemplate);object_path=(Get-ConsumerReference $_)}
 });
@@ -42,9 +42,17 @@ def select_confirmed(inventory, confirm):
     selected = {'tasks': [], 'services': [], 'wmi': [],
                 'inventory_counts': {key: len(rows(inventory.get(key)))
                                      for key in ('tasks', 'services', 'wmi', 'filters', 'bindings')}}
+    selected_tasks={}
     for task in rows(inventory.get('tasks')):
         command = '"' + str(task.get('execute', '')).strip('"') + '" ' + str(task.get('arguments', ''))
         if confirm(command):
+            identity=(str(task.get('path','')).casefold(),str(task.get('name','')).casefold())
+            previous=selected_tasks.get(identity)
+            if previous is not None:
+                if previous.get('xml')!=task.get('xml'):
+                    raise ValueError('同一任务在枚举期间发生变化，请重新扫描。')
+                continue
+            selected_tasks[identity]=task
             selected['tasks'].append({**task, 'confirmed': True})
     for service in rows(inventory.get('services')):
         if confirm(service.get('PathName', '')):
@@ -93,3 +101,89 @@ $bindings=@(Get-CimInstance -Namespace root/subscription -ClassName __FilterToCo
 foreach($binding in $bindings){Remove-CimInstance -InputObject $binding -ErrorAction Stop};
 Remove-CimInstance -InputObject $item -ErrorAction Stop
 """
+
+
+def _expected_script(record, required):
+    if any(not isinstance(record.get(key),str) or not record[key] for key in required):
+        raise ValueError('持久化身份或内容证据不完整，已停止修改。')
+    payload=base64.b64encode(json.dumps(record,ensure_ascii=False).encode('utf-8')).decode('ascii')
+    return "$ErrorActionPreference='Stop';$expected=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"+payload+"'))|ConvertFrom-Json;\n"
+
+
+def disable_task_script(task):
+    """Bind disabling to the task identity and exact exported definition."""
+    return _expected_script(task,('name','path','xml'))+r"""
+$items=@(Get-ScheduledTask | Where-Object {$_.TaskName -ceq $expected.name -and $_.TaskPath -ceq $expected.path});
+if($items.Count -ne 1){throw 'Scheduled task identity changed'};
+$item=$items[0];
+$xml=Export-ScheduledTask -InputObject $item;
+if($xml -cne $expected.xml){throw 'Scheduled task definition changed'};
+Disable-ScheduledTask -InputObject $item -ErrorAction Stop | Out-Null
+"""
+
+
+def disable_service_script(service):
+    """Recheck the observed service configuration and disable before stopping."""
+    return _expected_script(service,('Name','PathName','StartName','ServiceType'))+r"""
+function Confirm-ServiceSnapshot {
+  $items=@(Get-CimInstance Win32_Service | Where-Object {$_.Name -ceq $expected.Name});
+  if($items.Count -ne 1){throw 'Service identity changed'};
+  $item=$items[0];
+  if($item.PathName -cne $expected.PathName -or $item.StartName -cne $expected.StartName -or $item.ServiceType -cne $expected.ServiceType){throw 'Service configuration changed'};
+  return $item
+};
+$item=Confirm-ServiceSnapshot;
+$changed=Invoke-CimMethod -InputObject $item -MethodName Change -Arguments @{StartMode='Disabled'} -ErrorAction Stop;
+if($changed.ReturnValue -ne 0){throw ('Service disable failed: '+$changed.ReturnValue)};
+$item=Confirm-ServiceSnapshot;
+$stopped=Invoke-CimMethod -InputObject $item -MethodName StopService -ErrorAction Stop;
+if($stopped.ReturnValue -notin @(0,6)){throw ('Service stop failed: '+$stopped.ReturnValue)}
+"""
+
+
+def _task_definition(xml):
+    """Compare every definition field except the expected Enabled transition."""
+    from xml.etree import ElementTree as ET
+    root=ET.fromstring(xml)
+    for settings in root.findall('./{*}Settings'):
+        for enabled in settings.findall('./{*}Enabled'):
+            settings.remove(enabled)
+    def tree(element):
+        return (element.tag,tuple(sorted(element.attrib.items())),(element.text or '').strip(),
+                tuple(tree(child) for child in element))
+    return tree(root)
+
+
+def reconcile_snapshot(inventory,selected,snapshot):
+    """Keep exact previously proven entries visible after their payload is gone.
+
+    An identity whose definition changed is unresolved, never automatically
+    authorized from its old content. Absence is only concluded from a successful
+    complete inventory supplied by the caller.
+    """
+    snapshot=snapshot or {}
+    selected={**selected,**{key:list(selected.get(key,[])) for key in ('tasks','services','wmi')},'snapshot_changes':[]}
+    identities={'tasks':('path','name'),'services':('Name',),'wmi':('class','Name')}
+    fields={'tasks':('execute','arguments','working_directory'),
+            'services':('PathName','StartName','ServiceType'),'wmi':('object_path','command','script_text')}
+    for kind,keys in identities.items():
+        identity=lambda row:tuple(str(row.get(key,'')) for key in keys)
+        for old in rows(snapshot.get(kind)):
+            if not old.get('confirmed'):continue
+            candidates=[row for row in rows(inventory.get(kind)) if tuple(v.casefold() for v in identity(row))==tuple(v.casefold() for v in identity(old))]
+            if not candidates:continue
+            # Tasks expose one row per action; compare the full XML as well.
+            matches=[]
+            for current in candidates:
+                valid=identity(current)==identity(old) and all(str(current.get(key,'') or '')==str(old.get(key,'') or '') for key in fields[kind])
+                if valid and kind=='tasks':
+                    try:valid=_task_definition(current.get('xml',''))==_task_definition(old.get('xml',''))
+                    except (ValueError,TypeError):valid=False
+                if valid:matches.append(current)
+            if not matches or kind!='tasks' and len(candidates)!=1:
+                selected['snapshot_changes'].append({'kind':kind,'identity':dict(zip(keys,identity(old))),
+                    'reason':'Previously confirmed persistence changed; current definition requires review.'})
+                continue
+            if not any(identity(row)==identity(old) for row in selected[kind]):
+                selected[kind].append({**matches[0],'confirmed':True,'confirmation_basis':'exact_pre_repair_snapshot'})
+    return selected

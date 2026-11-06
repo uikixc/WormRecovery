@@ -51,8 +51,10 @@ output.write_text(json.dumps({'windowless': w.WINDOWLESS, 'parser': VBA_Parser._
         cleaner.errors=[]
         cleaner.add=lambda kind,path,**info:cleaner.findings.append({'kind':kind,'path':path,**info})
         cleaner.error=lambda path,error,details=None:cleaner.errors.append({'path':path,'error':error,'error_details':details})
-        with patch.object(w,'office_check',return_value={'status':'review','analysis_error':True,'reason':'fixture failure'}):
-            cleaner.scan_file('C:/fixture.xlsm',None)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'fixture.xlsm';path.write_bytes(b'inert parser-failure input')
+            with patch.object(w,'office_check',return_value={'status':'review','analysis_error':True,'reason':'fixture failure'}):
+                cleaner.scan_file(path,path.stat())
         self.assertTrue(cleaner.inspection_failed)
         self.assertEqual(cleaner.findings[0]['kind'],'review_office')
         self.assertEqual(len(cleaner.errors),1)

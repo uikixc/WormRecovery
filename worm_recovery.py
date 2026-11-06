@@ -12,10 +12,11 @@ import psutil
 from windows_read import open_read,extended_path
 from office_triage import assess_office,is_confirmed
 from office_structure import inspect_package, attach_evidence
-from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
+from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_paths,
+    disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.1'
+VERSION = '1.8.2'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -38,7 +39,8 @@ EXE_EXTS = {'.exe', '.dll', '.scr', '.cpl', '.com', '.ocx', '.sys'}
 OFFICE_EXTS = {'.xlsx','.xlsm','.xlam','.xlsb','.xltm','.docx','.docm','.dotm','.pptx','.pptm','.ppam','.xls','.doc','.ppt'}
 CRITICAL_PROCESSES = {'system','registry','smss.exe','csrss.exe','wininit.exe','winlogon.exe',
     'services.exe','lsass.exe','svchost.exe','msmpeng.exe','mssense.exe','codex.exe','openai.exe'}
-HERE = pathlib.Path(sys.executable if getattr(sys,'frozen',False) else __file__).resolve().parent
+from runtime_identity import application_path
+HERE = (application_path() if getattr(sys,'frozen',False) else pathlib.Path(__file__).resolve()).parent
 kernel = ctypes.WinDLL('kernel32', use_last_error=True)
 kernel.GetCurrentProcess.argtypes=[];kernel.GetCurrentProcess.restype=W.HANDLE
 kernel.GetFileAttributesW.argtypes=[W.LPCWSTR];kernel.GetFileAttributesW.restype=W.DWORD
@@ -169,8 +171,8 @@ class PEView:
             if va<=rva and rva+n<=va+rs:return rp+rva-va
         raise ValueError('unmapped PE RVA')
     def known_stub(self):
-        s=self.sections[0]
-        return self.machine==0x14c and self.n==8 and self.entry==0x9ab80 and s[0]==b'CODE' and s[3]==629760 and hashlib.sha256(self.read(s[4],s[3])).hexdigest()==STUB_CODE_SHA256
+        return self.machine==0x14c and any(s[3]==629760 and
+            hashlib.sha256(self.read(s[4],s[3])).hexdigest()==STUB_CODE_SHA256 for s in self.sections)
     def resource(self,wanted):
         if not self.res_rva or not self.res_size:return None
         base=self.rva(self.res_rva);found=[];budget=[0]
@@ -214,7 +216,7 @@ def is_stub(path,strict=False,data=None):
             if off>1024*1024:return False
             f.seek(off);h=f.read(512)
             if h[:4]!=bytes.fromhex('50450000') or len(h)<256:return False
-            if struct.unpack_from('<H',h,4)[0]!=0x14c or struct.unpack_from('<H',h,6)[0]!=8 or struct.unpack_from('<I',h,40)[0]!=0x9ab80:return False
+            if struct.unpack_from('<H',h,4)[0]!=0x14c:return False
         with PEView(path) as pe:return pe.known_stub()
     except OSError:
         if strict:raise
@@ -318,14 +320,9 @@ def sanitized_xlsx(source,dest):
         for name in names:
             if name in removed:continue
             b=src.read(name)
-            if name=='[Content_Types].xml':
-                b=re.sub(rb'<(?:\w+:)?Override\b[^>]*\bPartName="/?(?:xl/)?vba[^\"]*"[^>]*/>',b'',b,flags=re.I)
-                b=b.replace(b'application/vnd.ms-excel.sheet.macroEnabled.main+xml',b'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml')
-            elif name.endswith('.rels'):
-                b=re.sub(rb'<(?:\w+:)?Relationship\b(?=[^>]*\bType="[^\"]*/vba(?:Project|ProjectSignature|Data)")[^>]*/>',b'',b,flags=re.I)
-            elif name=='xl/workbook.xml':
-                b=re.sub(rb'(<(?:\w+:)?sheet\b[^>]*?)\s+state="(?:hidden|veryHidden)"',rb'\1',b)
-                b=re.sub(rb'\b(?:activeTab|firstSheet)="\d+"',lambda m:m[0].split(b'=')[0]+b'="0"',b)
+            if name=='[Content_Types].xml' or name.endswith('.rels') or name=='xl/workbook.xml':
+                from office_repair_xml import rewrite
+                b=rewrite(name,b,removed)
             changes[name]=b
             if b==src.read(name):before[name]=hashlib.sha256(b).hexdigest()
         with zipfile.ZipFile(dest,'x',compression=zipfile.ZIP_DEFLATED) as out:
@@ -338,6 +335,8 @@ def sanitized_xlsx(source,dest):
                 if hashlib.sha256(check.read(name)).hexdigest()!=h:raise ValueError('非目标工作簿成员发生变化：'+name)
             for name in check.namelist():
                 if name.endswith(('.xml','.rels')):ET.fromstring(check.read(name))
+            from office_repair_xml import validate_relationships
+            validate_relationships(check)
             for name in names:
                 if name.startswith('xl/worksheets/') and name.endswith('.xml') and check.read(name)!=src.read(name):raise ValueError('工作表内容校验不一致。')
     return {'unchanged_parts':len(before),'removed_parts':sorted(removed),'worksheet_bytes_preserved':True}
@@ -389,50 +388,130 @@ def lock_holders(path):
         if result!=234 or not 0<needed.value<1024:return []
         rows=(INFO*needed.value)();count.value=needed.value
         if rm.RmGetList(session,ctypes.byref(needed),ctypes.byref(count),rows,ctypes.byref(reasons)):return []
-        return [x.process.pid for x in rows[:count.value]]
+        return [{'pid':x.process.pid,'created':((x.process.start.dwHighDateTime<<32)|x.process.start.dwLowDateTime)/10000000-11644473600}
+                for x in rows[:count.value]]
     finally:rm.RmEndSession(session)
+
+def autoit_companion_path(path):
+    p=pathlib.Path(path);stem=p.stem
+    if stem.casefold().startswith('._cache_'):stem=stem[len('._cache_'):]
+    return p.with_name(stem+'.a3x')
+
+
+def autoit_companion(path):
+    """An interpreter hash is not malicious; require its exact paired script."""
+    candidate=autoit_companion_path(path)
+    try:
+        if candidate.is_file() and not file_attributes(candidate)&0x400 and digest_file(candidate)==AUTOIT_A3X_SHA256:
+            return {'path':str(candidate),'sha256':AUTOIT_A3X_SHA256}
+    except OSError:pass
+    return None
 
 def inspect_file_content(path,st):
     """Read-only detector; return data without mutating Cleaner or UI state."""
     result={'office':0,'findings':[]}
     def add(kind,path,**detail):result['findings'].append({'kind':kind,'path':str(path),'size':getattr(st,'st_size',None),**detail})
     name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
-    if name.startswith('~$') and not name.startswith('~$cache'):return result
-    if ext in EXE_EXTS or name.startswith(('~$cache','._cache_')):
-        data=None
-        if st.st_size<=16*1024*1024:
-            with open_read(path) as stream:data=stream.read(st.st_size+1)
+    # Every selected file reaches a bounded header probe, even with a misleading
+    # extension. Do not follow a name/extension allowlist before reading magic.
+    from family_analysis import MAX_INPUT,MAX_CARRIER,inspect as inspect_family
+    data=None
+    with open_read(path) as stream:
+        prefix=stream.read(min(128,st.st_size+1))
+        packed_zip=prefix.startswith(b'PK\x03\x04');png=prefix.startswith(b'\x89PNG\r\n\x1a\n')
+        office_container=False;encrypted_project=False
+        archive_probe=None
+        if packed_zip:
+            from carrier_probe import zip_directory
+            archive_probe=zip_directory(stream,st.st_size)
+            office_container=archive_probe.get('office',False)
+            encrypted_project=archive_probe.get('encrypted_project',False)
+            stream.seek(len(prefix))
+        from carrier_probe import png_candidate
+        program=prefix.startswith(b'MZ') or (ext in EXE_EXTS or name.startswith(('~$cache','._cache_'))) and not (packed_zip or png)
+        carrier=png and png_candidate(prefix) or encrypted_project
+        script=ext in ('.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf','.lua')
+        if program and st.st_size<=MAX_INPUT or (carrier or script) and st.st_size<=MAX_CARRIER:
+            data=prefix+stream.read(max(0,st.st_size+1-len(prefix)))
             if len(data)!=st.st_size:raise ValueError('检查时文件大小发生变化，请重新扫描。')
+    result['engine_checks']={'file_header':1}
+    if archive_probe and archive_probe['status']!='complete':
+        result['engine_checks']['archive_directory_limited']=1
+    def family(data,rules=None):
+        analysis=inspect_family(data,rules);result['engine_checks']['family_static']=1
+        if analysis.get('role'):
+            result['family_observations']=[{'path':str(path),'role':analysis['role'],'sha256':analysis['source_sha256']}]
+        if analysis['status']=='detected':
+            names=sorted({hit['family'] for hit in analysis['detections']})
+            # Infection code in an unusual PE layout still requires the
+            # original-program recovery path. Never quarantine its entire host
+            # as an independent miner merely because the wrapper parser failed.
+            if any(h['signature']=='WR_Synaptics_Code_Section' for h in analysis['detections']):
+                add('infected_executable',path,family='Synaptics',family_analysis=analysis,
+                    reason='已确认感染代码；文件布局需在恢复前重新核对原程序资源。',
+                    action='使用程序恢复流程；结构无法验证时保留整份原文件。')
+                return True
+            add('malware_component',path,sha256=analysis['source_sha256'],family=' / '.join(names),
+                assessment='confirmed_malicious_code',family_analysis=analysis,
+                reason='已确认恶意代码特征：'+'、'.join(hit['signature'] for hit in analysis['detections']),
+                action='处理时复核内容指纹并保留隔离副本；不按名称删除目录。')
+            return True
+        if analysis['status']=='incomplete':
+            add('review_binary',path,family_analysis=analysis,reason=analysis['reason'],
+                action='保留原件；静态解码未完成不等于已确认感染。')
+            return True
+        return False
+    if program:
         if is_stub(path,strict=True,data=data):
             with PEView(path) as pe:original=pe.resource('EXERESX')
-            add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None)
+            result['engine_checks']['family_static']=1
+            add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None,
+                family='Synaptics',reason='感染代码节完整指纹与已确认的蠕虫感染器一致。',
+                family_analysis={'engine':'WormRecovery static family analysis','status':'detected',
+                    'ruleset_version':__import__('local_rules').RULESET_VERSION,'name_used_for_verdict':False,'target_execution':False,
+                    'detections':[{'signature':'WR_Synaptics_Code_Section','family':'Synaptics',
+                                   'basis':'exact_infection_code_section','section_sha256':STUB_CODE_SHA256}]})
         elif st.st_size==15360 and (hashlib.sha256(data).hexdigest() if data is not None else digest_file(path))==HOOK_SHA256:add('worm_hook',path,sha256=HOOK_SHA256)
-        elif name.startswith('._cache_') and st.st_size==750320 and (hashlib.sha256(data).hexdigest() if data is not None else digest_file(path))==AUTOIT_EXE_SHA256:add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256)
-        elif st.st_size<=16*1024*1024:
+        elif st.st_size==750320 and (hashlib.sha256(data).hexdigest() if data is not None else digest_file(path))==AUTOIT_EXE_SHA256:
+            companion=autoit_companion(path)
+            if companion:add('worm_runtime',path,sha256=AUTOIT_EXE_SHA256,related_evidence=[companion],
+                reason='解释器内容指纹与其实际配套脚本内容共同确认已知恶意部署。')
+            else:result['engine_checks']['recognized_autoit_runtime_without_malicious_companion']=1
+        elif data is not None:
             from local_rules import scan_bytes
-            rules=scan_bytes(data);result['engine_checks']={'yara_x':1}
-            if rules['matches']:add('review_binary',path,reason='程序内容命中家族组合规则，正在执行离线复核。',content_rules=rules)
+            rules=scan_bytes(data);result['engine_checks']['yara_x']=1
+            if not family(data,rules) and rules['matches']:add('review_binary',path,reason='程序内容命中家族组合规则，正在执行离线复核。',content_rules=rules)
+        else:
+            result['engine_checks']['family_size_limited']=1
+            add('review_binary',path,reason='程序超过静态家族检查大小上限，完整内容未检查。')
+    elif carrier:
+        if data is not None:family(data)
+        else:
+            result['engine_checks']['family_size_limited']=1
+            add('review_binary',path,reason='载体超过静态家族检查大小上限，完整内容未检查。')
     elif ext=='.a3x':
         if digest_file(path)==AUTOIT_A3X_SHA256:add('worm_script',path,sha256=AUTOIT_A3X_SHA256)
         else:add('review_autoit',path,reason='未识别脚本已保留，需进一步核查。')
-    elif ext in ('.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf') and st.st_size<=4*1024*1024:
+    elif script and data is not None:
         from local_rules import scan_bytes
-        with open_read(path) as stream:rules=scan_bytes(stream.read())
-        result['engine_checks']={'yara_x':1}
-        if rules['matches']:add('review_script',path,reason='本地组合规则命中，正在执行离线复核。',content_rules=rules)
+        rules=scan_bytes(data);result['engine_checks']['yara_x']=1
+        if not family(data,rules) and rules['matches']:add('review_script',path,reason='本地组合规则命中，正在执行离线复核。',content_rules=rules)
+    elif script:
+        result['engine_checks']['family_size_limited']=1
+        add('review_script',path,reason='脚本超过静态家族检查大小上限，完整内容未检查。')
     elif ext=='.lnk' and st.st_size<1024*1024:
         link=shortcut(path)
         if link and link.get('malicious'):add('malicious_shortcut',path,shortcut=link)
         elif link and link.get('av_placeholder') and payload_root(path) and norm(os.path.dirname(path))==norm(payload_root(path)):
             fingerprint=digest_file(path)
             if fingerprint in QUARANTINE_LINK_HASHES:add('worm_residue',path,sha256=fingerprint,reason='已确认家族目录内的已知隔离提示快捷方式。')
-    elif ext in OFFICE_EXTS:
+    elif ext in OFFICE_EXTS or office_container:
         result['office']=1;info=office_check(path)
         analysis=info.get('macro_analysis',{});checks={}
         if analysis.get('source_sha256'):checks['vba_source_analysis']=1
         if analysis.get('pcode_status')=='instructions_read':checks['vba_pcode']=1
         if analysis.get('content_rules'):checks['yara_x']=1
-        if checks:result['engine_checks']=checks
+        if checks:result['engine_checks'].update(checks)
         if info['status']=='infected':add('infected_office',path,**info)
         elif info['status']=='info':add('info_office',path,**info)
         elif info['status']=='review':
@@ -455,6 +534,7 @@ class Cleaner:
         self.quarantine=self.run/'quarantine';self.quarantine.mkdir();self.events=[];self.findings=[];self.errors=[]
         tool_scope=pathlib.Path(sys.executable) if getattr(sys,'frozen',False) else HERE
         self.protected=[tool_scope,self.run.parent,*map(pathlib.Path,protected)]
+        if getattr(sys,'frozen',False):self.protected.append(application_path())
         if getattr(sys,'_MEIPASS',None):self.protected.append(pathlib.Path(sys._MEIPASS))
         if os.environ.get('WORMRECOVERY_WORK_ROOT'):self.protected.append(pathlib.Path(os.environ['WORMRECOVERY_WORK_ROOT']))
         from engine_assets import engine_root
@@ -502,10 +582,63 @@ class Cleaner:
                 if extension=='.a3x' and digest_file(path)==AUTOIT_A3X_SHA256:return True
                 if extension=='.lnk' and (shortcut(path) or {}).get('malicious'):return True
                 if extension in ('.exe','.com','.scr') and is_stub(path):return True
+                if extension in ('.exe','.com','.scr') and self.content_confirmed_path(path):return True
             except (OSError,ValueError,struct.error):continue
         root=exact_startup_root(text)
         if root and self.root_residue_evidence(root):return True
         return False
+    def content_confirmed_path(self,path):
+        if self.protected_path(path):return False
+        self.policy.check(path)
+        if not os.path.isfile(path) or file_attributes(path)&0x400:return False
+        from family_analysis import MAX_INPUT,inspect as inspect_family
+        if os.path.getsize(path)>MAX_INPUT:return False
+        with open_read(path) as stream:data=stream.read(MAX_INPUT+1)
+        if inspect_family(data)['status']=='detected':return True
+        return any(row.get('kind')=='malware_deployment' and norm(row['path'])==norm(path)
+                   and self.confirmed_deployment(row) for row in [*getattr(self,'findings',[]),*(getattr(self,'initial_findings',None) or [])])
+    def confirmed_deployment(self,record):
+        from family_analysis import KNOWN_RUNTIME,MAX_INPUT,inspect as inspect_family
+        target=record['path']
+        if record.get('sha256')!=KNOWN_RUNTIME or digest_file(target)!=KNOWN_RUNTIME:return False
+        verified=[]
+        for peer in record.get('related_evidence',[]):
+            source=peer['path']
+            if norm(os.path.dirname(source))!=norm(os.path.dirname(target)) or norm(source)==norm(target):return False
+            self.policy.check(source)
+            if self.protected_path(source):return False
+            if os.path.isfile(source):
+                if file_attributes(source)&0x400:return False
+            else:
+                backup=next((event.get('backup') for event in reversed(self.events)
+                    if event.get('kind')=='quarantined' and norm(event['path'])==norm(source)
+                    and event.get('sha256')==peer['sha256']),None)
+                if not backup or not beneath(backup,self.quarantine):return False
+                source=backup
+            if os.path.getsize(source)>MAX_INPUT:return False
+            with open_read(source) as stream:data=stream.read(MAX_INPUT+1)
+            if hashlib.sha256(data).hexdigest()!=peer['sha256']:return False
+            result=inspect_family(data)
+            if result['status']!='detected':return False
+            verified.append({'path':peer['path'],'sha256':peer['sha256'],'family_analysis':result})
+        from family_analysis import correlate
+        return bool(correlate(verified,[{'path':target,'sha256':KNOWN_RUNTIME,'role':'observed_trueupdate_runtime'}]))
+    def recheck_deployment_observations(self):
+        """Use verified quarantine evidence if an exact runtime is regenerated."""
+        observed={(norm(row['path']),row.get('sha256')) for row in getattr(self,'family_observations',[])
+                  if row.get('role')=='observed_trueupdate_runtime'}
+        present={norm(row['path']) for row in self.findings if row.get('kind')=='malware_deployment'}
+        for original in (getattr(self,'initial_findings',None) or []):
+            if original.get('kind')!='malware_deployment' or norm(original['path']) in present:continue
+            if (norm(original['path']),original.get('sha256')) not in observed:continue
+            try:
+                if not self.confirmed_deployment(original):
+                    self.add('review_binary',original['path'],reason='原已确认部署运行时再次出现，但关联证据无法重新验证，原文件已保留。')
+                    continue
+                record=copy.deepcopy(original);kind=record.pop('kind');path=record.pop('path')
+                record['confirmation_basis']='current_runtime_and_verified_pre_repair_companions'
+                self.add(kind,path,**record);present.add(norm(path))
+            except (OSError,ValueError,KeyError) as ex:self.error(original['path'],ex)
     def startup_approved(self,base,prefix,name,branches,source):
         for branch in branches:
             sub=(prefix+'\\' if prefix else '')+r'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'+'\\'+branch
@@ -561,21 +694,32 @@ class Cleaner:
         if digest_file(dest)!=h or p.stat().st_size!=before.st_size or p.stat().st_mtime_ns!=before.st_mtime_ns:raise RuntimeError('备份期间源文件发生变化，操作已中止。')
         self.log('backup',path=str(p),backup=str(dest),sha256=h,attributes=file_attributes(p),mtime_ns=before.st_mtime_ns,size=before.st_size)
         return h,dest,before
-    def stop_pid(self,pid,reason):
+    def stop_pid(self,pid,reason,*,process=None,expected_created=None,expected_exe=None):
         if pid in (0,4,os.getpid()):raise PermissionError('不能终止关键系统进程或当前程序。')
-        p=psutil.Process(pid)
-        if p.name().casefold() in CRITICAL_PROCESSES:raise PermissionError('受保护进程不能自动终止：'+p.name())
-        self.log('terminate_process',pid=pid,name=p.name(),path=p.exe(),created=p.create_time(),reason=reason)
+        if process is None or process.pid!=pid or expected_created is None or not expected_exe:
+            raise PermissionError('进程身份不完整，已停止终止操作。')
+        p=process
+        if not p.is_running():raise psutil.NoSuchProcess(pid)
+        if abs(p.create_time()-expected_created)>0.00001 or norm(p.exe())!=norm(expected_exe):
+            raise PermissionError('进程身份已改变，已停止终止操作。')
+        if p.name().casefold() in CRITICAL_PROCESSES or self.protected_path(expected_exe):
+            raise PermissionError('受保护进程不能自动终止：'+p.name())
+        self.log('terminate_process',pid=pid,name=p.name(),path=expected_exe,created=expected_created,reason=reason)
         p.kill();p.wait(10)
     def close_locks(self,path):
         if not self.force_close:return
-        for pid in lock_holders(path):
-            try:self.stop_pid(pid,'User-authorized release of confirmed infected file '+str(path))
+        for holder in lock_holders(path):
+            try:
+                process=psutil.Process(holder['pid'])
+                self.stop_pid(holder['pid'],'User-authorized release of confirmed infected file '+str(path),
+                    process=process,expected_created=holder['created'],expected_exe=process.exe())
             except psutil.NoSuchProcess:pass
-    def quarantine_file(self,path,reason):
+    def quarantine_file(self,path,reason,expected=None):
         self.policy.mutation(path);p=pathlib.Path(path)
         if not p.exists():return
-        h,dest,st=self.backup(p);self.close_locks(p)
+        h,dest,st=self.backup(p)
+        if expected and h!=expected:raise RuntimeError('文件在复核后发生变化，未终止占用进程。')
+        self.close_locks(p)
         if digest_file(p)!=h:raise RuntimeError('隔离前源文件发生变化，操作已中止。')
         attrs=file_attributes(p);kernel.SetFileAttributesW(str(p),attrs&~1)
         p.unlink();self.log('quarantined',path=str(p),backup=str(dest),sha256=h,reason=reason)
@@ -600,7 +744,7 @@ class Cleaner:
         self.log('restored',path=str(p),sha256=digest_file(p))
     def contain(self,apply=False):
         hits=[]
-        for p in psutil.process_iter(['pid','name','exe','cmdline']):
+        for p in psutil.process_iter(['pid','name','exe','cmdline','create_time']):
             try:
                 if p.pid==os.getpid() or (p.info['name'] or '').casefold() in CRITICAL_PROCESSES:continue
                 exe=p.info['exe'];args=p.info['cmdline'] or [];cmd=' '.join(args)
@@ -616,9 +760,10 @@ class Cleaner:
                             autoit=True;break
                         root=exact_script_root(script)
                         if root and self.root_residue_evidence(root):autoit=True;break
-                if bad or autoit:
-                    rec={'pid':p.pid,'exe':exe,'cmdline':cmd,'family':'Synaptics' if bad else 'AutoIt'};hits.append(rec)
-                    if apply:self.stop_pid(p.pid,'Confirmed worm process')
+                content=not bad and not autoit and self.content_confirmed_path(exe)
+                if bad or autoit or content:
+                    rec={'pid':p.pid,'exe':exe,'cmdline':cmd,'family':'Synaptics' if bad else 'AutoIt' if autoit else 'Confirmed worm/miner code'};hits.append(rec)
+                    if apply:self.stop_pid(p.pid,'Confirmed worm process',process=p,expected_created=p.info.get('create_time'),expected_exe=exe)
             except (psutil.Error,OSError,ValueError) as ex:self.error('process:'+str(p.pid),ex)
         self.log('process_inspection',apply=apply,processes=hits);return hits
     def registry(self,apply=False):
@@ -644,14 +789,18 @@ class Cleaner:
                                 except OSError:break
                             for name,value,typ in values:
                                 text=str(value).casefold()
-                                confirmed=self.confirmed_command(value)
-                                bad=confirmed or ('googlechrome.a3x' in text or exact_startup_root(value) is not None)
+                                prior=next((r for r in (getattr(self,'registry_snapshot',None) or [])
+                                    if r.get('confirmed') and (r['hive'].casefold(),r['key'].casefold(),r['view'],r['name'].casefold())==(label.casefold(),sub.casefold(),view,name.casefold())),None)
+                                snapshot_match=bool(prior and prior['value']==value and prior['type']==typ)
+                                confirmed=self.confirmed_command(value) or snapshot_match
+                                bad=bool(prior) or confirmed or ('googlechrome.a3x' in text or exact_startup_root(value) is not None)
                                 if 'synaptics' in text:
                                     target=str(value).strip('"').split('"')[0]
                                     bad=bad or (os.path.isfile(target) and is_stub(target))
                                 if bad:
                                     rec={'hive':label,'key':sub,'view':view,'name':name,'value':value,'type':typ};hits.append(rec)
                                     rec['confirmed']=confirmed
+                                    if prior:rec['snapshot_status']='exact' if snapshot_match else 'changed_requires_review'
                                     if apply and rec['confirmed']:
                                         self.log('registry_backup',**rec)
                                         if winreg.QueryValueEx(key,name)!=(value,typ):raise RuntimeError('启动项已改变，请重新检测。')
@@ -669,15 +818,20 @@ class Cleaner:
         try:
             inventory=powershell(INVENTORY_SCRIPT)
             d=select_confirmed(inventory,self.confirmed_command)
+            if not apply:d=reconcile_snapshot(inventory,d,getattr(self,'persistence_snapshot',{}))
+            self.last_persistence=copy.deepcopy(d)
             self.log('persistence_inventory',counts=d['inventory_counts'],filters=inventory.get('filters',[]),bindings=inventory.get('bindings',[]))
             self.log('system_persistence',apply=apply,result=d)
             if apply:
                 for t in d.get('tasks',[]):
-                    if self.confirmed_command(str(t.get('execute',''))+' '+str(t.get('arguments',''))):
-                        powershell('Disable-ScheduledTask -TaskName '+psquote(t['name'])+' -TaskPath '+psquote(t['path'])+' | Out-Null');self.log('task_disabled',task=t)
+                    if self.confirmed_command('"'+str(t.get('execute','')).strip('"')+'" '+str(t.get('arguments',''))):
+                        self.log('task_disable_backup',task=t)
+                        powershell(disable_task_script(t));self.log('task_disabled',task=t)
                 for s in d.get('services',[]):
                     # Require the real engine fingerprint before changing a service.
-                    if self.confirmed_command(s['PathName']):powershell('Stop-Service -Name '+psquote(s['Name'])+' -Force; Set-Service -Name '+psquote(s['Name'])+' -StartupType Disabled');self.log('service_disabled',service=s)
+                    if self.confirmed_command(s['PathName']):
+                        self.log('service_disable_backup',service=s)
+                        powershell(disable_service_script(s));self.log('service_disabled',service=s)
                 for x in d.get('wmi',[]):
                     self.log('wmi_subscription_backup',consumer=x,filters=inventory.get('filters',[]),bindings=inventory.get('bindings',[]))
                     from persistence_inventory import remove_consumer_script
@@ -740,6 +894,9 @@ class Cleaner:
         for row in result.get('findings',[]):
             row=dict(row);kind=row.pop('kind');target=row.pop('path')
             self.add(kind,target,**row)
+        if result.get('family_observations'):
+            if not hasattr(self,'family_observations'):self.family_observations=[]
+            self.family_observations.extend(result['family_observations'])
         if result.get('error'):
             self.inspection_failed=True;self.error(path,result['error'],result.get('error_details'))
     def scan_file(self,path,st):
@@ -750,7 +907,7 @@ class Cleaner:
         roots=self.policy.fixed_roots() if roots is None else roots
         if not roots:raise ValueError('未指定有效扫描范围。')
         self.findings=[];self.count=0;self.dircount=0;self.scanned_office=0;self.skipped=[];self.reparse_points=[];start=time.monotonic()
-        self.engine_checks={};self.secondary_dispatch={'status':'not_started','candidates':0}
+        self.engine_checks={};self.secondary_dispatch={'status':'not_started','candidates':0};self.family_observations=[]
         self.scan_roots=list(map(os.path.abspath,roots))
         self.scan_active=True;self.scan_started=start;self.current_path='';self.last_progress=start;self.last_completed=start
         self.set_progress('files','正在遍历并检查文件')
@@ -782,9 +939,6 @@ class Cleaner:
             key=norm(path)
             if key in files_seen:return 'target_already_checked'
             files_seen.add(key);self.current_path=path
-            name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
-            if ext not in EXE_EXTS|OFFICE_EXTS|{'.a3x','.lnk','.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf'} and not name.startswith(('~$cache','._cache_')):
-                accept_file(path,{'office':0,'findings':[]},None);return 'target_checked'
             root=directory_volumes.get(norm(os.path.dirname(path)))
             if root is None:root=self.policy.check(path)['root']
             if root not in profiles:
@@ -873,6 +1027,10 @@ class Cleaner:
         self.scan_seconds=time.monotonic()-start;self.scan_active=False
         self.file_scan_seconds=self.scan_seconds
         if not self.cancel.is_set():
+            from family_analysis import correlate
+            for row in correlate(self.findings,self.family_observations):
+                kind=row.pop('kind');path=row.pop('path');self.add(kind,path,**row)
+            self.recheck_deployment_observations()
             from secondary_analysis import enrich_reviews
             enrich_reviews(self)
         self.scan_seconds=time.monotonic()-start
@@ -902,8 +1060,9 @@ class Cleaner:
                 if root.exists():kernel.SetFileAttributesW(str(root),attrs)
                 raise
             self.log('empty_payload_directory_removed',path=str(root))
-    def restore_executable(self,path):
-        p=pathlib.Path(path);self.policy.mutation(p);source_hash=digest_file(p);stage=p.with_name('.wormrepair-'+uuid.uuid4().hex+'.tmp');created=[]
+    def restore_executable(self,path,expected=None):
+        p=pathlib.Path(path);self.policy.mutation(p);source_hash=digest_file(p);created=[]
+        if expected and source_hash!=expected:raise ValueError('程序在复核后发生变化，原文件已保留。')
         try:
             current=p;layers=0
             while is_stub(current):
@@ -914,6 +1073,11 @@ class Cleaner:
                     if not res:raise ValueError('文件中未发现可验证原件，无法自动恢复。')
                     pe.extract_resource(res,nextstage)
                 current=nextstage;layers+=1
+            if not layers:raise ValueError('感染层结构未验证，原文件已保留。')
+            from family_analysis import MAX_INPUT,inspect as inspect_family
+            if current.stat().st_size>MAX_INPUT:raise ValueError('嵌入原件超过内容复核上限，原文件已保留。')
+            with open_read(current) as stream:original_analysis=inspect_family(stream.read(MAX_INPUT+1))
+            if original_analysis['status']!='no_known_match':raise ValueError('嵌入原件仍包含已知恶意代码或未完成解析，原文件已保留。')
             with PEView(current) as clean:
                 if clean.size<1024:raise ValueError('嵌入原件结构无效，无法自动恢复。')
             if digest_file(p)!=source_hash:raise RuntimeError('提取期间源文件发生变化，操作已中止。')
@@ -923,10 +1087,12 @@ class Cleaner:
         finally:
             for t in created:
                 if t.exists():t.unlink()
-    def restore_office(self,path):
+    def restore_office(self,path,expected=None):
         p=pathlib.Path(path);self.policy.mutation(p);check=office_check(p)
         if check['status']!='infected':raise ValueError('文档不再匹配检测指纹，请重新检测。')
-        h=digest_file(p);source_stat=p.stat();source_attrs=file_attributes(p);dest=p.with_suffix('.xlsx')
+        h=digest_file(p)
+        if expected and h!=expected:raise ValueError('文档在复核后发生变化，原文件已保留。')
+        source_stat=p.stat();source_attrs=file_attributes(p);dest=p.with_suffix('.xlsx')
         if dest!=p and dest.exists():raise FileExistsError('目标文件已存在，双方均已保留，需人工核查：'+str(dest))
         stage=p.with_name('.wormrepair-'+uuid.uuid4().hex+'.xlsx.tmp')
         try:
@@ -937,7 +1103,9 @@ class Cleaner:
                 validation={'historical_original':history,'worksheet_bytes_preserved':False}
             else:validation=sanitized_xlsx(p,stage)
             if digest_file(p)!=h:raise RuntimeError('修复期间文档发生变化，操作已中止。')
-            result_hash=digest_file(stage);self.backup(p);self.close_locks(p)
+            result_hash=digest_file(stage);backup_hash,_,_=self.backup(p)
+            if backup_hash!=h:raise RuntimeError('备份前文档发生变化，未终止占用进程。')
+            self.close_locks(p)
             if digest_file(p)!=h:raise RuntimeError('提交修复前文档发生变化，操作已中止。')
             if dest==p:self.replace(p,stage,expected=h)
             else:
@@ -968,9 +1136,40 @@ class Cleaner:
                 except FileNotFoundError:old,typ=None,winreg.REG_DWORD
                 self.log('security_setting_backup',key=sub,name=name,value=old,type=typ);winreg.SetValueEx(k,name,0,winreg.REG_DWORD,new)
         self.log('security_settings_repaired',macro_keys=changes)
+    def confirmed_autoit_runtime(self,record):
+        if digest_file(record['path'])!=AUTOIT_EXE_SHA256:return False
+        companion=str(autoit_companion_path(record['path']))
+        peers=record.get('related_evidence',[])
+        if len(peers)!=1 or norm(peers[0]['path'])!=norm(companion) or peers[0].get('sha256')!=AUTOIT_A3X_SHA256:return False
+        if self.protected_path(companion):return False
+        self.policy.check(companion)
+        if os.path.isfile(companion):
+            return not file_attributes(companion)&0x400 and digest_file(companion)==AUTOIT_A3X_SHA256
+        backup=next((event.get('backup') for event in reversed(self.events)
+            if event.get('kind')=='quarantined' and norm(event['path'])==norm(companion)
+            and event.get('sha256')==AUTOIT_A3X_SHA256),None)
+        return bool(backup and beneath(backup,self.quarantine) and digest_file(backup)==AUTOIT_A3X_SHA256)
+    def revalidate_finding(self,record,path):
+        """Require current byte evidence before any application lock release."""
+        before=digest_file(path)
+        if record.get('sha256') and before!=record['sha256']:
+            raise ValueError('检测后文件已改变，未终止占用进程，原文件已保留。')
+        if record['kind']=='malware_deployment':
+            valid=self.confirmed_deployment(record)
+        elif record['kind']=='worm_runtime':
+            valid=self.confirmed_autoit_runtime(record)
+        else:
+            fresh=inspect_file_content(path,path.stat())
+            valid=any(row['kind']==record['kind'] and is_confirmed(row) for row in fresh['findings'])
+        if not valid or digest_file(path)!=before:
+            raise ValueError('内容复核未通过，未终止占用进程，原文件已保留。')
+        return before
     def repair(self):
-        self.initial_findings=list(self.findings)
-        self.contain(True);self.registry(True);self.system_persistence(True);self.firewall(True)
+        self.initial_findings=copy.deepcopy(self.findings)
+        self.registry_snapshot=copy.deepcopy(self.registry(False))
+        self.persistence_snapshot=copy.deepcopy(self.system_persistence(False))
+        self.registry(True);self.system_persistence(True);self.firewall(True);self.contain(True)
+        self.log('containment_scope',reason='Persistence disabled before process containment; subsequent process checks reduce but cannot atomically prevent regeneration.')
         residue_roots=set()
         for rec in list(self.findings):
             if self.cancel.is_set():break
@@ -979,33 +1178,45 @@ class Cleaner:
             try:
                 if not p.exists():continue
                 self.policy.mutation(p)
+                expected=self.revalidate_finding(rec,p)
+                self.contain(True)
                 self.emit('正在修复：'+str(p))
-                # Only scan-confirmed items reach here; release exclusive locks
-                # before reopening and rechecking their fingerprints.
-                self.close_locks(p)
-                if kind=='infected_office':self.restore_office(p)
-                elif kind=='infected_executable' and not self.payload_path(p):self.restore_executable(p)
+                if kind=='infected_office':self.restore_office(p,expected=expected)
+                elif kind=='infected_executable':self.restore_executable(p,expected=expected)
                 elif kind=='malicious_shortcut':
                     if not shortcut(p).get('malicious'):raise ValueError('快捷方式已发生变化，请重新检测。')
                     self.shortcut_startup_approved(p)
-                    self.quarantine_file(p,'confirmed AutoIt shortcut')
+                    self.quarantine_file(p,'confirmed AutoIt shortcut',expected=expected)
                     candidate=p.with_suffix('')
                     if candidate.is_dir() and not self.payload_path(candidate) and not beneath(candidate,os.environ.get('WINDIR','C:/Windows')):
                         self.policy.mutation(candidate);a=file_attributes(candidate)
                         if a&6:self.log('attributes_backup',path=str(candidate),attributes=a);kernel.SetFileAttributesW(str(candidate),(a&~6) or 16)
-                elif kind in ('worm_payload','infected_executable'):
+                elif kind=='worm_payload':
                     if not is_stub(p):raise ValueError('载荷指纹已发生变化，请重新检测。')
-                    self.quarantine_file(p,kind)
+                    self.quarantine_file(p,kind,expected=expected)
                 elif kind=='worm_script':
                     if digest_file(p)!=AUTOIT_A3X_SHA256:raise ValueError('脚本已发生变化，请重新检测。')
-                    self.quarantine_file(p,kind)
+                    self.quarantine_file(p,kind,expected=expected)
                 elif kind in ('worm_runtime','worm_hook'):
                     expected=AUTOIT_EXE_SHA256 if kind=='worm_runtime' else HOOK_SHA256
                     if digest_file(p)!=expected:raise ValueError('组件指纹已发生变化，请重新检测。')
-                    self.quarantine_file(p,kind)
+                    if kind=='worm_runtime' and not self.confirmed_autoit_runtime(rec):raise ValueError('恶意配套脚本证据发生变化，解释器已保留。')
+                    self.quarantine_file(p,kind,expected=expected)
                 elif kind=='worm_residue':
                     if digest_file(p) not in QUARANTINE_LINK_HASHES:raise ValueError('残留文件指纹已改变，请重新检测。')
-                    self.quarantine_file(p,'confirmed family quarantine-link residue')
+                    self.quarantine_file(p,'confirmed family quarantine-link residue',expected=expected)
+                elif kind=='malware_component':
+                    if digest_file(p)!=rec['sha256']:raise ValueError('恶意组件内容已改变，请重新检测。')
+                    fresh=inspect_file_content(p,p.stat())
+                    if not any(r['kind']=='malware_component' and r['sha256']==rec['sha256'] for r in fresh['findings']):
+                        raise ValueError('恶意代码特征复核未通过，原文件已保留。')
+                    self.quarantine_file(p,'confirmed malicious code component',expected=expected)
+                elif kind=='malware_deployment':
+                    # A legitimate signed runtime is not deletion authority on
+                    # its own. Recheck all peer hashes before processing starts;
+                    # peers already quarantined retain their exact backup proof.
+                    if not self.confirmed_deployment(rec):raise ValueError('关联加载链已改变，运行时已保留。')
+                    self.quarantine_file(p,'content-proven malicious deployment runtime',expected=expected)
                 root=payload_root(p)
                 if root:residue_roots.add(root)
             except Exception as ex:self.error(p,ex)
@@ -1026,10 +1237,14 @@ class Cleaner:
                 enabled=ET.fromstring(x.get('xml','')).find('.//{*}Settings/{*}Enabled')
                 if enabled is None or (enabled.text or '').strip().casefold()!='false':active_tasks.append(x)
             except ET.ParseError:active_tasks.append(x)
-        active_services=[x for x in system.get('services',[]) if x.get('StartMode')!='Disabled' or x.get('State')=='Running']
+        active_services=[x for x in system.get('services',[]) if x.get('StartMode')!='Disabled' or x.get('State')!='Stopped']
         confirmed=[x for x in remaining if is_confirmed(x)]
         self.verification={'roots':roots,'remaining_confirmed':confirmed,'review_count':sum(x['kind'].startswith('review_') for x in remaining),'processes':processes,'registry':registry,'active_tasks':active_tasks,'active_services':active_services,'wmi':system.get('wmi',[]),'enabled_worm_firewall_rules':firewall,'new_errors':len(self.errors)-before_errors,'known_family_clear':not (confirmed or processes or registry or active_tasks or active_services or system.get('wmi',[]) or firewall or len(self.errors)>before_errors or self.cancel.is_set()),'coverage':'USB, research paths, and inaccessible locations excluded; no universal clean certification'}
-        self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.errors and not self.inspection_failed
+        self.verification['disabled_tasks']=[x for x in system.get('tasks',[]) if x not in active_tasks]
+        self.verification['disabled_services']=[x for x in system.get('services',[]) if x not in active_services]
+        self.verification['persistence_changes']=system.get('snapshot_changes',[])
+        self.verification['size_limited_files']=getattr(self,'engine_checks',{}).get('family_size_limited',0)
+        self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.errors and not self.inspection_failed and not self.verification['persistence_changes'] and not self.verification['size_limited_files']
         self.verification['unverified_links']=[r for r in getattr(self,'reparse_points',[]) if r.get('status') in ('unverified','error','pending')]
         self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.verification['unverified_links']
         self.verification['coverage']='Selected mounted volumes only; exclusions, reparse points, archives, offline hives and other malware families are not certified.'
@@ -1042,7 +1257,7 @@ class Cleaner:
         self.log('verification_complete',result=self.verification);self.save();return self.verification
     def save(self):
         summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'file_scan_seconds':getattr(self,'file_scan_seconds',None),'review_seconds':getattr(self,'review_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
-        summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
+        summary.update(registry_snapshot=getattr(self,'registry_snapshot',None),persistence_snapshot=getattr(self,'persistence_snapshot',None),scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
         summary['operation']=dict(getattr(self,'operation',{'type':'legacy_unclassified'}))
         summary['scan_timing']={'file_scan_seconds':getattr(self,'file_scan_seconds',None),'secondary_analysis_seconds':getattr(self,'review_seconds',None)}
         summary['scan_progress']=dict(self.progress)
@@ -1052,6 +1267,11 @@ class Cleaner:
         from engine_audit import build_audit
         summary['offline_analysis']={'versions':assets.get('versions',{}),'ruleset_version':RULESET_VERSION,'assets_available':bool(assets),'scope':'Content screening plus second-opinion analysis of unresolved candidates; no universal safety verdict',
             **build_audit(getattr(self,'engine_checks',{}),getattr(self,'secondary_dispatch',{'status':'not_started','candidates':0}),self.findings)}
+        summary['offline_analysis']['family_detection']={'source':'REA-reviewed code combinations compiled into offline rules',
+            'methods':['infection_code_section','xor32_nrv2e','encrypted_project_crc_and_loader_code','png_rc4_and_controller_code','content_proven_companion_correlation'],
+            'target_execution':False,'filename_used_as_verdict':False,'maximum_input_bytes':16*1024*1024,
+            'maximum_carrier_bytes':4*1024*1024,'size_limited_files':getattr(self,'engine_checks',{}).get('family_size_limited',0),
+            'scope':'Known observed families; bounded decoding is not universal unpacking or a clean certification.'}
         json_save(self.run/'report.json',summary);return summary
 
 def resolve_scan_scope(mode='internal',manual=None):

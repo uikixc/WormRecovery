@@ -37,6 +37,15 @@ class FakeCleaner:
 
 
 class ModernUITests(unittest.TestCase):
+    def test_confirmed_carrier_displays_decoding_basis(self):
+        record={'kind':'malware_component','path':'C:/fixture/anything.bin','reason':'已确认恶意代码',
+                'family_analysis':{'status':'detected','detections':[],
+                                   'decodings':[{'method':'png_prefix64_rc4'}]}}
+        self.app.result_records=[record];self.app.select_filter('confirmed')
+        self.app.tree.selection_set('0');self.app.selected()
+        self.assertIn('已匹配恶意代码组合特征',self.app.selected_path.get())
+        self.assertIn('已解密图片载荷',self.app.selected_path.get())
+
     def test_server_connection_button_checks_in_background_and_displays_route(self):
         result={'message':'日志服务器已连接 · 内网 · 上传授权有效。','routes':[
             {'route':'内网','endpoint':'http://10.205.103.120:10888','reachable':True,'authorization':'accepted','elapsed_ms':12},
