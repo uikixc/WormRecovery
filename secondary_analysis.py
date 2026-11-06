@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -168,16 +169,19 @@ def _parser_request(mode, path, timeout=25, cancel=None):
     return response['result']
 
 
-def pe_second_opinion(path, cancel=None, progress=lambda stage: None):
+def pe_second_opinion(path, cancel=None, progress=lambda stage: None, include_capabilities=True):
     """Capabilities and declarations are evidence, not maliciousness verdicts."""
     output = {}
     try:
         if cancel is not None and cancel.is_set():raise InterruptedError('离线分析已停止。')
-        progress('capa 程序能力分析')
-        executable = _tool('capa/capa.exe')
-        document = _json_command([executable, '-j', str(path)], timeout=25, cancel=cancel)
-        coverage = {'backend': 'auto', 'function_analysis': True}
-        output['capa'] = {'status': 'analyzed', 'capabilities': list(document.get('rules', {}))[:120], 'coverage': coverage}
+        if include_capabilities:
+            progress('capa 程序能力分析')
+            executable = _tool('capa/capa.exe')
+            document = _json_command([executable, '-j', str(path)], timeout=25, cancel=cancel)
+            coverage = {'backend': 'auto', 'function_analysis': True}
+            output['capa'] = {'status': 'analyzed', 'capabilities': list(document.get('rules', {}))[:120], 'coverage': coverage}
+        else:
+            output['capa']={'status':'not_requested','reason':'常规检测保留病毒库、内容规则与结构检查；可勾选深度能力分析，能力标签本身不作为病毒判定。'}
     except InterruptedError:raise
     except Exception as ex:
         output['capa'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
@@ -199,6 +203,20 @@ def pe_second_opinion(path, cancel=None, progress=lambda stage: None):
     return output
 
 
+def review_cache_key(row, generation, deep):
+    # Contextual Office decisions are always recomputed on the current row.
+    tasks=(row.get('kind'),sorted(x.get('kind','') for x in row.get('structural_evidence',[])),deep)
+    return (row['analysis_sha256'],generation,json.dumps(tasks,sort_keys=True))
+
+
+def complete_evidence(value):
+    if isinstance(value,dict):
+        if value.get('status') in ('incomplete','unsupported','cancelled','error','partial','unknown','failed'):return False
+        return all(complete_evidence(item) for item in value.values())
+    if isinstance(value,list):return all(complete_evidence(item) for item in value)
+    return True
+
+
 def enrich_reviews(cleaner):
     candidates = [row for row in cleaner.findings if row.get('kind', '').startswith('review_')]
     cleaner.secondary_dispatch={'candidates':len(candidates),'status':'cancelled' if cleaner.cancel.is_set() else 'not_needed' if not candidates else 'dispatched',
@@ -206,6 +224,11 @@ def enrich_reviews(cleaner):
     cleaner.log('secondary_dispatch',**cleaner.secondary_dispatch)
     if not candidates or cleaner.cancel.is_set():
         return
+    from local_rules import RULESET_VERSION
+    generation=hashlib.sha256(json.dumps({'assets':manifest(),'rules':RULESET_VERSION,'schema':1},sort_keys=True).encode()).hexdigest()
+    cache=getattr(cleaner,'_secondary_cache',None)
+    if cache is None:cache={};cleaner._secondary_cache=cache
+    deep=bool(getattr(cleaner,'deep_analysis',False))
     def phase(stage,path='',completed=0,timeout=None,total=None):
         state={'phase':'review','stage':stage,'path':str(path),'started':time.monotonic(),
                'completed':completed,'total':len(candidates) if total is None else total,'timeout':timeout}
@@ -278,13 +301,14 @@ def enrich_reviews(cleaner):
         if hasattr(cleaner,'save'):cleaner.save()
         try:
             from clamav_batch import batch_deadline
-            deadline=batch_deadline(len(pairs))
+            pending=[snapshot for row,snapshot in pairs if review_cache_key(row,generation,deep) not in cache]
+            deadline=batch_deadline(len(pending))
             phase('ClamAV 病毒库加载及批量复核',timeout=deadline)
             originals={str(snapshot):row['path'] for row,snapshot in pairs}
             def clam_progress(state):
                 names={'loading':'ClamAV 正在加载病毒库','scanning':'ClamAV 正在检查文件','result':'ClamAV 已返回文件结果'}
                 phase(names[state['stage']],originals.get(state['path'],''),state['completed'],deadline,total=state['total'])
-            clam, database = clam_batch([snapshot for _, snapshot in pairs], work, cancel=cleaner.cancel,progress=clam_progress)
+            clam, database = clam_batch(pending, work, cancel=cleaner.cancel,progress=clam_progress) if pending else ({},{})
         except Exception as ex:
             clam, database = {}, {}
             cleaner.inspection_failed = True
@@ -295,29 +319,37 @@ def enrich_reviews(cleaner):
             phase('正在执行文件内容规则',row['path'],index)
             cleaner.emit('正在复核：' + str(row['path']))
             evidence = {'clamav': clam.get(str(snapshot), {'status': 'incomplete'}), 'database': database}
+            cache_key=review_cache_key(row,generation,deep)
+            cached=cache.get(cache_key)
+            if cached is not None:
+                evidence=copy.deepcopy(cached)
+                evidence['reuse']={'status':'reused','scope':'same_scan_repair_session','sha256':row['analysis_sha256'],
+                                   'engine_generation':generation,'source_rehashed':True}
+            else:evidence['reuse']={'status':'executed','engine_generation':generation}
             if row.get('kind') == 'review_office':
                 evidence['office_parser'] = {'status': 'incomplete' if row.get('analysis_error') else 'analyzed',
                     'reason': row.get('reason') if row.get('analysis_error') else None}
                 if row.get('macro_analysis',{}).get('pcode_analysis',{}).get('status')=='incomplete':
                     evidence['vba_pcode']=row['macro_analysis']['pcode_analysis']
-            try:
-                evidence['yara_x'] = __import__('local_rules').scan_bytes(snapshot.read_bytes())
-            except Exception as ex:
-                evidence['yara_x'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
-            if row.get('kind') == 'review_autoit':
+            if cached is None:
+                try:
+                    evidence['yara_x'] = __import__('local_rules').scan_bytes(snapshot.read_bytes())
+                except Exception as ex:
+                    evidence['yara_x'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
+            if row.get('kind') == 'review_autoit' and cached is None:
                 try:
                     phase('AutoIt 静态解析',row['path'],index,25)
                     evidence['autoit'] = parser_request('autoit', snapshot, cancel=cleaner.cancel)
                 except Exception as ex:
                     evidence['autoit'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
             kinds = {x['kind'] for x in row.get('structural_evidence', [])}
-            if 'embedded_object' in kinds:
+            if 'embedded_object' in kinds and cached is None:
                 try:
                     phase('正在解析嵌入对象',row['path'],index,25)
                     from office_analysis import analyze_embedded_document
                     evidence['embedded_content']=analyze_embedded_document(snapshot.read_bytes())
                 except Exception as error:evidence['embedded_content']={'status':'incomplete','reason':str(error)[:700]}
-            if kinds & {'xlm_macro_sheet', 'auto_macro_name'}:
+            if kinds & {'xlm_macro_sheet', 'auto_macro_name'} and cached is None:
                 try:
                     phase('Excel XLM 宏复核',row['path'],index,25)
                     evidence['xlm'] = parser_request('xlm', snapshot, cancel=cleaner.cancel)
@@ -325,10 +357,10 @@ def enrich_reviews(cleaner):
                     evidence['xlm'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
             with snapshot.open('rb') as stream:
                 is_pe = stream.read(2) == b'MZ'
-            if is_pe and not cleaner.cancel.is_set():
+            if is_pe and not cleaner.cancel.is_set() and cached is None:
                 try:
                     evidence.update(pe_second_opinion(snapshot,cancel=cleaner.cancel,
-                        progress=lambda stage:phase(stage,row['path'],index,25)))
+                        progress=lambda stage:phase(stage,row['path'],index,25),include_capabilities=deep))
                 except InterruptedError:evidence['pe']={'status':'incomplete','reason':'用户已停止，程序分析未完成。'}
             if cleaner.cancel.is_set():evidence['cancelled']={'status':'incomplete','reason':'用户已停止，离线复核未完成。'}
             detected = evidence['clamav'].get('status') == 'detected'
@@ -336,6 +368,11 @@ def enrich_reviews(cleaner):
             failures = [name for name, value in evidence.items() if isinstance(value, dict) and value.get('status') in ('incomplete', 'unsupported')]
             evidence['status'] = 'detected' if detected else 'incomplete' if failures else 'suspicious' if rule_hits else 'no_known_match'
             row['secondary_analysis'] = evidence
+            if cached is None and complete_evidence(evidence) and not cleaner.cancel.is_set():
+                # Bound memory and never persist snapshots, paths or failed results.
+                if len(cache)>=256:cache.pop(next(iter(cache)))
+                cache[cache_key]=copy.deepcopy({key:value for key,value in evidence.items()
+                    if key not in ('office_parser','vba_pcode','reuse')})
             if detected:
                 row['assessment'] = 'engine_detected_requires_recovery'
                 row['reason'] = '离线 ClamAV 检出：' + '、'.join(evidence['clamav'].get('detections', []))

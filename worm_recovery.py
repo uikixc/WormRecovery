@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.4'
+VERSION = '1.8.5'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -705,7 +705,17 @@ class Cleaner:
                 try:self._active_pagefiles=active_pagefiles()
                 except OSError:self._active_pagefiles=set()
             record.update(describe_read_error(path,ex,self._active_pagefiles))
-        self.errors.append(record);self.log('error',**record)
+        stage=getattr(self,'_error_stage','scan')
+        record['scope']='repair_failed' if stage=='repair' else 'inspection_limit'
+        record['occurrences']=1;record['stages']={stage:1}
+        previous=next((item for item in self.errors if norm(item['path'])==norm(record['path'])
+                       and item['error']==record['error'] and item.get('scope')==record['scope']),None)
+        if previous is not None:
+            previous['occurrences']=previous.get('occurrences',1)+1
+            stages=previous.setdefault('stages',{});stages[stage]=stages.get(stage,0)+1
+            record=previous
+        else:self.errors.append(record)
+        self.log('error',**copy.deepcopy(record))
     def add(self,kind,path,**detail):
         record={'kind':kind,'path':str(path),**detail};self.findings.append(record)
         labels={'infected_office':'受感染文档','infected_executable':'受感染程序','worm_payload':'恶意载荷','worm_hook':'恶意组件','worm_runtime':'恶意缓存','worm_script':'恶意脚本','malicious_shortcut':'恶意快捷方式','worm_residue':'已确认家族残留','review_office':'待核查文档','review_autoit':'待核查脚本'}
@@ -929,6 +939,7 @@ class Cleaner:
     def scan_file(self,path,st):
         self.record_file_result(path,inspect_file_content(path,st))
     def scan(self,roots=None,workers=None):
+        self._error_stage='verification' if getattr(self,'_verification_active',False) else 'scan'
         from scan_concurrency import FileScanner,storage_profile
         from reparse_scan import inspect_reparse,resolve_target,CoverageLimit
         roots=self.policy.fixed_roots() if roots is None else roots
@@ -1107,7 +1118,14 @@ class Cleaner:
                 original_analysis=inspect_large_file(current,expected_stat=current.stat())
             else:
                 with open_read(current) as stream:original_analysis=inspect_family(stream.read(MAX_INPUT+1))
-            if original_analysis['status']!='no_known_match':raise ValueError('嵌入原件仍包含已知恶意代码或未完成解析，原文件已保留。')
+            if original_analysis['status']!='no_known_match':
+                self.log('executable_recovery_blocked',path=str(p),layers=layers,
+                         extracted_sha256=digest_file(current),extracted_bytes=current.stat().st_size,
+                         analysis=original_analysis,source_preserved=True)
+                state=original_analysis['status']
+                reason='嵌入原件检出已知恶意代码' if state=='detected' else '嵌入原件内容已识别但尚未建立安全恢复依据' if state=='identified' else '嵌入原件静态解析未完成'
+                detail=original_analysis.get('reason') or '、'.join(hit.get('signature','') for hit in original_analysis.get('detections',[]))
+                raise ValueError(reason+'（'+state+'）'+('：'+detail if detail else '')+'；原文件已保留。')
             with PEView(current) as clean:
                 if clean.size<1024:raise ValueError('嵌入原件结构无效，无法自动恢复。')
             if digest_file(p)!=source_hash:raise RuntimeError('提取期间源文件发生变化，操作已中止。')
@@ -1195,6 +1213,7 @@ class Cleaner:
             raise ValueError('内容复核未通过，未终止占用进程，原文件已保留。')
         return before
     def repair(self):
+        self._error_stage='repair'
         self.initial_findings=copy.deepcopy(self.findings)
         self.registry_snapshot=copy.deepcopy(self.registry(False))
         self.persistence_snapshot=copy.deepcopy(self.system_persistence(False))
@@ -1257,9 +1276,11 @@ class Cleaner:
         except Exception as ex:self.error('security_settings',ex)
         self.save()
     def verify(self):
-        before_errors=len(self.errors);roots=list(self.scan_roots)
+        before_errors=sum(row.get('occurrences',1) for row in self.errors);roots=list(self.scan_roots)
         workers=getattr(self,'scan_workers',None)
-        remaining=self.scan(roots,workers=workers) if workers is not None else self.scan(roots)
+        self._verification_active=True;self._error_stage='verification'
+        try:remaining=self.scan(roots,workers=workers) if workers is not None else self.scan(roots)
+        finally:self._verification_active=False
         processes=self.contain(False);registry=self.registry(False);system=self.system_persistence(False);firewall=[x for x in self.firewall(False) if x['enabled']=='True']
         active_tasks=[]
         for x in system.get('tasks',[]):
@@ -1269,8 +1290,12 @@ class Cleaner:
             except ET.ParseError:active_tasks.append(x)
         active_services=[x for x in system.get('services',[]) if x.get('StartMode')!='Disabled' or x.get('State')!='Stopped']
         confirmed=[x for x in remaining if is_confirmed(x)]
-        self.verification={'roots':roots,'remaining_confirmed':confirmed,'review_count':sum(x['kind'].startswith('review_') for x in remaining),'processes':processes,'registry':registry,'active_tasks':active_tasks,'active_services':active_services,'wmi':system.get('wmi',[]),'enabled_worm_firewall_rules':firewall,'new_errors':len(self.errors)-before_errors,'known_family_clear':not (confirmed or processes or registry or active_tasks or active_services or system.get('wmi',[]) or firewall or len(self.errors)>before_errors or self.cancel.is_set()),'coverage':'USB, research paths, and inaccessible locations excluded; no universal clean certification'}
+        new_errors=sum(row.get('occurrences',1) for row in self.errors)-before_errors
+        self.verification={'roots':roots,'remaining_confirmed':confirmed,'review_count':sum(x['kind'].startswith('review_') for x in remaining),'processes':processes,'registry':registry,'active_tasks':active_tasks,'active_services':active_services,'wmi':system.get('wmi',[]),'enabled_worm_firewall_rules':firewall,'new_errors':new_errors,'known_family_clear':not (confirmed or processes or registry or active_tasks or active_services or system.get('wmi',[]) or firewall or new_errors or self.cancel.is_set()),'coverage':'USB, research paths, and inaccessible locations excluded; no universal clean certification'}
         self.verification['disabled_tasks']=[x for x in system.get('tasks',[]) if x not in active_tasks]
+        self.verification['new_error_occurrences']=new_errors
+        self.verification['repair_failed_items']=sum(row.get('scope')=='repair_failed' for row in self.errors)
+        self.verification['inspection_limit_items']=sum(row.get('scope')!='repair_failed' for row in self.errors)
         self.verification['disabled_services']=[x for x in system.get('services',[]) if x not in active_services]
         self.verification['persistence_changes']=system.get('snapshot_changes',[])
         self.verification['size_limited_files']=getattr(self,'engine_checks',{}).get('family_size_limited',0)
@@ -1291,6 +1316,9 @@ class Cleaner:
         summary.update(registry_snapshot=getattr(self,'registry_snapshot',None),persistence_snapshot=getattr(self,'persistence_snapshot',None),scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
         summary['operation']=dict(getattr(self,'operation',{'type':'legacy_unclassified'}))
         summary['scan_timing']={'file_scan_seconds':getattr(self,'file_scan_seconds',None),'secondary_analysis_seconds':getattr(self,'review_seconds',None)}
+        summary['error_summary']={'unique_items':len(self.errors),'occurrences':sum(row.get('occurrences',1) for row in self.errors),
+            'repair_failed_items':sum(row.get('scope')=='repair_failed' for row in self.errors),
+            'inspection_limit_items':sum(row.get('scope')!='repair_failed' for row in self.errors)}
         summary['scan_progress']=dict(self.progress)
         from engine_assets import manifest
         from local_rules import RULESET_VERSION
@@ -1357,6 +1385,7 @@ def cli_main():
     parser.add_argument('--root',action='append',help='手动指定扫描位置；选择外接设备中的位置时包含同设备全部盘符')
     parser.add_argument('--scope',choices=['internal','removable'],default='internal',help='internal：本机全盘；removable：可移动设备')
     parser.add_argument('--workers',type=int,choices=range(1,9),metavar='1-8',help='只读文件扫描线程数；默认按物理磁盘自动选择')
+    parser.add_argument('--deep-analysis',action='store_true',help='同时执行耗时较长的 capa 能力分析；常规检测仍保留病毒库与内容规则')
     parser.add_argument('--report-dir',help='固定磁盘上的报告/隔离根目录')
     parser.add_argument('--force-close',action='store_true',default=True,help=argparse.SUPPRESS)
     parser.add_argument('--restore-history',action='store_true',default=True,help=argparse.SUPPRESS)
@@ -1367,6 +1396,7 @@ def cli_main():
     scope=resolve_scan_scope(args.scope,args.root)
     cleaner=Cleaner(args.report_dir,force_close=True,protected=args.exclude,restore_history=True,external_volumes=scope['external_volumes'],excluded_roots=scope['excluded_roots'])
     cleaner.scope_summary=scope
+    cleaner.deep_analysis=args.deep_analysis
     from operation_capture import execute
     def inspect_only():
         cleaner.contain(False);cleaner.registry(False);cleaner.system_persistence(False)

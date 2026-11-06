@@ -188,6 +188,10 @@ class ModernWindow:
             button=ttk.Button(row,text=title,style='Primary.TButton' if key=='internal' else 'Secondary.TButton',command=lambda k=key:self.choose_scope(k))
             button.pack(side='left',padx=(0,10));self.scope_buttons[key]=button
         tk.Label(setup,textvariable=self.scope_description,bg='white',fg=MUTED,font=(FONT,9),anchor='w',wraplength=820).pack(fill='x',pady=(7,2))
+        self.deep_analysis=tk.BooleanVar(value=False)
+        self.deep_analysis_option=ttk.Checkbutton(setup,text='深度能力分析（capa，耗时较长；常规检测已含病毒库与内容规则）',
+            variable=self.deep_analysis,style='Option.TCheckbutton')
+        self.deep_analysis_option.pack(anchor='w',pady=(5,0))
 
         actions=tk.Frame(main,bg=BG)
         actions.pack(fill='x')
@@ -334,17 +338,22 @@ class ModernWindow:
             secondary=record.get('secondary_analysis',{})
             if secondary:
                 names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA','office_parser':'Office 解析','vba_pcode':'VBA 编译缓存','embedded_content':'嵌入对象'}
-                statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','no_content':'文件为空，无可检查内容','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持'}
+                statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','no_content':'文件为空，无可检查内容','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持','not_requested':'未选择'}
                 text+='\n离线复核：'+'；'.join(names[k]+' '+statuses.get(v.get('status'), '已执行规则检查') for k,v in secondary.items() if k in names and isinstance(v,dict))
                 if secondary.get('clamav',{}).get('detections'):text+='\n检出名称：'+'、'.join(secondary['clamav']['detections'])
+                if secondary.get('reuse',{}).get('status')=='reused':text+='\n内容已重新校验 SHA-256；复用本次会话中相同引擎和规则已完成的分析。'
                 if record.get('analysis_incomplete_engines'):text+='\n未完成引擎：'+ '、'.join(record['analysis_incomplete_engines'])
                 for key in ('clamav','office_parser','vba_pcode','embedded_content','autoit','xlm','capa','rea'):
                     result=secondary.get(key,{})
                     if result.get('reason'):text+='\n'+names[key]+'：'+result['reason'][:220]
             self.selected_path.set(text)
+            if record.get('occurrences'):
+                self.selected_path.set(text+'\n异常分类：'+('修复失败' if record.get('scope')=='repair_failed' else '检查覆盖受限')+
+                    '；发生 '+str(record['occurrences'])+' 次；阶段：'+str(record.get('stages',{})))
 
     def set_busy(self,busy):
         self.busy=busy
+        self.deep_analysis_option.configure(state='disabled' if busy else 'normal')
         self.scan_button.configure(state='disabled' if busy else 'normal')
         self.clean_button.configure(state='normal' if not busy and self.scan_ready and self.has_confirmed() else 'disabled')
         self.stop_button.configure(state='normal' if busy else 'disabled')
@@ -372,6 +381,7 @@ class ModernWindow:
             if not messagebox.askokcancel('开始原位恢复',text,parent=self.root):return
         selected=self.scope.get().strip()
         scope_mode=self.scope_mode.get()
+        deep_analysis=self.deep_analysis.get()
         self.generation+=1
         generation=self.generation
         self.started=time.monotonic()
@@ -393,6 +403,7 @@ class ModernWindow:
                     scope=self.engine.resolve_scan_scope(mode=scope_mode,manual=[selected] if scope_mode=='manual' else None)
                     c=self.engine.Cleaner(emit=output,force_close=True,restore_history=True,external_volumes=scope['external_volumes'],excluded_roots=scope['excluded_roots'])
                     self.cleaner=c
+                    c.deep_analysis=deep_analysis
                     c.scope_summary=scope
                     if self.stop_requested.is_set():c.cancel.set()
                     output('扫描位置：'+'、'.join(scope['roots']))
@@ -402,6 +413,7 @@ class ModernWindow:
                     execute(c,'scan',inspect_only)
                 else:
                     c=self.cleaner
+                    c.deep_analysis=deep_analysis
                     c.cancel.clear();c.force_close=True;c.restore_history=True
                     def repair_and_verify():
                         c.repair()
@@ -492,14 +504,17 @@ class ModernWindow:
                     review_count=sum(r['kind'].startswith('review_') for r in c.findings)
                     info_count=sum(r['kind'].startswith('info_') for r in c.findings)
                     data_loss=sum(bool(r.get('data_integrity_issue')) for r in c.findings)
+                    failures=sum(row.get('scope')=='repair_failed' for row in c.errors)
+                    limits=len(c.errors)-failures
+                    error_text='修复失败 %s 项，检查受限 %s 项（共发生 %s 次，重复项已合并）'%(failures,limits,sum(row.get('occurrences',1) for row in c.errors))
                     if c.cancel.is_set():self.status.set('已停止');self.detail.set('已完成的文件事务已保存；重新扫描后再修复。')
                     elif payload=='scan':
                         self.status.set('检测完成')
-                        self.detail.set('确认感染 %s 项，未确认文件 %s 项，已自动归类说明 %s 项，检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
+                        self.detail.set('确认感染 %s 项，未确认文件 %s 项，分析说明 %s 项；'%(confirmed,review_count,info_count)+error_text+'。')
                     else:
                         complete=(getattr(c,'verification',None) or {}).get('known_family_clear',False)
-                        self.status.set('修复与复核完成' if complete else '已执行修复，存在未完成检查')
-                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；已自动归类说明 %s 项；检查异常 %s 项。'%(confirmed,review_count,info_count,len(c.errors)))
+                        self.status.set('修复与复核完成' if complete else '已执行修复，仍有确认感染' if confirmed else '已执行修复，存在未完成检查')
+                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；分析说明 %s 项；'%(confirmed,review_count,info_count)+error_text+'。')
                     if data_loss and not c.cancel.is_set():self.detail.set(self.detail.get()+' 其中 %s 份文件正文缺失，需要历史原件或备份。'%data_loss)
                     self.append_log('报告：'+str(c.run/'report.json'))
                     from engine_audit import dispatch_message

@@ -233,7 +233,8 @@ class ModernUITests(unittest.TestCase):
         texts=[]
         for widget in widgets(a.root):
             if 'text' in widget.keys():texts.append(str(widget.cget('text')))
-            self.assertNotIn('Checkbutton',widget.winfo_class())
+            if 'Checkbutton' in widget.winfo_class():self.assertIs(widget,a.deep_analysis_option)
+        self.assertFalse(a.deep_analysis.get())
         self.assertFalse(any('USB 样本' in t or '留空' in t for t in texts))
     def test_persistence_only_detection_allows_repair(self):
         self.app.cleaner=FakeCleaner(emit=lambda s:None)

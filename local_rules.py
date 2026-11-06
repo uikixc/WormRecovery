@@ -2,7 +2,7 @@
 import threading
 import itertools
 
-RULESET_VERSION = '2026.11.06.3'
+RULESET_VERSION = '2026.11.07.1'
 # Confirmed combinations require recovered code, not a pathname, miner keyword,
 # packer, signature publisher or a general-purpose API in isolation.
 CONFIRMED_CODE_RULES = {

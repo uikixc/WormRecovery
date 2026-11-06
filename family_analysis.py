@@ -43,17 +43,27 @@ class PE:
         self.headers=struct.unpack_from('<I',data,opt+60)[0]
         self.sections=[]
         self.code_ranges=[]
+        self.raw_aliases=[];raw_flags=[]
         for i in range(count):
             p=opt+optlen+i*40;vs,va,size,raw=struct.unpack_from('<IIII',data,p+8)
             if size and (raw<opt+optlen+count*40 or raw+size>len(data)):
                 raise ValueError('PE 节字节范围无效。')
             self.sections.append((va,size,raw,vs))
             flags=struct.unpack_from('<I',data,p+36)[0]
+            if size:raw_flags.append((raw,raw+size,flags,i))
             if flags&0x20000000 and size:self.code_ranges.append((raw,raw+size))
-        # Overlapping raw sections cannot establish unique image ownership.
-        ranges=sorted((raw,raw+size) for _,size,raw,_ in self.sections if size)
-        if any(end>right for (_,end),(right,_) in zip(ranges,ranges[1:])):
-            raise ValueError('PE 节范围重叠，无法确认代码归属。')
+        # Some installers alias read-only resource/relocation bytes. Such
+        # aliases cannot establish executable ownership and are recorded.
+        # Every pair is checked, including non-adjacent enclosing ranges.
+        def readonly_data(value):
+            return bool(value&0x40000000 and value&0x40) and not value&(0x20000000|0x80000000|0x20)
+        for left,(start,end,flags,index) in enumerate(raw_flags):
+            for other_start,other_end,other_flags,other_index in raw_flags[left+1:]:
+                if max(start,other_start)>=min(end,other_end):continue
+                if not readonly_data(flags) or not readonly_data(other_flags):
+                    raise ValueError('PE 节范围重叠，无法确认代码归属。')
+                self.raw_aliases.append({'sections':[index,other_index],'offset':max(start,other_start),
+                                         'bytes':min(end,other_end)-max(start,other_start),'scope':'readonly_nonexecutable_data'})
 
     def rva(self,value,length=1):
         if 0<=value and value+length<=min(self.headers,len(self.data)):return value
@@ -189,10 +199,12 @@ def _inspect(data,rules=None,*,mapped_pe=False):
     pe=None
     if data[:2]==b'MZ':
         try:pe=PE(data)
-        except (ValueError,struct.error):pass
+        except (ValueError,struct.error) as error:
+            result.update(status='incomplete',reason='PE 结构未完成验证：'+str(error))
     observed_rules=rules if rules is not None else scan_bytes(data)
     result['detections']=_hits(data,observed_rules)
     if pe:
+        if pe.raw_aliases:result['readonly_section_aliases']=pe.raw_aliases
         from tsco_analysis import identify
         tsco=identify(data,pe)
         result.update(tsco)
