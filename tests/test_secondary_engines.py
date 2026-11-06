@@ -97,7 +97,8 @@ class EngineResultTests(unittest.TestCase):
                 error=lambda *args:None,inspection_failed=False)
             def scan(paths,work,**kwargs):return {str(p):{'status':'no_match'} for p in paths},{}
             with patch.object(engines,'clam_batch',side_effect=scan):engines.enrich_reviews(cleaner)
-            self.assertTrue(any(p['timeout']==180 for p in phases))
+            from clamav_batch import batch_deadline
+            self.assertTrue(any(p['timeout']==batch_deadline(1) for p in phases))
             self.assertEqual(phases[-1]['completed'],1);self.assertEqual(phases[-1]['total'],1)
 
     def test_cancelled_batch_marks_every_unprocessed_candidate_incomplete(self):
@@ -141,8 +142,7 @@ class EngineResultTests(unittest.TestCase):
         self.assertEqual(self.clam_result('Heuristics.Limits.Exceeded.MaxFileSize FOUND', 1)['status'], 'incomplete')
 
     def test_clam_failed_exit_cannot_be_reported_clean(self):
-        with self.assertRaisesRegex(ValueError, '退出码'):
-            self.clam_result('engine failed ERROR', 2)
+        self.assertEqual(self.clam_result('engine failed ERROR',2)['status'],'incomplete')
 
     def test_capa_timeout_is_explicit_and_does_not_suppress_rea(self):
         rea = {'normalized_result': {'coverage': {'status': 'complete'}, 'imports': []}}

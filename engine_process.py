@@ -55,7 +55,7 @@ def _job(process):
     return kernel, handle
 
 
-def run(command, *, timeout, input=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=None, cancel=None):
+def run(command, *, timeout, input=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=None, cancel=None, on_poll=None):
     process = start(command, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
         stdout=stdout, stderr=stderr, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     kernel = handle = None
@@ -66,6 +66,7 @@ def run(command, *, timeout, input=None, stdout=subprocess.PIPE, stderr=subproce
         while True:
             if cancel is not None and cancel.is_set():
                 raise InterruptedError('离线分析已停止。')
+            if on_poll is not None:on_poll()
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, timeout)

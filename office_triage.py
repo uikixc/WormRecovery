@@ -61,6 +61,9 @@ def assess_office(path,result):
             return result
     if result.get('analysis_error'):
         result.update(assessment='analysis_incomplete',action='暂勿打开或启用宏；保留原件，查看解析错误并使用已更新的安全软件检查。')
+    elif result.get('macro_analysis',{}).get('pcode_analysis',{}).get('status')=='incomplete':
+        result.update(assessment='macro_cache_incomplete',reason='宏源码已读取；部分编译缓存缺少解码依据，已分别保留分析结果。',
+                      action='保留原件并保持宏禁用；查看编译缓存覆盖结果，不将缺少编译数据视为文件读取失败。')
     elif result.get('active_content_unresolved'):
         names={'xlm_macro_sheet':'Excel 4.0 宏表','auto_macro_name':'自动运行宏名称','embedded_object':'嵌入对象','activex':'ActiveX 控件','external_data':'外部数据连接','external_relationship':'外部内容关系','dde_field':'DDE 字段','external_book_link':'工作簿数据链接','external_executable_link':'DDE/OLE 外部执行连接'}
         types=list(dict.fromkeys(names.get(row['kind'],row['kind']) for row in result.get('structural_evidence',[])))

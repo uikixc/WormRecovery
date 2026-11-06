@@ -14,7 +14,8 @@ def build_audit(first_pass,dispatch,findings):
         counts=engine['second_pass_results']
         if counts.get('incomplete') or counts.get('unsupported') or counts.get('unknown'):
             engine['status']='not_finished'
-        elif engine['first_pass_files'] or counts:engine['status']='executed'
+        elif engine['first_pass_files'] or counts:
+            engine['status']='not_needed' if set(counts)=={'no_content'} and not engine['first_pass_files'] else 'executed'
     return {'dispatch':dict(dispatch),'engine_usage':engines,
             'count_basis':'Files checked or with retained results; cached identical VBA projects may reuse analysis. Installed versions do not prove execution.',
             'rea_scope':'Static PE import inspection; Ghidra decompilation and runtime execution are not bundled.'}

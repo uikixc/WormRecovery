@@ -15,7 +15,7 @@ from office_structure import inspect_package, attach_evidence
 from persistence_inventory import INVENTORY_SCRIPT, select_confirmed, registry_paths
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.0'
+VERSION = '1.8.1'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -259,6 +259,9 @@ def _office_check(path):
     try:
         with open_read(p) as header:prefix=header.read(16)
         if not prefix:return {'status':'review','macro':False,'reason':'文件内容为空，原有正文缺失；没有可供宏分析的字节，需要另行恢复内容。','document_format':'empty','data_integrity_issue':'empty_document'}
+        from metadata_formats import inspect_metadata
+        metadata=inspect_metadata(p,prefix)
+        if metadata is not None:return metadata
         stage='read_container'
         with open_read(p) as package,zipfile.ZipFile(package) as z:
             stage='package_structure'
@@ -278,7 +281,7 @@ def _office_check(path):
             stage='macro_worker'
             analysis=analyze_project(data)
             matches=analysis['family_modules'];others=analysis['other_modules']
-            result={'status':'review','document_format':'ooxml','package_structure_checked':True,'reason':'未识别宏已完成源码及编译指令特征检查，尚未确认感染。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h,'macro_analysis':analysis}
+            result={'status':'review','macro':True,'document_format':'ooxml','package_structure_checked':True,'reason':'宏项目已进行源码和可用编译指令检查，判定范围以各项结果为准。','has_family_macro':bool(matches),'other_modules':others,'vba_hash':h,'macro_analysis':analysis}
             if matches and not others and analysis.get('pcode_family_match') and macro[0].filename=='xl/vbaProject.bin':
                 result.update(status='infected',family='Synaptics-Excel',vba_part=macro[0].filename,
                               reason='宏源码与编译指令均匹配 Synaptics-Excel 感染特征，已确认感染。')
@@ -392,7 +395,7 @@ def lock_holders(path):
 def inspect_file_content(path,st):
     """Read-only detector; return data without mutating Cleaner or UI state."""
     result={'office':0,'findings':[]}
-    def add(kind,path,**detail):result['findings'].append({'kind':kind,'path':str(path),**detail})
+    def add(kind,path,**detail):result['findings'].append({'kind':kind,'path':str(path),'size':getattr(st,'st_size',None),**detail})
     name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
     if name.startswith('~$') and not name.startswith('~$cache'):return result
     if ext in EXE_EXTS or name.startswith(('~$cache','._cache_')):
@@ -527,6 +530,10 @@ class Cleaner:
         record={'path':str(path),'error':str(ex)}
         details=details or {'phase':getattr(ex,'operation_phase',None),'winerror':getattr(ex,'winerror',None)}
         if details.get('phase'):record['error_details']=details
+        if details.get('phase')=='reparse_target':
+            record.update(category='reparse_target_missing',content_inspected=False,
+                          reason='链接目标在当前扫描环境中不存在：'+str(details.get('target') or ''),
+                          action='保留链接及目标路径记录；目标不存在与读取权限被拒绝分别报告。')
         if details.get('source_bytes_read'):
             record.update(category='document_analysis_failed',source_bytes_read=True,content_inspected=False,
                           reason='文件字节已经读取，后续文档解析未完成。',action='保留原文件，查看具体分析步骤及自动重试结果。')
@@ -802,6 +809,11 @@ class Cleaner:
                 record['status']='unverified';record['reason']=ex.reason
                 if ex.target:record['target']=ex.target
                 self.skipped.append({'path':path,'reason':ex.reason,'target':ex.target})
+            except FileNotFoundError as ex:
+                record['status']='error';record['error']=str(ex)
+                details={'phase':'reparse_target','source_bytes_read':False,'target':record.get('target'),
+                         'exception_type':type(ex).__name__,'winerror':getattr(ex,'winerror',None)}
+                self.error(path,ex,details)
             except Exception as ex:
                 record['status']='error';record['error']=str(ex);self.error(path,ex)
         try:
@@ -1029,7 +1041,7 @@ class Cleaner:
         self.verification['unverified_areas']=['压缩档内部文件','离线用户配置单元','未分配盘符或未挂载的卷','排除目录与未解析或范围外的链接目标','未识别的恶意软件家族']
         self.log('verification_complete',result=self.verification);self.save();return self.verification
     def save(self):
-        summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
+        summary={'version':VERSION,'computer':os.environ.get('COMPUTERNAME'),'files':self.count,'directories':self.dircount,'scan_seconds':getattr(self,'scan_seconds',None),'file_scan_seconds':getattr(self,'file_scan_seconds',None),'review_seconds':getattr(self,'review_seconds',None),'scan_workers':getattr(self,'scan_workers',1),'office_examined':self.scanned_office,'findings':self.findings,'errors':self.errors,'events':self.events,'volume_policy':self.policy.cache,'cancelled':self.cancel.is_set(),'limitation':'Sample-specific repair; encrypted/corrupt/unknown malware and inaccessible areas remain explicitly unverified.'}
         summary.update(scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
         summary['operation']=dict(getattr(self,'operation',{'type':'legacy_unclassified'}))
         summary['scan_timing']={'file_scan_seconds':getattr(self,'file_scan_seconds',None),'secondary_analysis_seconds':getattr(self,'review_seconds',None)}

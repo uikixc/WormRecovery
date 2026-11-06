@@ -4,7 +4,7 @@ import re
 import hashlib
 from urllib.parse import unquote, urlsplit
 
-VERSION='2026.11.05.3'
+VERSION='2026.11.06.1'
 
 
 def content_id_image(target):
@@ -46,21 +46,24 @@ def assess_document(row):
                         '校验副本的完整 SHA-256 等于空字节序列；此结论不表示已恢复正文')
         decision['action']='保留该位置；原有正文无法从零字节中重建，需要可验证的历史原件或备份。'
         return decision
-    if row.get('analysis_error') or evidence.get('status')=='incomplete':
-        return result('incomplete','analysis_incomplete','文件分析未完成，不能判定无威胁。','解析错误或引擎未完成')
-    if row.get('kind')!='review_office':
-        return result('unresolved','executable_candidate','脚本或程序候选保留其引擎判定，不使用文档资源规则。','仅对 Office 文档使用文档分类规则')
     if row.get('has_family_macro') or row.get('macro_analysis',{}).get('family_modules'):
         return result('suspicious','family_macro_evidence','存在家族宏证据，保留处置要求。','VBA 家族特征')
     behavior=row.get('macro_analysis',{}).get('behavior_analysis',{})
     if behavior.get('classification')=='suspicious':
         return result('suspicious','macro_behavior_combination','宏命中高风险行为组合：'+'、'.join(behavior.get('rules',[]))+'。',
                       '源码及可读编译指令中的行为组合；保留原件，禁止据此删除全部宏')
+    if row.get('analysis_error') or evidence.get('status')=='incomplete':
+        return result('incomplete','analysis_incomplete','文件分析未完成，不能判定无威胁。','解析错误或引擎未完成')
+    if row.get('kind')!='review_office':
+        return result('unresolved','executable_candidate','脚本或程序候选保留其引擎判定，不使用文档资源规则。','仅对 Office 文档使用文档分类规则')
     if evidence.get('clamav',{}).get('status')!='no_match' or rules.get('matches')!=[]:
         return result('unresolved','insufficient_engine_evidence','现有证据不足以自动降级。','缺少完成的病毒检查或内容规则命中')
     if row.get('passive_text_verified') is True and row.get('macro') is False and not row.get('structural_evidence') and row.get('format_sha256')==row.get('analysis_sha256') and evidence.get('office_parser',{}).get('status')=='analyzed':
         return result('informational','passive_text_document','文件实际为纯文本，没有 Office 宏或活动内容结构，当前病毒库及内容规则未检出威胁。',
                       '完整文本解码及非标记格式检查、格式哈希与复核副本一致、病毒检查及内容规则完成')
+    if row.get('passive_metadata_verified') is True and row.get('metadata_structure',{}).get('status')=='complete' and row.get('document_format') in ('appledouble','recycle_index') and row.get('macro') is False and not row.get('structural_evidence') and row.get('format_sha256')==row.get('analysis_sha256') and evidence.get('office_parser',{}).get('status')=='analyzed':
+        return result('informational','verified_metadata_container','已核验的元数据附属文件或回收站索引；不是 Office 正文，当前病毒库和内容规则未检出威胁。',
+                      '内容格式、完整项范围和记录长度检查、相同 SHA-256 的校验副本及独立病毒检查；不打开记录中的目标路径')
     from office_triage import installation_component, REVIEWED_COMPONENTS
     known=REVIEWED_COMPONENTS.get(row.get('analysis_sha256'))
     if known and installation_component(row['path']) and ntpath.basename(row['path']).casefold()==known[0].casefold() and not row.get('active_content_unresolved'):
@@ -80,6 +83,8 @@ def assess_document(row):
     if row.get('macro') is not False or row.get('macro_analysis') or row.get('other_modules') or not structures or evidence.get('office_parser',{}).get('status')!='analyzed':
         return result('unresolved','unresolved_executable_content','宏或文档结构尚无足够证据，保留风险状态。','不使用文件名或杀毒未命中作为单独白名单')
     ordinary=[]
+    embedded=evidence.get('embedded_content',{})
+    embedded_rows={item.get('member'):item for item in embedded.get('objects',[])}
     for item in structures:
         kind=item.get('kind');relation=item.get('relationship_type','').casefold()
         if item.get('target_truncated'):
@@ -90,6 +95,12 @@ def assess_document(row):
             ordinary.append('图片内容 ID 引用')
         elif kind=='external_relationship' and relation in ('externallinkpath','xlpathmissing') and local_reference(item.get('target'),{'.xls','.xlsx'}):
             ordinary.append('本地工作簿数据链接')
+        elif kind=='embedded_object':
+            found=embedded_rows.get(item.get('member'))
+            if embedded.get('status')!='analyzed' or embedded.get('container_sha256')!=row.get('analysis_sha256') or not found or found.get('classification')!='passive_office':
+                detail=(found or {}).get('reason','嵌入对象尚未完整解析。')
+                return result('unresolved','embedded_content_needs_analysis',detail,'保留对象类型、流清单、字节哈希与实际引擎结果；未认证对象不作无害处理')
+            ordinary.append('已解析的无宏嵌入文档')
         elif kind in ('external_data','external_book_link'):
             member=item.get('member','')
             owner=member.replace('/_rels/','/')[:-5] if member.endswith('.rels') else member

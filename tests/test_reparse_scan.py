@@ -1,4 +1,5 @@
 import json
+import ctypes
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +18,27 @@ def link_data(target,tag=0xa0000003,relative=False):
     return struct.pack('<IHH',tag,len(body),0)+body
 
 class ReparseTests(unittest.TestCase):
+    def info(self,attributes,tag):
+        def read(handle,kind,buffer,size):
+            values=ctypes.cast(buffer,ctypes.POINTER(ctypes.c_ulong))
+            values[0]=attributes;values[1]=tag;return 1
+        return read
+    def test_cloud_filters_use_entry_data_without_link_ioctl(self):
+        with patch.object(rs.k,'CreateFileW',return_value=123),patch.object(rs.k,'CloseHandle'),patch.object(rs.k,'GetFileInformationByHandleEx',side_effect=self.info(0x410,0x9000001A)),patch.object(rs.k,'DeviceIoControl',side_effect=AssertionError('not a namespace link')):
+            result=rs.inspect_reparse('C:/cloud')
+        self.assertEqual(result['kind'],'filter_data');self.assertEqual(result['target'],'C:\\cloud')
+    def test_entry_that_lost_its_reparse_flag_is_scanned_normally(self):
+        with patch.object(rs.k,'CreateFileW',return_value=123),patch.object(rs.k,'CloseHandle'),patch.object(rs.k,'GetFileInformationByHandleEx',side_effect=self.info(0x10,0)),patch.object(rs.k,'DeviceIoControl',side_effect=AssertionError('ordinary entry')):
+            result=rs.inspect_reparse('C:/changed')
+        self.assertEqual(result['kind'],'ordinary_entry')
+    def test_unknown_reparse_identity_still_requires_raw_inspection(self):
+        with patch.object(rs.k,'CreateFileW',return_value=123),patch.object(rs.k,'CloseHandle'),patch.object(rs.k,'GetFileInformationByHandleEx',side_effect=self.info(0x400,0)),patch.object(rs.k,'DeviceIoControl',side_effect=OSError('inert unknown tag')):
+            with self.assertRaisesRegex(OSError,'unknown tag'):rs.inspect_reparse('C:/unknown')
+    def test_intermediate_filter_does_not_cause_link_cycle(self):
+        fake=type('Stat',(),{'st_file_attributes':0x400})()
+        with patch.object(rs.os,'lstat',return_value=fake),patch.object(rs,'inspect_reparse',side_effect=lambda p:{'kind':'filter_data','target':str(p),'tag':'0x9000001a'}):
+            result=rs.resolve_target('C:/cloud/sub/file.docx',lambda p:True)
+        self.assertEqual(result['target'],'C:\\cloud\\sub\\file.docx');self.assertEqual(len(result['chain']),3)
     def test_junction_target_is_decoded(self):
         self.assertEqual(rs.decode_reparse(link_data('\\??\\C:\\Users'),'C:/old')['target'],'C:\\Users')
     def test_relative_symlink_is_resolved(self):

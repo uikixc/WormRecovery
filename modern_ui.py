@@ -313,12 +313,12 @@ class ModernWindow:
             if decision:text+='\n自动判定：'+decision.get('reason','')+'\n判定依据：'+decision.get('basis','')
             secondary=record.get('secondary_analysis',{})
             if secondary:
-                names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA','office_parser':'Office 解析'}
+                names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA','office_parser':'Office 解析','vba_pcode':'VBA 编译缓存','embedded_content':'嵌入对象'}
                 statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','no_content':'文件为空，无可检查内容','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持'}
                 text+='\n离线复核：'+'；'.join(names[k]+' '+statuses.get(v.get('status'), '已执行规则检查') for k,v in secondary.items() if k in names and isinstance(v,dict))
                 if secondary.get('clamav',{}).get('detections'):text+='\n检出名称：'+'、'.join(secondary['clamav']['detections'])
                 if record.get('analysis_incomplete_engines'):text+='\n未完成引擎：'+ '、'.join(record['analysis_incomplete_engines'])
-                for key in ('office_parser','autoit','xlm','capa','rea'):
+                for key in ('clamav','office_parser','vba_pcode','embedded_content','autoit','xlm','capa','rea'):
                     result=secondary.get(key,{})
                     if result.get('reason'):text+='\n'+names[key]+'：'+result['reason'][:220]
             self.selected_path.set(text)

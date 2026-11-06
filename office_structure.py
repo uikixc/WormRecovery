@@ -45,6 +45,7 @@ def inspect_package(package):
             raise ValueError('文档包含非规范成员路径：' + name)
         if item.flag_bits & 1:
             raise ValueError('文档包含加密成员，无法完成内容检查：' + name)
+        if item.is_dir():continue
         if re.search(r'(^|/)macrosheets/', low):
             add('xlm_macro_sheet', name)
         if re.search(r'(^|/)embeddings/', low):

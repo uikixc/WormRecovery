@@ -105,6 +105,26 @@ class VbaInventoryTests(unittest.TestCase):
         result=self.inspect(vba_streams('Attribute VB_Name = "Fixture"\r\nSub A()\r\nDebug.Print "fixture"\r\nEnd Sub\r\n'))
         self.assertFalse(result['module_inventory']['empty_project_verified'])
 
+    def test_missing_project_identifier_table_preserves_source_without_false_parser_failure(self):
+        result=self.inspect(vba_streams(cache=b'inert cached bytes',source='Attribute VB_Name = "Fixture"\r\nSub A()\r\nDebug.Print "fixture"\r\nEnd Sub\r\n'))
+        self.assertTrue(result['source_sha256'])
+        self.assertEqual(result['pcode_status'],'incomplete')
+        self.assertEqual(result['pcode_analysis']['modules'][0]['status'],'incomplete')
+        self.assertFalse(result['pcode_family_match'])
+        self.assertFalse(result['module_inventory']['empty_project_verified'])
+
+    def test_source_only_module_is_never_disassembled_as_cache(self):
+        import contextlib,io
+        from office_analysis import inspect_pcode,LimitedText
+        inventory={'status':'complete','modules':[{'stream':'VBA/One','cache_bytes':0},
+                                                 {'stream':'VBA/Two','cache_bytes':16}]}
+        parser=type('Parser',(),{'find_vba_projects':lambda self:[('','PROJECT','VBA/dir')],
+                                'ole_file':type('Ole',(),{'openstream':lambda self,path:io.BytesIO(b'inert cached project information')})()})()
+        with contextlib.redirect_stdout(io.StringIO()),patch('pcodedmp.pcodedmp.processDir',return_value=(b'dir',['One','Two'],False)),patch('pcodedmp.pcodedmp.getTheIdentifiers',return_value=[]),patch('pcodedmp.pcodedmp.pcodeDump') as disassemble:
+            result=inspect_pcode(parser,inventory,LimitedText(1000))
+        self.assertEqual(disassemble.call_count,1)
+        self.assertEqual([row['status'] for row in result['modules']],['not_present','analyzed'])
+
     def test_empty_module_with_library_reference_needs_dependency_check(self):
         import struct
         name=b'FixtureLibrary';libid=b'*\\G{00000000-0000-0000-0000-000000000001}#1.0#0#C:\\fixture\\library.tlb#Fixture'

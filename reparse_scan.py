@@ -12,6 +12,8 @@ k.CreateFileW.restype=W.HANDLE
 k.DeviceIoControl.argtypes=[W.HANDLE,W.DWORD,ctypes.c_void_p,W.DWORD,ctypes.c_void_p,W.DWORD,ctypes.POINTER(W.DWORD),ctypes.c_void_p]
 k.DeviceIoControl.restype=W.BOOL
 k.CloseHandle.argtypes=[W.HANDLE]
+k.GetFileInformationByHandleEx.argtypes=[W.HANDLE,ctypes.c_int,ctypes.c_void_p,W.DWORD]
+k.GetFileInformationByHandleEx.restype=W.BOOL
 
 class CoverageLimit(Exception):
     def __init__(self,reason,target=None):
@@ -56,6 +58,16 @@ def inspect_reparse(path):
     handle=k.CreateFileW(extended_path(path),0,7,None,3,0x02200000,None)
     if handle==ctypes.c_void_p(-1).value:raise ctypes.WinError(ctypes.get_last_error())
     try:
+        class Attributes(ctypes.Structure):_fields_=[('attributes',W.DWORD),('tag',W.DWORD)]
+        attributes=Attributes()
+        # Cloud/projection filters are not namespace links. Read their actual
+        # entries through Windows instead of asking for a link destination.
+        if k.GetFileInformationByHandleEx(handle,9,ctypes.byref(attributes),ctypes.sizeof(attributes)):
+            tag=attributes.tag
+            if not attributes.attributes&0x400:
+                return {'kind':'ordinary_entry','target':local_path(str(path)),'tag':'0x0','identity_basis':'FileAttributeTagInfo'}
+            if tag and not tag&0x20000000 and tag not in (0x8000001b,0x80000017):
+                return {'kind':'filter_data','target':local_path(str(path)),'tag':hex(tag),'identity_basis':'FileAttributeTagInfo'}
         buffer=ctypes.create_string_buffer(16384);size=W.DWORD()
         if not k.DeviceIoControl(handle,0x900a8,None,0,buffer,len(buffer),ctypes.byref(size),None):raise ctypes.WinError(ctypes.get_last_error())
         return decode_reparse(buffer.raw[:size.value],str(path))
@@ -78,8 +90,8 @@ def resolve_target(path,approved,max_hops=63):
             if getattr(st,'st_file_attributes',0)&0x400:
                 info=inspect_reparse(partial)
                 chain.append({'path':partial,**info})
-                if info['kind']=='wof_file_data':
-                    if index!=len(parts)-1:raise CoverageLimit('unsupported_directory_filter',partial)
+                if info['kind'] in ('wof_file_data','filter_data','ordinary_entry'):
+                    if info['kind']=='wof_file_data' and index!=len(parts)-1:raise CoverageLimit('unsupported_directory_filter',partial)
                     continue
                 candidate=ntpath.join(info['target'],*parts[index+1:])
                 candidate=local_path(candidate)

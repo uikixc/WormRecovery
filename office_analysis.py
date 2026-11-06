@@ -34,13 +34,58 @@ class LimitedText(io.StringIO):
         return super().write(value)
 
 
+def inspect_pcode(parser,inventory,output):
+    """Disassemble only declared module caches, retaining unavailable facets."""
+    from pcodedmp import pcodedmp
+    args=SimpleNamespace(disasmOnly=True,verbose=False)
+    if inventory.get('status')!='complete':
+        pcodedmp.processProject(parser,args,output_file=output)
+        return {'status':'incomplete','reason':'模块清单未完整核验，编译指令覆盖不足。','modules':[]}
+    rows=[]
+    for root,_,dir_path in parser.find_vba_projects():
+        owned=[row for row in inventory['modules'] if row['stream'].casefold().startswith((root+'VBA/').casefold())]
+        cached=[row for row in owned if row['cache_bytes']]
+        rows.extend({'stream':row['stream'],'status':'not_present','cache_bytes':0} for row in owned if not row['cache_bytes'])
+        if not cached:continue
+        project=parser.ole_file.openstream(root+'VBA/_VBA_PROJECT').read()
+        if len(project)<=7:
+            rows.extend({'stream':row['stream'],'status':'incomplete','cache_bytes':row['cache_bytes'],
+                         'reason':'模块保留缓存字节，但项目未保存解码缓存所需的标识符表。'} for row in cached)
+            continue
+        diagnostics=LimitedText(8192)
+        try:
+            with contextlib.redirect_stderr(diagnostics):
+                dir_data,module_names,is64bit=pcodedmp.processDir(parser,dir_path,args,output_file=output)
+                identifiers=pcodedmp.getTheIdentifiers(project)
+            reported={(root+'VBA/'+name).casefold() for name in module_names}
+            if reported!={row['stream'].casefold() for row in owned} or diagnostics.getvalue().strip():
+                raise ValueError(diagnostics.getvalue().strip()[:600] or '编译指令解析器返回的模块清单不一致。')
+        except Exception as error:
+            rows.extend({'stream':row['stream'],'status':'incomplete','cache_bytes':row['cache_bytes'],
+                         'reason':str(error)[:700]} for row in cached)
+            continue
+        for row in cached:
+            diagnostics=LimitedText(8192);module_output=LimitedText(MAX_PCODE_CHARS-output.used)
+            try:
+                with contextlib.redirect_stderr(diagnostics):
+                    data=parser.ole_file.openstream(row['stream']).read()
+                    pcodedmp.pcodeDump(data,project,dir_data,identifiers,is64bit,args,output_file=module_output)
+                if diagnostics.getvalue().strip():raise ValueError(diagnostics.getvalue().strip()[:700])
+                output.write(module_output.getvalue())
+                rows.append({'stream':row['stream'],'status':'analyzed','cache_bytes':row['cache_bytes']})
+            except Exception as error:
+                rows.append({'stream':row['stream'],'status':'incomplete','cache_bytes':row['cache_bytes'],'reason':str(error)[:700]})
+    failed=[row for row in rows if row['status']=='incomplete']
+    return {'status':'incomplete' if failed else 'analyzed' if any(row['status']=='analyzed' for row in rows) else 'not_present',
+            'reason':failed[0]['reason'] if failed else None,'modules':rows}
+
+
 def inspect_project(data, full_document=False):
     """Worker only. Extract code without executing Office or macro instructions."""
     if len(data) > (MAX_DOCUMENT_BYTES if full_document else MAX_PROJECT_BYTES):
         raise ValueError('宏项目超过分析资源上限。')
     from oletools.olevba import VBA_Parser
     from oletools.mraptor import MacroRaptor
-    from pcodedmp import pcodedmp
 
     parser = VBA_Parser('vbaProject.bin', data=data, disable_pcode=True)
     errors = LimitedText(65536)
@@ -72,8 +117,7 @@ def inspect_project(data, full_document=False):
             with contextlib.redirect_stderr(LimitedText(8192)):
                 inventory=inspect_inventory(parser,modules)
             module_cache_absent=inventory.get('status')=='complete' and all(row['cache_bytes']==0 for row in inventory['modules'])
-            if not module_cache_absent:
-                pcodedmp.processProject(parser, SimpleNamespace(disasmOnly=True, verbose=False), output_file=output)
+            pcode_analysis=inspect_pcode(parser,inventory,output)
         if errors.getvalue().strip():
             raise ValueError('宏编译代码解析未完成：' + errors.getvalue().strip()[:700])
         if not modules:
@@ -94,9 +138,10 @@ def inspect_project(data, full_document=False):
             if re.search(r'\b' + re.escape(keyword) + r'\b', pcode, re.I):
                 indicators.append(keyword)
         return {'modules': modules, 'family_modules': matches, 'other_modules': others,
-                'pcode_status': 'cache_absent' if inventory.get('compiled_cache_absent') else 'no_module_cache' if module_cache_absent else 'instructions_read' if 'Line #' in pcode else 'no_instructions_returned',
+                'pcode_status': 'incomplete' if pcode_analysis['status']=='incomplete' else 'cache_absent' if inventory.get('compiled_cache_absent') else 'no_module_cache' if module_cache_absent else 'instructions_read' if 'Line #' in pcode else 'no_instructions_returned',
+                'pcode_analysis':pcode_analysis,
                 'module_inventory':inventory,
-                'pcode_family_match': all(token in pcode.casefold() for token in
+                'pcode_family_match': pcode_analysis['status']!='incomplete' and all(token in pcode.casefold() for token in
                                          ('synaptics', '~$cache1', 'regkeysave', 'workbook_open')),
                 'source_sha256': hashlib.sha256(source.encode('utf-8')).hexdigest(),
                 'pcode_sha256': hashlib.sha256(pcode.encode('utf-8')).hexdigest(),
@@ -118,8 +163,12 @@ def analyze_legacy_document(data, timeout=ANALYSIS_TIMEOUT):
     return _analyze_bytes(data, 'legacy', timeout)
 
 
+def analyze_embedded_document(data,timeout=ANALYSIS_TIMEOUT):
+    return _analyze_bytes(data,'embedded',timeout)
+
+
 def _analyze_bytes(data, mode, timeout):
-    if len(data) > (MAX_DOCUMENT_BYTES if mode == 'legacy' else MAX_PROJECT_BYTES):
+    if len(data) > (MAX_DOCUMENT_BYTES if mode in ('legacy','embedded') else MAX_PROJECT_BYTES):
         raise ValueError('宏项目超过分析资源上限。')
     fingerprint = (mode, hashlib.sha256(data).hexdigest())
     if fingerprint in _CACHE:
@@ -179,7 +228,7 @@ def _legacy_bytes(data):
     return {'status':'review','macro':True,'document_format':'ole','macro_analysis':analysis,'legacy_structure':structure,
             'has_family_macro':bool(analysis.get('family_modules')),
             'other_modules':analysis.get('other_modules',[]),
-            'reason':'旧版 Office 宏已完成源码、编译指令和内容特征检查。'}
+            'reason':'旧版 Office 宏已进行源码、可用编译指令和内容特征检查，判定范围以各项结果为准。'}
 
 
 def worker_server():
@@ -204,10 +253,13 @@ def worker_server():
             with contextlib.redirect_stdout(diagnostics),contextlib.redirect_stderr(diagnostics):
                 request=json.loads(line)
                 mode=request.get('mode')
-                if mode not in ('vba','legacy'):raise ValueError('未知 Office 字节分析任务。')
+                if mode not in ('vba','legacy','embedded'):raise ValueError('未知 Office 字节分析任务。')
                 data=base64.b64decode(request['data'],validate=True)
-                if len(data)>(MAX_DOCUMENT_BYTES if mode=='legacy' else MAX_PROJECT_BYTES):raise ValueError('文档超过分析上限。')
-                result=_legacy_bytes(data) if mode=='legacy' else inspect_project(data)
+                if len(data)>(MAX_DOCUMENT_BYTES if mode in ('legacy','embedded') else MAX_PROJECT_BYTES):raise ValueError('文档超过分析上限。')
+                if mode=='embedded':
+                    from embedded_analysis import inspect as inspect_embedded
+                    result=inspect_embedded(data)
+                else:result=_legacy_bytes(data) if mode=='legacy' else inspect_project(data)
                 response={'ok':True,'result':result}
         except Exception as error:
             response={'ok':False,'error':str(error)[:1200],

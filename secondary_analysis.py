@@ -76,55 +76,9 @@ def _json_command(command, timeout=45, cancel=None):
     return json.loads(result.stdout.decode('utf-8-sig'))
 
 
-def clam_batch(paths, work, timeout=180, cancel=None):
-    """One database load for the whole batch, on private immutable snapshots."""
-    exe = _tool('clamav/clamscan.exe')
-    database = engine_root() / 'clamdb'
-    if not all((database / name).is_file() for name in ('main.cvd', 'daily.cvd', 'bytecode.cvd')):
-        raise FileNotFoundError('离线病毒库不完整，不能完成通用病毒检查。')
-    for name in ('main.cvd', 'daily.cvd', 'bytecode.cvd'):
-        _tool('clamdb/' + name)
-    filelist = work / 'clam-file-list.txt'
-    filelist.write_text(''.join(str(p) + '\n' for p in paths), encoding='utf-8')
-    output = work / 'clam-output.txt'
-    command = [str(exe), '--database=' + str(database), '--file-list=' + str(filelist),
-        '--stdout', '--no-summary', '--alert-exceeds-max=yes', '--max-scantime=20000',
-        '--max-filesize=128M', '--max-scansize=256M', '--max-recursion=12',
-        '--bytecode-timeout=5000', '--tempdir=' + str(work)]
-    with output.open('wb') as stream:
-        result = run_engine(command, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout, cancel=cancel)
-    if result.returncode not in (0, 1):
-        raise ValueError('ClamAV 未完成，退出码 ' + str(result.returncode) + '：' + output.read_text(encoding='utf-8', errors='replace')[-900:])
-    if output.stat().st_size > 8 * 1024 * 1024:
-        raise ValueError('ClamAV 输出超过资源上限。')
-    text = output.read_text(encoding='utf-8', errors='replace')
-    rows = {}
-    for path in paths:
-        prefix = str(path) + ': '
-        messages = [line[len(prefix):] for line in text.splitlines() if line.startswith(prefix)]
-        detections = [line[:-6] for line in messages if line.endswith(' FOUND')]
-        incomplete = [line for line in messages if 'ERROR' in line or 'Heuristics.Limits.Exceeded' in line]
-        if path.stat().st_size==0 and not detections and not incomplete:
-            rows[str(path)]={'status':'no_content','detections':[],'reason':'校验副本为零字节，没有可供病毒库检查的内容。'}
-            continue
-        if incomplete or not messages:
-            rows[str(path)] = {'status': 'incomplete', 'detections': detections,
-                'reason': '; '.join(incomplete) or '引擎未返回该文件的独立结果。'}
-        elif detections:
-            rows[str(path)] = {'status': 'detected', 'detections': detections}
-        elif 'OK' in messages:
-            rows[str(path)] = {'status': 'no_match', 'detections': []}
-        else:
-            rows[str(path)] = {'status': 'incomplete', 'reason': '; '.join(messages)}
-    dbinfo = {}
-    for name in ('main.cvd', 'daily.cvd', 'bytecode.cvd'):
-        with (database / name).open('rb') as stream:
-            header = stream.read(512).decode('ascii', 'replace').strip()
-        fields = header.split(':')
-        dbinfo[name] = {'build': fields[1] if len(fields) > 1 else '',
-                        'version': fields[2] if len(fields) > 2 else '',
-                        'signatures': fields[3] if len(fields) > 3 else ''}
-    return rows, dbinfo
+def clam_batch(paths, work, timeout=None, cancel=None, progress=lambda value:None):
+    from clamav_batch import scan
+    return scan(paths,work,_tool,engine_root(),run_engine,subprocess_environment(),timeout,cancel,progress)
 
 
 def worker_request(request):
@@ -252,9 +206,9 @@ def enrich_reviews(cleaner):
     cleaner.log('secondary_dispatch',**cleaner.secondary_dispatch)
     if not candidates or cleaner.cancel.is_set():
         return
-    def phase(stage,path='',completed=0,timeout=None):
+    def phase(stage,path='',completed=0,timeout=None,total=None):
         state={'phase':'review','stage':stage,'path':str(path),'started':time.monotonic(),
-               'completed':completed,'total':len(candidates),'timeout':timeout}
+               'completed':completed,'total':len(candidates) if total is None else total,'timeout':timeout}
         cleaner.progress=state
         cleaner.log('scan_phase',**state)
         cleaner.emit(stage+('：'+str(path) if path else ''))
@@ -323,8 +277,14 @@ def enrich_reviews(cleaner):
             return
         if hasattr(cleaner,'save'):cleaner.save()
         try:
-            phase('ClamAV 病毒库加载及批量复核',timeout=180)
-            clam, database = clam_batch([snapshot for _, snapshot in pairs], work, cancel=cleaner.cancel)
+            from clamav_batch import batch_deadline
+            deadline=batch_deadline(len(pairs))
+            phase('ClamAV 病毒库加载及批量复核',timeout=deadline)
+            originals={str(snapshot):row['path'] for row,snapshot in pairs}
+            def clam_progress(state):
+                names={'loading':'ClamAV 正在加载病毒库','scanning':'ClamAV 正在检查文件','result':'ClamAV 已返回文件结果'}
+                phase(names[state['stage']],originals.get(state['path'],''),state['completed'],deadline,total=state['total'])
+            clam, database = clam_batch([snapshot for _, snapshot in pairs], work, cancel=cleaner.cancel,progress=clam_progress)
         except Exception as ex:
             clam, database = {}, {}
             cleaner.inspection_failed = True
@@ -338,6 +298,8 @@ def enrich_reviews(cleaner):
             if row.get('kind') == 'review_office':
                 evidence['office_parser'] = {'status': 'incomplete' if row.get('analysis_error') else 'analyzed',
                     'reason': row.get('reason') if row.get('analysis_error') else None}
+                if row.get('macro_analysis',{}).get('pcode_analysis',{}).get('status')=='incomplete':
+                    evidence['vba_pcode']=row['macro_analysis']['pcode_analysis']
             try:
                 evidence['yara_x'] = __import__('local_rules').scan_bytes(snapshot.read_bytes())
             except Exception as ex:
@@ -349,6 +311,12 @@ def enrich_reviews(cleaner):
                 except Exception as ex:
                     evidence['autoit'] = {'status': 'incomplete', 'reason': str(ex)[:700]}
             kinds = {x['kind'] for x in row.get('structural_evidence', [])}
+            if 'embedded_object' in kinds:
+                try:
+                    phase('正在解析嵌入对象',row['path'],index,25)
+                    from office_analysis import analyze_embedded_document
+                    evidence['embedded_content']=analyze_embedded_document(snapshot.read_bytes())
+                except Exception as error:evidence['embedded_content']={'status':'incomplete','reason':str(error)[:700]}
             if kinds & {'xlm_macro_sheet', 'auto_macro_name'}:
                 try:
                     phase('Excel XLM 宏复核',row['path'],index,25)
@@ -374,6 +342,9 @@ def enrich_reviews(cleaner):
                 row['action'] = '已确认有引擎检出，需要结合感染结构恢复；当前文件保留原件，不以整份删除代替内容恢复。'
             elif rule_hits:
                 row['reason'] = '离线内容规则命中：' + '、'.join(rule_hits) + '；需结合代码及文件关联判断。'
+            elif failures:
+                row['reason']=row.get('reason','文件已保留。')+'；离线复核未完成：'+'、'.join(failures)+'。'
+                row['action']='保留原件；软件已记录每个未完成引擎的具体原因，未完成不等于病毒检出。'
             else:
                 row['reason'] = row.get('reason', '检测到尚未认证的活动内容。') + '；已完成的离线引擎未匹配已知威胁，未知内容的用途仍未认证。'
             if failures:

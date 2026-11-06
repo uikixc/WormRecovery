@@ -49,6 +49,10 @@ class DocumentDecisionTests(unittest.TestCase):
             row['secondary_analysis']['status']=state
             self.assertEqual(assess_document(row)['classification'],expected)
 
+    def test_confirmed_family_evidence_is_not_hidden_by_other_engine_failure(self):
+        row=self.row();row['has_family_macro']=True;row['secondary_analysis']['status']='incomplete'
+        self.assertEqual(assess_document(row)['classification'],'suspicious')
+
     def test_content_rule_hit_or_missing_engine_cannot_clear(self):
         row=self.row();row['secondary_analysis']['yara_x']['matches']=['family']
         self.assertEqual(assess_document(row)['classification'],'unresolved')
