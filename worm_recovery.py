@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.2'
+VERSION = '1.8.3'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -437,8 +437,9 @@ def inspect_file_content(path,st):
     result['engine_checks']={'file_header':1}
     if archive_probe and archive_probe['status']!='complete':
         result['engine_checks']['archive_directory_limited']=1
-    def family(data,rules=None):
-        analysis=inspect_family(data,rules);result['engine_checks']['family_static']=1
+    def family(data=None,rules=None,analysis=None):
+        analysis=inspect_family(data,rules) if analysis is None else analysis
+        result['engine_checks']['family_static']=1
         if analysis.get('role'):
             result['family_observations']=[{'path':str(path),'role':analysis['role'],'sha256':analysis['source_sha256']}]
         if analysis['status']=='detected':
@@ -458,11 +459,27 @@ def inspect_file_content(path,st):
             return True
         if analysis['status']=='incomplete':
             add('review_binary',path,family_analysis=analysis,reason=analysis['reason'],
+                content_rules=analysis.get('content_rules'),
                 action='保留原件；静态解码未完成不等于已确认感染。')
             return True
         return False
+    def large_checks(analysis):
+        coverage=analysis.get('coverage',{})
+        result['large_file_coverage']=coverage
+        if coverage.get('rule_scan')=='complete':
+            result['engine_checks']['yara_x']=1
+            result['engine_checks']['family_streamed_pe' if program else 'family_streamed_script']=1
+            result['streamed_bytes']=coverage.get('rule_scan_bytes',0)
+        if analysis['status']=='incomplete':result['engine_checks']['family_streamed_failed']=1
     if program:
-        if is_stub(path,strict=True,data=data):
+        if st.st_size>MAX_INPUT:
+            from family_analysis import inspect_large_file
+            analysis=inspect_large_file(path,expected_stat=st);large_checks(analysis)
+            rules=analysis.get('content_rules',{})
+            if not family(analysis=analysis) and rules.get('matches'):
+                add('review_binary',path,family_analysis=analysis,content_rules=rules,
+                    reason='完整文件规则命中，但尚未确立独立恶意程序的代码归属。')
+        elif is_stub(path,strict=True,data=data):
             with PEView(path) as pe:original=pe.resource('EXERESX')
             result['engine_checks']['family_static']=1
             add('infected_executable' if original else 'worm_payload',path,size=st.st_size,embedded_original_bytes=original[1] if original else None,
@@ -497,8 +514,10 @@ def inspect_file_content(path,st):
         rules=scan_bytes(data);result['engine_checks']['yara_x']=1
         if not family(data,rules) and rules['matches']:add('review_script',path,reason='本地组合规则命中，正在执行离线复核。',content_rules=rules)
     elif script:
-        result['engine_checks']['family_size_limited']=1
-        add('review_script',path,reason='脚本超过静态家族检查大小上限，完整内容未检查。')
+        from large_pe_analysis import inspect_large_script
+        analysis=inspect_large_script(path,expected_stat=st);large_checks(analysis)
+        if analysis['status']=='incomplete':
+            add('review_script',path,family_analysis=analysis,content_rules=analysis.get('content_rules'),reason=analysis['reason'])
     elif ext=='.lnk' and st.st_size<1024*1024:
         link=shortcut(path)
         if link and link.get('malicious'):add('malicious_shortcut',path,shortcut=link)
@@ -592,7 +611,9 @@ class Cleaner:
         self.policy.check(path)
         if not os.path.isfile(path) or file_attributes(path)&0x400:return False
         from family_analysis import MAX_INPUT,inspect as inspect_family
-        if os.path.getsize(path)>MAX_INPUT:return False
+        if os.path.getsize(path)>MAX_INPUT:
+            from family_analysis import inspect_large_file
+            return inspect_large_file(path)['status']=='detected'
         with open_read(path) as stream:data=stream.read(MAX_INPUT+1)
         if inspect_family(data)['status']=='detected':return True
         return any(row.get('kind')=='malware_deployment' and norm(row['path'])==norm(path)
@@ -888,6 +909,7 @@ class Cleaner:
         return None
     def record_file_result(self,path,result):
         self.count+=1;self.scanned_office+=result.get('office',0)
+        self.streamed_bytes=getattr(self,'streamed_bytes',0)+result.get('streamed_bytes',0)
         if not hasattr(self,'engine_checks'):self.engine_checks={}
         for engine,count in result.get('engine_checks',{}).items():
             self.engine_checks[engine]=self.engine_checks.get(engine,0)+count
@@ -907,7 +929,7 @@ class Cleaner:
         roots=self.policy.fixed_roots() if roots is None else roots
         if not roots:raise ValueError('未指定有效扫描范围。')
         self.findings=[];self.count=0;self.dircount=0;self.scanned_office=0;self.skipped=[];self.reparse_points=[];start=time.monotonic()
-        self.engine_checks={};self.secondary_dispatch={'status':'not_started','candidates':0};self.family_observations=[]
+        self.engine_checks={};self.streamed_bytes=0;self.secondary_dispatch={'status':'not_started','candidates':0};self.family_observations=[]
         self.scan_roots=list(map(os.path.abspath,roots))
         self.scan_active=True;self.scan_started=start;self.current_path='';self.last_progress=start;self.last_completed=start
         self.set_progress('files','正在遍历并检查文件')
@@ -1075,8 +1097,11 @@ class Cleaner:
                 current=nextstage;layers+=1
             if not layers:raise ValueError('感染层结构未验证，原文件已保留。')
             from family_analysis import MAX_INPUT,inspect as inspect_family
-            if current.stat().st_size>MAX_INPUT:raise ValueError('嵌入原件超过内容复核上限，原文件已保留。')
-            with open_read(current) as stream:original_analysis=inspect_family(stream.read(MAX_INPUT+1))
+            if current.stat().st_size>MAX_INPUT:
+                from family_analysis import inspect_large_file
+                original_analysis=inspect_large_file(current,expected_stat=current.stat())
+            else:
+                with open_read(current) as stream:original_analysis=inspect_family(stream.read(MAX_INPUT+1))
             if original_analysis['status']!='no_known_match':raise ValueError('嵌入原件仍包含已知恶意代码或未完成解析，原文件已保留。')
             with PEView(current) as clean:
                 if clean.size<1024:raise ValueError('嵌入原件结构无效，无法自动恢复。')
@@ -1244,7 +1269,8 @@ class Cleaner:
         self.verification['disabled_services']=[x for x in system.get('services',[]) if x not in active_services]
         self.verification['persistence_changes']=system.get('snapshot_changes',[])
         self.verification['size_limited_files']=getattr(self,'engine_checks',{}).get('family_size_limited',0)
-        self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.errors and not self.inspection_failed and not self.verification['persistence_changes'] and not self.verification['size_limited_files']
+        self.verification['large_file_incomplete']=getattr(self,'engine_checks',{}).get('family_streamed_failed',0)
+        self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.errors and not self.inspection_failed and not self.verification['persistence_changes'] and not self.verification['size_limited_files'] and not self.verification['large_file_incomplete']
         self.verification['unverified_links']=[r for r in getattr(self,'reparse_points',[]) if r.get('status') in ('unverified','error','pending')]
         self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.verification['unverified_links']
         self.verification['coverage']='Selected mounted volumes only; exclusions, reparse points, archives, offline hives and other malware families are not certified.'
@@ -1270,6 +1296,11 @@ class Cleaner:
         summary['offline_analysis']['family_detection']={'source':'REA-reviewed code combinations compiled into offline rules',
             'methods':['infection_code_section','xor32_nrv2e','encrypted_project_crc_and_loader_code','png_rc4_and_controller_code','content_proven_companion_correlation'],
             'target_execution':False,'filename_used_as_verdict':False,'maximum_input_bytes':16*1024*1024,
+            'large_pe_method':'Full-file YARA-X plus read-only mapped PE structure and code ownership; source identity checked before and after',
+            'streamed_bytes':getattr(self,'streamed_bytes',0),
+            'streamed_pe_files':getattr(self,'engine_checks',{}).get('family_streamed_pe',0),
+            'streamed_script_files':getattr(self,'engine_checks',{}).get('family_streamed_script',0),
+            'large_file_incomplete':getattr(self,'engine_checks',{}).get('family_streamed_failed',0),
             'maximum_carrier_bytes':4*1024*1024,'size_limited_files':getattr(self,'engine_checks',{}).get('family_size_limited',0),
             'scope':'Known observed families; bounded decoding is not universal unpacking or a clean certification.'}
         json_save(self.run/'report.json',summary);return summary

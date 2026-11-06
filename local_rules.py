@@ -2,7 +2,7 @@
 import threading
 import itertools
 
-RULESET_VERSION = '2026.11.06.1'
+RULESET_VERSION = '2026.11.06.2'
 # Confirmed combinations require recovered code, not a pathname, miner keyword,
 # packer, signature publisher or a general-purpose API in isolation.
 CONFIRMED_CODE_RULES = {
@@ -100,7 +100,18 @@ def scan_bytes(data):
     return _result(_scanner().scan(data))
 
 
-def scan_file(path):
+def scan_file(path,*,timeout_seconds=3):
     # Initialize the per-thread scanner once; scan_file avoids copying a whole
     # executable into a second Python bytes allocation.
-    return _result(_scanner().scan_file(str(path)))
+    if type(timeout_seconds) is not int or not 1<=timeout_seconds<=180:
+        raise ValueError('规则扫描预算必须为 1 到 180 秒。')
+    scanner=_scanner()
+    scanner.set_timeout(timeout_seconds)
+    try:return _result(scanner.scan_file(str(path)))
+    finally:
+        # YARA-X retains its last mapped input. Releasing this lightweight
+        # per-thread scanner closes the file before repair can rename/delete
+        # it; compiled rules stay globally cached. Do not leave an antivirus
+        # scan holding the very file it must later restore.
+        scanner.set_timeout(3)
+        if getattr(_local,'scanner',None) is scanner:del _local.scanner

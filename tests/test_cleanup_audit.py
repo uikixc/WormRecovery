@@ -185,17 +185,21 @@ class RepairBoundaryTests(unittest.TestCase):
                 recovery.Cleaner.quarantine_file(c,path,'fixture',expected='scanned')
             c.close_locks.assert_not_called();self.assertTrue(path.exists())
 
-    def test_size_limited_programs_and_scripts_are_review_and_counted(self):
+    def test_malformed_large_program_is_review_but_plain_large_script_is_scanned(self):
         from family_analysis import MAX_INPUT,MAX_CARRIER
         with TemporaryDirectory() as directory:
-            for name,size,kind in (('fixture.exe',MAX_INPUT+1,'review_binary'),('fixture.ps1',MAX_CARRIER+1,'review_script')):
+            for name,size in (('fixture.exe',MAX_INPUT+1),('fixture.ps1',MAX_CARRIER+1)):
                 path=Path(directory)/name
                 with path.open('wb') as stream:stream.write(b'inert');stream.seek(size-1);stream.write(b'!')
                 result=recovery.inspect_file_content(path,path.stat())
-                self.assertEqual(result['engine_checks']['family_size_limited'],1)
-                self.assertIn(kind,{row['kind'] for row in result['findings']})
-        c=inert_cleaner();c.engine_checks={'family_size_limited':1}
-        result=c.verify();self.assertFalse(result['known_family_clear']);self.assertEqual(result['size_limited_files'],1)
+                if name.endswith('.exe'):
+                    self.assertEqual(result['engine_checks']['family_streamed_failed'],1)
+                    self.assertIn('review_binary',{row['kind'] for row in result['findings']})
+                else:
+                    self.assertEqual(result['findings'],[])
+                    self.assertEqual(result['streamed_bytes'],size)
+        c=inert_cleaner();c.engine_checks={'family_streamed_failed':1}
+        result=c.verify();self.assertFalse(result['known_family_clear']);self.assertEqual(result['large_file_incomplete'],1)
 
     def test_regenerated_runtime_requires_verified_quarantine_companion_bytes(self):
         import hashlib

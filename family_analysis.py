@@ -77,7 +77,9 @@ def rc4(data,key):
 def _hits(data,rules=None,*,raw_kind=None):
     result=rules if rules is not None else scan_bytes(data)
     names=[name for name in result.get('matches',[]) if name in CONFIRMED_CODE_RULES]
-    if names and not result.get('pattern_hits'):result=scan_bytes(data)
+    if names and not result.get('pattern_hits'):
+        if not isinstance(data,bytes):return []
+        result=scan_bytes(data)
     pe=None
     if raw_kind is None:
         try:pe=PE(data)
@@ -166,8 +168,9 @@ def _packed(data,pe):
     displacement=struct.unpack_from('<i',head,10)[0]
     compressed_rva=pe.entry+14+displacement;offset=pe.rva(compressed_rva,32)
     section=next(s for s in pe.sections if s[0]<=compressed_rva< s[0]+s[1])
-    source=bytearray(data[offset:section[2]+section[1]])
-    if not 32<=len(source)<=8*1024*1024:raise ValueError('压缩区超过静态解包范围。')
+    end=section[2]+section[1]
+    if not 32<=end-offset<=8*1024*1024:raise ValueError('压缩区超过静态解包范围。')
+    source=bytearray(data[offset:end])
     for i in range(32):source[i]^=(0x3c,0xe8)[i%2]
     from packed_content import decode_nrv2e
     decoded,consumed=decode_nrv2e(source)
@@ -177,15 +180,15 @@ def _packed(data,pe):
                     'representation':'image bytes before relative branch inversion; not a runnable restoration'}
 
 
-def inspect(data,rules=None):
+def _inspect(data,rules=None,*,mapped_pe=False):
     """Return positive code evidence or explicit limits, never a clean verdict."""
     result={'engine':'WormRecovery static family analysis','ruleset_version':RULESET_VERSION,
             'status':'no_known_match','detections':[],'decodings':[],
             'target_execution':False,'name_used_for_verdict':False}
-    if len(data)>MAX_INPUT:
+    if len(data)>MAX_INPUT and not mapped_pe:
         result.update(status='incomplete',reason='文件超过家族静态分析大小上限。');return result
     pe=None
-    if data.startswith(b'MZ'):
+    if data[:2]==b'MZ':
         try:pe=PE(data)
         except (ValueError,struct.error):pass
     observed_rules=rules if rules is not None else scan_bytes(data)
@@ -239,6 +242,33 @@ def inspect(data,rules=None):
     if len(data)==486832 and hashlib.sha256(data).hexdigest()==KNOWN_RUNTIME:
         result['role']='observed_trueupdate_runtime';result['source_sha256']=KNOWN_RUNTIME
     return result
+
+
+def inspect(data,rules=None):
+    """Inspect an already bounded byte string without loading target code."""
+    return _inspect(data,rules)
+
+
+def inspect_mapped_pe(mapping,rules):
+    """Apply code ownership to a validated read-only mapped PE and full scan.
+
+    The caller retains the source handle, bounds mapping admission, performs
+    the complete file rule scan, and checks file identity before/after. This
+    function makes no whole-file bytes copy; digesting a positive buffer uses
+    the buffer protocol directly. Known carrier unpack limits still apply.
+    """
+    PE(mapping)
+    return _inspect(mapping,rules,mapped_pe=True)
+
+
+def inspect_large_file(path,expected_stat=None):
+    from large_pe_analysis import inspect_large_file as inspect_streamed
+    return inspect_streamed(path,expected_stat=expected_stat)
+
+
+def inspect_large_script(path,expected_stat=None):
+    from large_pe_analysis import inspect_large_script as inspect_streamed
+    return inspect_streamed(path,expected_stat=expected_stat)
 
 
 def correlate(findings,observations):
