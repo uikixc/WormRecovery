@@ -189,7 +189,7 @@ class ModernWindow:
             button.pack(side='left',padx=(0,10));self.scope_buttons[key]=button
         tk.Label(setup,textvariable=self.scope_description,bg='white',fg=MUTED,font=(FONT,9),anchor='w',wraplength=820).pack(fill='x',pady=(7,2))
         self.deep_analysis=tk.BooleanVar(value=False)
-        self.deep_analysis_option=ttk.Checkbutton(setup,text='深度能力分析（capa，耗时较长；常规检测已含病毒库与内容规则）',
+        self.deep_analysis_option=ttk.Checkbutton(setup,text='单独分析待核项时启用深度能力分析（capa，耗时更长）',
             variable=self.deep_analysis,style='Option.TCheckbutton')
         self.deep_analysis_option.pack(anchor='w',pady=(5,0))
 
@@ -199,6 +199,8 @@ class ModernWindow:
         self.scan_button.pack(side='left')
         self.clean_button=ttk.Button(actions,text='修复并原位恢复',style='Secondary.TButton',command=lambda:self.launch('clean'),state='disabled')
         self.clean_button.pack(side='left',padx=10)
+        self.review_button=ttk.Button(actions,text='单独分析待核项',style='Secondary.TButton',command=lambda:self.launch('review'),state='disabled')
+        self.review_button.pack(side='left',padx=(0,10))
         self.stop_button=ttk.Button(actions,text='停止',style='Secondary.TButton',command=self.stop,state='disabled')
         self.stop_button.pack(side='left')
         self.report_button=ttk.Button(actions,text='打开报告  ↗',style='Small.TButton',command=self.open_report,state='disabled')
@@ -264,6 +266,7 @@ class ModernWindow:
         if self.scan_ready:
             self.scan_ready=False
             self.clean_button.configure(state='disabled')
+            self.review_button.configure(state='disabled')
             self.detail.set('扫描范围已改变，请重新扫描后再修复。')
 
     def browse(self):
@@ -340,6 +343,7 @@ class ModernWindow:
                 names={'clamav':'ClamAV','yara_x':'YARA-X','autoit':'AutoIt 提取','xlm':'XLM 模拟','capa':'capa','rea':'REA','office_parser':'Office 解析','vba_pcode':'VBA 编译缓存','embedded_content':'嵌入对象'}
                 statuses={'analyzed':'已分析','no_match':'未命中当前病毒库','no_content':'文件为空，无可检查内容','detected':'引擎检出','incomplete':'未完成','unsupported':'格式不支持','not_requested':'未选择'}
                 text+='\n离线复核：'+'；'.join(names[k]+' '+statuses.get(v.get('status'), '已执行规则检查') for k,v in secondary.items() if k in names and isinstance(v,dict))
+                if secondary.get('status')=='not_requested':text+='\n'+secondary.get('reason','补充引擎分析未启动。')
                 if secondary.get('clamav',{}).get('detections'):text+='\n检出名称：'+'、'.join(secondary['clamav']['detections'])
                 if secondary.get('reuse',{}).get('status')=='reused':text+='\n内容已重新校验 SHA-256；复用本次会话中相同引擎和规则已完成的分析。'
                 if record.get('analysis_incomplete_engines'):text+='\n未完成引擎：'+ '、'.join(record['analysis_incomplete_engines'])
@@ -356,6 +360,7 @@ class ModernWindow:
         self.deep_analysis_option.configure(state='disabled' if busy else 'normal')
         self.scan_button.configure(state='disabled' if busy else 'normal')
         self.clean_button.configure(state='normal' if not busy and self.scan_ready and self.has_confirmed() else 'disabled')
+        self.review_button.configure(state='normal' if not busy and self.scan_ready and self.cleaner and any(r['kind'].startswith('review_') for r in self.cleaner.findings) else 'disabled')
         self.stop_button.configure(state='normal' if busy else 'disabled')
         for widget in self.scope_buttons.values():widget.configure(state='disabled' if busy else 'normal')
         if busy:self.progress.start(14)
@@ -373,7 +378,7 @@ class ModernWindow:
 
     def launch(self,mode):
         if self.busy:return
-        if mode=='clean' and not self.scan_ready:return
+        if mode in ('clean','review') and not self.scan_ready:return
         if mode=='clean':
             if not ctypes.windll.shell32.IsUserAnAdmin():
                 messagebox.showerror('需要管理员权限','请以管理员身份运行。',parent=self.root);return
@@ -392,8 +397,8 @@ class ModernWindow:
             self.result_records=[]
             self.render_results()
             for metric in self.metrics.values():metric.set('0')
-        self.status.set('正在检测' if mode=='scan' else '正在修复')
-        self.detail.set('正在检测并记录证据，本次扫描不执行修复。' if mode=='scan' else '正在备份、验证并修复感染文件。')
+        self.status.set('正在检测' if mode=='scan' else '正在补充分析' if mode=='review' else '正在修复')
+        self.detail.set('正在检测并记录证据，完成后即可处理确认项；补充引擎需单独启动。' if mode=='scan' else '仅分析现有待核项，可以停止；停止后仍可处理已确认感染。' if mode=='review' else '正在备份、验证并修复感染文件。')
         self.set_busy(True)
         def output(text):self.queue.put((generation,'log',text))
         def worker():
@@ -411,10 +416,16 @@ class ModernWindow:
                         if not c.cancel.is_set():c.contain();c.registry();c.system_persistence();c.firewall()
                         c.scan(scope['roots'])
                     execute(c,'scan',inspect_only)
+                elif mode=='review':
+                    c=self.cleaner;c.deep_analysis=deep_analysis
+                    c.cancel.clear()
+                    if self.stop_requested.is_set():c.cancel.set()
+                    execute(c,'review',c.review)
                 else:
                     c=self.cleaner
                     c.deep_analysis=deep_analysis
                     c.cancel.clear();c.force_close=True;c.restore_history=True
+                    if self.stop_requested.is_set():c.cancel.set()
                     def repair_and_verify():
                         c.repair()
                         self.queue.put((generation,'phase','正在复扫'))
@@ -495,7 +506,7 @@ class ModernWindow:
                     messagebox.showerror('操作未完成',payload,parent=self.root)
                 elif kind=='done':
                     c=self.cleaner
-                    self.scan_ready=payload=='scan' and not c.cancel.is_set()
+                    self.scan_ready=payload in ('scan','review')
                     self.result_records=list(c.findings)+[dict(row,kind='coverage_error',_coverage_error=True) for row in c.errors]
                     self.render_results()
                     self.set_busy(False)
@@ -507,9 +518,11 @@ class ModernWindow:
                     failures=sum(row.get('scope')=='repair_failed' for row in c.errors)
                     limits=len(c.errors)-failures
                     error_text='修复失败 %s 项，检查受限 %s 项（共发生 %s 次，重复项已合并）'%(failures,limits,sum(row.get('occurrences',1) for row in c.errors))
-                    if c.cancel.is_set():self.status.set('已停止');self.detail.set('已完成的文件事务已保存；重新扫描后再修复。')
-                    elif payload=='scan':
-                        self.status.set('检测完成')
+                    if c.cancel.is_set():
+                        self.status.set('已停止，保留现有结果')
+                        self.detail.set('扫描或分析未完成；已发现的确认感染可以处理，处理前逐项重新校验。未扫描和待核内容不视为安全。' if self.scan_ready else '已完成的文件事务已保存；复核未完成，不能判定清理完成。')
+                    elif payload in ('scan','review'):
+                        self.status.set('检测完成' if payload=='scan' else '补充分析完成')
                         self.detail.set('确认感染 %s 项，未确认文件 %s 项，分析说明 %s 项；'%(confirmed,review_count,info_count)+error_text+'。')
                     else:
                         complete=(getattr(c,'verification',None) or {}).get('known_family_clear',False)

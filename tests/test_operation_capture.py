@@ -49,6 +49,15 @@ class OperationCaptureTests(unittest.TestCase):
         with patch('diagnostic_client.collect') as collect,patch('diagnostic_client.schedule'):
             execute(self.cleaner,'scan',lambda:self.cleaner.cancel.set())
         record=json.loads(Path(collect.call_args.args[0]).read_text());self.assertEqual(record['operation']['status'],'cancelled')
+    def test_supplemental_review_has_separate_readonly_snapshot(self):
+        with patch('diagnostic_client.collect'),patch('diagnostic_client.schedule'):
+            execute(self.cleaner,'scan',lambda:None)
+            scan_id=self.cleaner.operation['id']
+            execute(self.cleaner,'review',lambda:self.cleaner.cancel.set())
+        self.assertFalse(self.cleaner.operation['mutations_allowed'])
+        self.assertEqual(self.cleaner.operation['status'],'cancelled')
+        self.assertTrue((self.root/'operations'/scan_id/'report.json').is_file())
+        self.assertNotEqual(scan_id,self.cleaner.operation['id'])
     def test_capture_failure_does_not_change_completed_scan_result(self):
         with patch('diagnostic_client.collect',side_effect=OSError('inert queue failure')):
             self.assertEqual(execute(self.cleaner,'scan',lambda:42),42)

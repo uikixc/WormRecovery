@@ -17,6 +17,11 @@ class VerificationTests(unittest.TestCase):
     def test_prior_error_blocks_clean_result(self):
         c=self.cleaner();c.errors=[{'path':'C:/locked.exe','error':'access denied'}]
         self.assertFalse(c.verify()['known_family_clear'])
+    def test_verification_does_not_repeat_optional_engines(self):
+        c=self.cleaner();c.secondary_enabled=True;seen=[]
+        c.scan=lambda roots:seen.append(c.secondary_enabled) or []
+        c.verify()
+        self.assertEqual(seen,[False]);self.assertTrue(c.secondary_enabled)
     def test_repeated_scan_error_counts_new_occurrence_not_new_item(self):
         c=self.cleaner();c.errors=[{'path':'C:/locked','error':'locked','occurrences':2,'stages':{'scan':2},'scope':'inspection_limit'}]
         c.scan=lambda roots:c.error('C:/locked','locked') or []
@@ -54,6 +59,17 @@ class VerificationTests(unittest.TestCase):
     def test_stop_does_not_report_clean(self):
         c=self.cleaner();c.cancel.set()
         self.assertFalse(c.verify()['known_family_clear'])
+    def test_stopped_verification_preserves_existing_findings_without_rescan(self):
+        c=self.cleaner();c.findings=[{'kind':'infected_executable','path':'C:/inert.exe'}]
+        before=list(c.findings);c.cancel.set()
+        with patch.object(c,'scan',side_effect=AssertionError('cancelled verification must not reset results')):
+            result=c.verify()
+        self.assertEqual(c.findings,before);self.assertEqual(result['remaining_confirmed'],before)
+        self.assertTrue(result['cancelled']);self.assertFalse(result['known_family_clear'])
+    def test_cancelled_repair_does_not_start_persistence_changes(self):
+        c=self.cleaner();c.cancel.set()
+        with patch.object(c,'registry',side_effect=AssertionError('cancelled repair must not start')):
+            c.repair()
     def test_unresolved_link_blocks_completion(self):
         c=self.cleaner();c.reparse_points=[{'path':'C:/link','status':'unverified'}]
         self.assertFalse(c.verify()['known_family_clear'])

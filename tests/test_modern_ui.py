@@ -180,6 +180,44 @@ class ModernUITests(unittest.TestCase):
         while self.app.busy and time.monotonic()<deadline:
             self.app.root.update();time.sleep(.02)
         self.assertFalse(self.app.busy)
+    def test_stopped_scan_can_repair_confirmed_without_repeating_scan(self):
+        a=self.app
+        original=FakeCleaner.scan
+        def stop_after_results(cleaner,roots=None):
+            original(cleaner,roots);cleaner.cancel.set()
+        with patch.object(FakeCleaner,'scan',stop_after_results):
+            a.launch('scan');self.wait()
+        self.assertTrue(a.cleaner.cancel.is_set());self.assertTrue(a.scan_ready)
+        self.assertNotIn('disabled',a.clean_button.state())
+        self.assertIn('已发现的确认感染可以处理',a.detail.get())
+        with patch.object(FakeCleaner,'scan',side_effect=AssertionError('must reuse current findings')), \
+             patch.object(modern_ui.messagebox,'askokcancel',return_value=True), \
+             patch.object(modern_ui.ctypes.windll.shell32,'IsUserAnAdmin',return_value=True):
+            a.launch('clean');self.wait()
+        self.assertFalse(a.cleaner.cancel.is_set())
+        self.assertEqual(a.cleaner.events,[{'kind':'office_recovered'}])
+        self.assertEqual(a.cleaner.operation['type'],'repair')
+
+    def test_stopped_review_is_readonly_and_preserves_confirmed_repair(self):
+        a=self.app;a.launch('scan');self.wait()
+        confirmed=a.cleaner.findings[0]
+        def review(cleaner):cleaner.cancel.set()
+        with patch.object(FakeCleaner,'review',review,create=True), \
+             patch.object(FakeCleaner,'scan',side_effect=AssertionError('no repeat scan')), \
+             patch.object(FakeCleaner,'repair',side_effect=AssertionError('review cannot repair')):
+            a.launch('review');self.wait()
+        self.assertIs(a.cleaner.findings[0],confirmed)
+        self.assertEqual(a.cleaner.operation['type'],'review')
+        self.assertFalse(a.cleaner.operation['mutations_allowed'])
+        self.assertTrue(a.scan_ready);self.assertNotIn('disabled',a.clean_button.state())
+
+    def test_stopped_review_only_scan_does_not_enable_repair(self):
+        a=self.app
+        def review_only(cleaner,roots=None):
+            cleaner.findings=[{'kind':'review_binary','path':'C:/inert.bin'}];cleaner.cancel.set()
+        with patch.object(FakeCleaner,'scan',review_only):a.launch('scan');self.wait()
+        self.assertTrue(a.scan_ready);self.assertIn('disabled',a.clean_button.state())
+        self.assertNotIn('disabled',a.review_button.state())
     def test_scan_filter_repair_state_and_scope_invalidation(self):
         a=self.app
         self.assertIn('disabled',a.clean_button.state())
@@ -208,6 +246,10 @@ class ModernUITests(unittest.TestCase):
     def test_log_navigation_and_small_window_layout(self):
         a=self.app
         a.root.geometry('1000x760');a.root.update()
+        buttons=[a.scan_button,a.clean_button,a.review_button,a.stop_button,a.report_button]
+        self.assertTrue(all(button.winfo_ismapped() for button in buttons))
+        for left,right in zip(buttons,buttons[1:]):
+            self.assertLessEqual(left.winfo_rootx()+left.winfo_width(),right.winfo_rootx())
         self.assertGreater(a.tree.winfo_height(),60)
         self.assertLess(a.panel.winfo_rooty()+a.panel.winfo_height(),a.root.winfo_rooty()+a.root.winfo_height())
         self.assertEqual(set(a.scope_buttons),{'internal','removable','manual'})

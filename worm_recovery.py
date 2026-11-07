@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.5'
+VERSION = '1.8.6'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -1069,14 +1069,25 @@ class Cleaner:
             for row in correlate(self.findings,self.family_observations):
                 kind=row.pop('kind');path=row.pop('path');self.add(kind,path,**row)
             self.recheck_deployment_observations()
-            from secondary_analysis import enrich_reviews
-            enrich_reviews(self)
+            from secondary_analysis import defer_reviews, enrich_reviews
+            if getattr(self,'secondary_enabled',False):enrich_reviews(self)
+            else:defer_reviews(self)
         self.scan_seconds=time.monotonic()-start
         self.review_seconds=max(0,self.scan_seconds-self.file_scan_seconds)
         self.set_progress('save','正在保存检测报告')
         self.log('scan_complete',files=self.count,directories=self.dircount,seconds=self.scan_seconds,cancelled=self.cancel.is_set(),findings=len(self.findings),skipped_count=len(self.skipped))
         self.save()
         self.progress=dict(self.progress,phase='stopped' if self.cancel.is_set() else 'complete',stage='已停止' if self.cancel.is_set() else '检测完成')
+        return self.findings
+    def review(self):
+        """Explicit read-only analysis of current unresolved findings."""
+        from secondary_analysis import enrich_reviews
+        self._error_stage='review';started=time.monotonic()
+        try:enrich_reviews(self)
+        finally:
+            self.supplemental_review_seconds=time.monotonic()-started
+            self.set_progress('stopped' if self.cancel.is_set() else 'complete','补充分析已停止' if self.cancel.is_set() else '补充分析完成')
+            self.save()
         return self.findings
     def payload_path(self,path):
         p=pathlib.Path(path);parts=[x.casefold() for x in p.parts]
@@ -1213,6 +1224,7 @@ class Cleaner:
             raise ValueError('内容复核未通过，未终止占用进程，原文件已保留。')
         return before
     def repair(self):
+        if self.cancel.is_set():return
         self._error_stage='repair'
         self.initial_findings=copy.deepcopy(self.findings)
         self.registry_snapshot=copy.deepcopy(self.registry(False))
@@ -1270,17 +1282,27 @@ class Cleaner:
                 if root:residue_roots.add(root)
             except Exception as ex:self.error(p,ex)
         for root in residue_roots:
+            if self.cancel.is_set():break
             try:self.cleanup_empty_payload_roots([root])
             except Exception as ex:self.error(root,ex)
-        try:self.security_settings();self.registry(True)
-        except Exception as ex:self.error('security_settings',ex)
+        if not self.cancel.is_set():
+            try:self.security_settings();self.registry(True)
+            except Exception as ex:self.error('security_settings',ex)
         self.save()
     def verify(self):
+        if self.cancel.is_set():
+            self.verification={'roots':list(self.scan_roots),'cancelled':True,'known_family_clear':False,
+                'remaining_confirmed':copy.deepcopy([r for r in self.findings if is_confirmed(r)]),
+                'review_count':sum(r['kind'].startswith('review_') for r in self.findings),
+                'assessment':'复扫已停止；现有检测结果已保留，不能判定清理完成。'}
+            self.verification['unresolved_review_count']=self.verification['review_count']
+            self.log('verification_complete',result=self.verification);self.save();return self.verification
         before_errors=sum(row.get('occurrences',1) for row in self.errors);roots=list(self.scan_roots)
         workers=getattr(self,'scan_workers',None)
         self._verification_active=True;self._error_stage='verification'
+        secondary_enabled=getattr(self,'secondary_enabled',False);self.secondary_enabled=False
         try:remaining=self.scan(roots,workers=workers) if workers is not None else self.scan(roots)
-        finally:self._verification_active=False
+        finally:self._verification_active=False;self.secondary_enabled=secondary_enabled
         processes=self.contain(False);registry=self.registry(False);system=self.system_persistence(False);firewall=[x for x in self.firewall(False) if x['enabled']=='True']
         active_tasks=[]
         for x in system.get('tasks',[]):
@@ -1316,6 +1338,7 @@ class Cleaner:
         summary.update(registry_snapshot=getattr(self,'registry_snapshot',None),persistence_snapshot=getattr(self,'persistence_snapshot',None),scan_roots=self.scan_roots,initial_findings=self.initial_findings,verification=self.verification,skipped=self.skipped,reparse_points=getattr(self,'reparse_points',[]),inspection_failed=self.inspection_failed,scope_summary=getattr(self,'scope_summary',None))
         summary['operation']=dict(getattr(self,'operation',{'type':'legacy_unclassified'}))
         summary['scan_timing']={'file_scan_seconds':getattr(self,'file_scan_seconds',None),'secondary_analysis_seconds':getattr(self,'review_seconds',None)}
+        summary['scan_timing']['supplemental_analysis_seconds']=getattr(self,'supplemental_review_seconds',None)
         summary['error_summary']={'unique_items':len(self.errors),'occurrences':sum(row.get('occurrences',1) for row in self.errors),
             'repair_failed_items':sum(row.get('scope')=='repair_failed' for row in self.errors),
             'inspection_limit_items':sum(row.get('scope')!='repair_failed' for row in self.errors)}
@@ -1385,7 +1408,8 @@ def cli_main():
     parser.add_argument('--root',action='append',help='手动指定扫描位置；选择外接设备中的位置时包含同设备全部盘符')
     parser.add_argument('--scope',choices=['internal','removable'],default='internal',help='internal：本机全盘；removable：可移动设备')
     parser.add_argument('--workers',type=int,choices=range(1,9),metavar='1-8',help='只读文件扫描线程数；默认按物理磁盘自动选择')
-    parser.add_argument('--deep-analysis',action='store_true',help='同时执行耗时较长的 capa 能力分析；常规检测仍保留病毒库与内容规则')
+    parser.add_argument('--deep-analysis',action='store_true',help='显式启动待核项补充引擎，并启用耗时较长的 capa 能力分析')
+    parser.add_argument('--secondary-analysis',action='store_true',help='扫描后额外分析待核项（ClamAV/REA 等，可能耗时很长）；默认单独启动')
     parser.add_argument('--report-dir',help='固定磁盘上的报告/隔离根目录')
     parser.add_argument('--force-close',action='store_true',default=True,help=argparse.SUPPRESS)
     parser.add_argument('--restore-history',action='store_true',default=True,help=argparse.SUPPRESS)
@@ -1397,6 +1421,7 @@ def cli_main():
     cleaner=Cleaner(args.report_dir,force_close=True,protected=args.exclude,restore_history=True,external_volumes=scope['external_volumes'],excluded_roots=scope['excluded_roots'])
     cleaner.scope_summary=scope
     cleaner.deep_analysis=args.deep_analysis
+    cleaner.secondary_enabled=args.secondary_analysis or args.deep_analysis
     from operation_capture import execute
     def inspect_only():
         cleaner.contain(False);cleaner.registry(False);cleaner.system_persistence(False)

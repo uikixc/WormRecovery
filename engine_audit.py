@@ -25,6 +25,7 @@ def build_audit(first_pass,dispatch,findings):
 def dispatch_message(dispatch):
     status=dispatch.get('status')
     if status=='not_needed':return '二次引擎未调用：本次没有未决候选文件。'
+    if status=='not_requested':return '补充引擎未启动：%s 个待核项已保留，可单独分析，不阻止处理确认感染。'%dispatch.get('candidates',0)
     if status=='dispatched':return '二次引擎已调度：%s 个候选文件，具体结果请查看文件详情。'%dispatch.get('candidates',0)
     if status=='cancelled':return '二次引擎未完成：用户已停止。'
     return '二次引擎尚未调度。'

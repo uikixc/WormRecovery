@@ -29,7 +29,7 @@ def capture_preflight_failure(error,version,mode,manual=None):
 
 
 def execute(cleaner,kind,action):
-    if kind not in ('scan','repair'):raise ValueError('操作类型无效。')
+    if kind not in ('scan','review','repair'):raise ValueError('操作类型无效。')
     cleaner.session_id=getattr(cleaner,'session_id',str(uuid.uuid4()))
     cleaner.operation={'id':str(uuid.uuid4()),'session_id':cleaner.session_id,'type':kind,
         'status':'running','started_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),

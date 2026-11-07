@@ -217,6 +217,15 @@ def complete_evidence(value):
     return True
 
 
+def defer_reviews(cleaner):
+    candidates=[row for row in cleaner.findings if row.get('kind','').startswith('review_')]
+    reason='补充引擎分析未启动；待核项保留，可单独分析，不阻止处理已确认感染。'
+    cleaner.secondary_dispatch={'candidates':len(candidates),'status':'not_requested' if candidates else 'not_needed','reason':reason}
+    for row in candidates:
+        row.setdefault('secondary_analysis',{'status':'not_requested','reason':reason})
+    cleaner.log('secondary_dispatch',**cleaner.secondary_dispatch)
+
+
 def enrich_reviews(cleaner):
     candidates = [row for row in cleaner.findings if row.get('kind', '').startswith('review_')]
     cleaner.secondary_dispatch={'candidates':len(candidates),'status':'cancelled' if cleaner.cancel.is_set() else 'not_needed' if not candidates else 'dispatched',
@@ -224,6 +233,9 @@ def enrich_reviews(cleaner):
     cleaner.log('secondary_dispatch',**cleaner.secondary_dispatch)
     if not candidates or cleaner.cancel.is_set():
         return
+    for row in candidates:
+        row.pop('secondary_analysis',None)
+        row.pop('analysis_incomplete_engines',None)
     from local_rules import RULESET_VERSION
     generation=hashlib.sha256(json.dumps({'assets':manifest(),'rules':RULESET_VERSION,'schema':1},sort_keys=True).encode()).hexdigest()
     cache=getattr(cleaner,'_secondary_cache',None)

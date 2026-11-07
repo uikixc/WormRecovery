@@ -104,10 +104,10 @@ class ScannerEquivalenceTests(unittest.TestCase):
             for extension in ('.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf'):
                 (root/('inert'+extension)).write_bytes(b'AutoIt3ExecuteScript GoogleChrome.a3x cmd.exe')
             c=w.Cleaner(emit=lambda _:None)
-            def enrich(cleaner):
-                self.assertEqual(len(cleaner.findings),7)
-            with patch('secondary_analysis.enrich_reviews',side_effect=enrich):
+            with patch('secondary_analysis.enrich_reviews',side_effect=AssertionError('supplemental engines must be explicit')):
                 c.scan([str(root)],workers=2)
+            self.assertEqual(c.secondary_dispatch['status'],'not_requested')
+            self.assertTrue(all(row['secondary_analysis']['status']=='not_requested' for row in c.findings))
             self.assertEqual(c.errors,[])
             self.assertEqual({Path(row['path']).suffix for row in c.findings},{'.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf'})
             self.assertTrue(all(row['kind']=='review_script' for row in c.findings))
