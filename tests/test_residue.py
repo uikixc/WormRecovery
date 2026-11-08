@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import os
 import tempfile
 import unittest
+import threading
+from windows_read import locked_read
 from unittest.mock import patch, MagicMock
 
 import worm_recovery as w
@@ -11,6 +13,36 @@ import worm_residue as residue
 
 
 class ResidueTests(unittest.TestCase):
+    def test_repair_reuses_only_unchanged_images_held_under_a_read_lease(self):
+        c=self.cleaner();c._containment_cache={};c.stop_pid=MagicMock();c.cancel=threading.Event()
+        with tempfile.TemporaryDirectory() as temp:
+            image=Path(temp)/'inert.bin';image.write_bytes(b'inert process image')
+            proc=SimpleNamespace(pid=123456,info={'name':'fixture','exe':str(image),'cmdline':[str(image)]})
+            with patch.object(w.psutil,'process_iter',return_value=[proc]),patch.object(w,'is_stub',return_value=False) as stub,patch.object(c,'content_confirmed_path',return_value=False) as content:
+                try:
+                    c.contain(True);c.contain(True)
+                    self.assertEqual(stub.call_count,1);self.assertEqual(content.call_count,1)
+                    self.assertEqual(c.events[-1]['images_reused'],1)
+                    with self.assertRaises(PermissionError):image.write_bytes(b'changed')
+                    with self.assertRaises(PermissionError):image.unlink()
+                finally:
+                    for handle,_ in c._containment_cache.values():handle.close()
+            image.write_bytes(b'changed');self.assertEqual(image.read_bytes(),b'changed')
+        c.stop_pid.assert_not_called()
+
+    def test_failed_image_lease_rechecks_and_repair_releases_leases_on_failure(self):
+        c=self.cleaner();c._containment_cache={};c.stop_pid=MagicMock();c.cancel=threading.Event()
+        with tempfile.TemporaryDirectory() as temp:
+            image=Path(temp)/'inert.bin';image.write_bytes(b'inert process image')
+            proc=SimpleNamespace(pid=123456,info={'name':'fixture','exe':str(image),'cmdline':[str(image)]})
+            with patch.object(w.psutil,'process_iter',return_value=[proc]),patch.object(w,'is_stub',return_value=False) as stub,patch.object(c,'content_confirmed_path',return_value=False),patch.object(w,'locked_read',side_effect=PermissionError('fixture')):
+                c.contain(True);c.contain(True);self.assertEqual(stub.call_count,2)
+            def failure():
+                c._containment_cache['fixture']=(locked_read(image),None)
+                raise RuntimeError('fixture failure')
+            with patch.object(c,'_repair',side_effect=failure),self.assertRaises(RuntimeError):c.repair()
+            self.assertIsNone(c._containment_cache);image.write_bytes(b'unlocked')
+
     def cleaner(self):
         c=w.Cleaner.__new__(w.Cleaner)
         c.events=[];c.errors=[];c.findings=[];c.protected=[]

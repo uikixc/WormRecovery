@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.IO.Pipes;
 using System.Linq;
 using System.Reflection;
 using System.Security.AccessControl;
@@ -27,7 +28,7 @@ internal static class RuntimeLauncher {
             Text = "WormRecovery · 正在启动"; Width = 470; Height = 170;
             StartPosition = FormStartPosition.CenterScreen; FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false;
-            status.SetBounds(22, 20, 410, 45); status.Text = "正在验证离线检测组件…";
+            status.SetBounds(22, 20, 410, 45); status.Text = "正在启动 WormRecovery…";
             progress.SetBounds(22, 78, 410, 20); Controls.Add(status); Controls.Add(progress);
             FormClosing += (sender, e) => { Cancelled = true; e.Cancel = true; };
         }
@@ -39,8 +40,9 @@ internal static class RuntimeLauncher {
     }
     private static StartupWindow startup;
     private static readonly Stopwatch uiClock = Stopwatch.StartNew();
+    private static readonly int uiThread = System.Threading.Thread.CurrentThread.ManagedThreadId;
     private static void Progress(string text, int done, int total) {
-        if (startup == null) return;
+        if (System.Threading.Thread.CurrentThread.ManagedThreadId != uiThread || startup == null) return;
         if (done != 0 && done != total && uiClock.ElapsedMilliseconds < 80) return;
         uiClock.Restart(); startup.Report(text, done, total);
     }
@@ -77,8 +79,11 @@ internal static class RuntimeLauncher {
         if (!adminAllowed) throw new IOException("Runtime cache administrator access is missing.");
     }
     private static Dictionary<string, Item> ReadManifest(out string identity) {
+        return ReadManifest("runtime-manifest.tsv", true, out identity);
+    }
+    private static Dictionary<string, Item> ReadManifest(string resource, bool requireEntry, out string identity) {
         byte[] bytes;
-        using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("runtime-manifest.tsv"))
+        using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resource))
         using (var memory = new MemoryStream()) { stream.CopyTo(memory); bytes = memory.ToArray(); }
         using (var memory = new MemoryStream(bytes)) identity = Hash(memory);
         var items = new Dictionary<string, Item>(StringComparer.OrdinalIgnoreCase);
@@ -92,16 +97,16 @@ internal static class RuntimeLauncher {
                 throw new IOException("Invalid embedded runtime filename.");
             items.Add(name, new Item { Name = name, Hash = fields[0], Size = size });
         }
-        if (!items.ContainsKey(LauncherConfig.Entry)) throw new IOException("Runtime entry is missing.");
+        if (requireEntry && !items.ContainsKey(LauncherConfig.Entry)) throw new IOException("Runtime entry is missing.");
         return items;
     }
     private static string ItemPath(string root, string name) { return Path.Combine(root, name.Replace('/', Path.DirectorySeparatorChar)); }
-    private static void Extract(string stage, Dictionary<string, Item> items) {
+    private static void Extract(string stage, Dictionary<string, Item> items, string resource = "runtime.zip") {
         stage = ExtendedPath(stage);
         Directory.CreateDirectory(stage, RootSecurity());
         var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        Progress("正在准备离线检测组件，仅首次需要…", 0, items.Count);
-        using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("runtime.zip"))
+        Progress("正在准备程序运行文件，仅首次需要…", 0, items.Count);
+        using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resource))
         using (var zip = new ZipArchive(stream, ZipArchiveMode.Read)) {
             foreach (var entry in zip.Entries) {
                 Item item;
@@ -119,7 +124,7 @@ internal static class RuntimeLauncher {
                     // which the full verification below rejects before execution.
                     output.Flush();
                 }
-                Progress("正在准备离线检测组件，仅首次需要…", found.Count, items.Count);
+                Progress("正在准备程序运行文件，仅首次需要…", found.Count, items.Count);
             }
         }
         if (found.Count != items.Count) throw new IOException("Runtime archive is incomplete.");
@@ -129,7 +134,7 @@ internal static class RuntimeLauncher {
     private static List<FileStream> VerifyAndLock(string root, Dictionary<string, Item> items) {
         root = ExtendedPath(root);
         var handles = new List<FileStream>();
-        Progress("正在验证离线检测组件…", 0, items.Count);
+        Progress("正在校验程序运行文件…", 0, items.Count);
         try {
             var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var directories = new Stack<string>(); directories.Push(root);
@@ -143,12 +148,74 @@ internal static class RuntimeLauncher {
                     if (!items.TryGetValue(name, out item) || !found.Add(name)) throw new IOException("Unexpected runtime cache file.");
                     var handle = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read); handles.Add(handle);
                     if (handle.Length != item.Size || Hash(handle) != item.Hash) throw new IOException("Runtime cache verification failed: " + name);
-                    Progress("正在验证离线检测组件…", found.Count, items.Count);
+                    Progress("正在校验程序运行文件…", found.Count, items.Count);
                 }
             }
             if (found.Count != items.Count) throw new IOException("Runtime cache is incomplete.");
             return handles;
         } catch { foreach (var handle in handles) handle.Dispose(); throw; }
+    }
+    private sealed class OptionalBroker : IDisposable {
+        private readonly string cache;
+        private readonly System.Threading.Thread worker;
+        private readonly object gate = new object();
+        private NamedPipeServerStream pipe;
+        private bool closed;
+        private List<FileStream> locks;
+        private string ready;
+        public readonly string Name = "WormRecovery-" + Guid.NewGuid().ToString("N");
+        public OptionalBroker(string cachePath) {
+            cache = cachePath;
+            worker = new System.Threading.Thread(Serve); worker.IsBackground = true; worker.Start();
+        }
+        private string Prepare() {
+            if (ready != null) return ready;
+            string identity; var items = ReadManifest("optional-manifest.tsv", false, out identity);
+            if (items.Count == 0) throw new IOException("Optional engines are not bundled.");
+            string root = Path.Combine(cache, identity);
+            using (var mutex = new System.Threading.Mutex(false, "Global\\WormRecoveryRuntime-" + identity)) {
+                bool acquired = false;
+                try {
+                    try { acquired = mutex.WaitOne(TimeSpan.FromMinutes(3)); }
+                    catch (System.Threading.AbandonedMutexException) { acquired = true; }
+                    if (!acquired) throw new IOException("Optional engine preparation is busy.");
+                    PlainPath(cache); CheckSecurity(Directory.GetAccessControl(ExtendedPath(cache)));
+                    if (!Directory.Exists(ExtendedPath(root))) {
+                        string stage = Path.Combine(cache, identity + ".stage-" + Guid.NewGuid().ToString("N"));
+                        Extract(stage, items, "optional.zip");
+                        Directory.Move(ExtendedPath(stage), ExtendedPath(root));
+                    }
+                    locks = VerifyAndLock(root, items);
+                    ready = ItemPath(root, "_internal/engines");
+                } finally { if (acquired) mutex.ReleaseMutex(); }
+            }
+            return ready;
+        }
+        private void Serve() {
+            try {
+                while (true) {
+                    var security = new PipeSecurity(); security.SetAccessRuleProtection(true, false);
+                    foreach (var sid in new [] { Admin, SystemSid })
+                        security.AddAccessRule(new PipeAccessRule(sid, PipeAccessRights.FullControl, AccessControlType.Allow));
+                    using (var current = new NamedPipeServerStream(Name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 4096, 4096, security)) {
+                        lock (gate) { if (closed) return; pipe = current; }
+                        current.WaitForConnection();
+                        // No caller-selected path, command or target is accepted.
+                        string response;
+                        try { response = "OK\t" + Prepare(); }
+                        catch (Exception ex) { response = "ERROR\t" + ex.Message.Replace('\r', ' ').Replace('\n', ' '); }
+                        byte[] bytes = Encoding.UTF8.GetBytes(response + "\n");
+                        current.Write(bytes, 0, bytes.Length); current.Flush();
+                    }
+                    lock (gate) { pipe = null; if (closed) return; }
+                }
+            } catch (IOException) { } catch (ObjectDisposedException) { }
+        }
+        public void Dispose() {
+            lock (gate) { closed = true; if (pipe != null) pipe.Dispose(); }
+            worker.Join();
+            if (locks != null) foreach (var handle in locks) handle.Dispose();
+        }
     }
     private static string Quote(string value) {
         var b = new StringBuilder("\""); int slashes = 0;
@@ -163,8 +230,9 @@ internal static class RuntimeLauncher {
         AppContext.SetSwitch("Switch.System.IO.UseLegacyPathHandling", false);
         AppContext.SetSwitch("Switch.System.IO.BlockLongPaths", false);
         List<FileStream> handles = null;
+        OptionalBroker broker = null;
         try {
-            if (args.Length == 0) { Application.EnableVisualStyles(); startup = new StartupWindow(); startup.Show(); Progress("正在验证离线检测组件…", 0, 0); }
+            if (args.Length == 0) { Application.EnableVisualStyles(); startup = new StartupWindow(); startup.Show(); Progress("正在启动 WormRecovery…", 0, 0); }
             string identity; var items = ReadManifest(out identity);
             string cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "WormRecoveryRuntime");
             PlainPath(cache); Directory.CreateDirectory(ExtendedPath(cache), RootSecurity()); CheckSecurity(Directory.GetAccessControl(ExtendedPath(cache)));
@@ -193,6 +261,7 @@ internal static class RuntimeLauncher {
                     handles = VerifyAndLock(root, items);
                 } finally { if (acquired) mutex.ReleaseMutex(); }
             }
+            broker = new OptionalBroker(cache);
             var start = new ProcessStartInfo(ItemPath(root, LauncherConfig.Entry), string.Join(" ", args.Select(Quote)));
             start.UseShellExecute = false; start.CreateNoWindow = true;
             start.RedirectStandardOutput = true; start.RedirectStandardError = true;
@@ -200,6 +269,7 @@ internal static class RuntimeLauncher {
             start.EnvironmentVariables["WORMRECOVERY_LAUNCHER_PATH"] = Assembly.GetExecutingAssembly().Location;
             start.EnvironmentVariables["WORMRECOVERY_LAUNCHER_PID"] = Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture);
             start.EnvironmentVariables["WORMRECOVERY_RUNTIME_ROOT"] = root;
+            start.EnvironmentVariables["WORMRECOVERY_ENGINE_PIPE"] = broker.Name;
             start.EnvironmentVariables["PYINSTALLER_RESET_ENVIRONMENT"] = "1";
             start.EnvironmentVariables.Remove("WORMRECOVERY_ENGINE_ROOT"); start.EnvironmentVariables.Remove("WORMRECOVERY_WORK_ROOT");
             start.EnvironmentVariables.Remove("PYTHONPATH"); start.EnvironmentVariables.Remove("PYTHONHOME");
@@ -219,6 +289,6 @@ internal static class RuntimeLauncher {
             try { Console.Error.WriteLine(ex.ToString()); } catch { }
             if (args.Length == 0) MessageBox.Show(ex.Message, "WormRecovery runtime", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
-        } finally { if (startup != null) startup.Dispose(); if (handles != null) foreach (var handle in handles) handle.Dispose(); }
+        } finally { if (startup != null) startup.Dispose(); if (broker != null) broker.Dispose(); if (handles != null) foreach (var handle in handles) handle.Dispose(); }
     }
 }

@@ -6,7 +6,7 @@ import subprocess
 import zipfile
 
 
-def create_payload(source, output):
+def create_payload(source, output, *, optional=False):
     source=Path(source).resolve();output=Path(output);output.mkdir(parents=True,exist_ok=True)
     files=[]
     for path in sorted(source.rglob('*')):
@@ -14,13 +14,20 @@ def create_payload(source, output):
             raise ValueError('Runtime payload must not contain reparse points: '+str(path))
         if path.is_file():
             relative=path.relative_to(source).as_posix()
+            parts=relative.split('/')
+            engine=len(parts)>2 and parts[:2]==['_internal','engines']
+            extra=engine and parts[2] not in ('analysis','WormRecovery-CLI.exe','manifest.json')
+            shared=engine and parts[2]=='manifest.json'
+            if optional and not (extra or shared):continue
+            if not optional and extra:continue
             if any(c in relative for c in '\t\r\n') or ':' in relative:raise ValueError('Invalid payload name')
             with path.open('rb') as stream:digest=hashlib.file_digest(stream,'sha256').hexdigest()
             files.append((relative,path.stat().st_size,digest,path))
-    if not files:raise ValueError('Runtime payload is empty')
-    manifest=output/'runtime-manifest.tsv'
+    if not files and not optional:raise ValueError('Runtime payload is empty')
+    prefix='optional' if optional else 'runtime'
+    manifest=output/(prefix+'-manifest.tsv')
     manifest.write_text(''.join(f'{digest}\t{size}\t{name}\n' for name,size,digest,path in files),encoding='utf8',newline='\n')
-    archive=output/'runtime.zip'
+    archive=output/(prefix+'.zip')
     with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
         for name,size,digest,path in files:z.write(path,name)
     return archive,manifest
@@ -28,6 +35,7 @@ def create_payload(source, output):
 
 def build_launcher(source, destination, work, entry='WormRecovery.exe'):
     archive,manifest=create_payload(source,work)
+    optional_archive,optional_manifest=create_payload(source,work,optional=True)
     compiler=Path('C:/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe')
     if not compiler.is_file():raise FileNotFoundError('Windows .NET Framework 4 compiler is required for the launcher build')
     repo=Path(__file__).resolve().parent
@@ -38,6 +46,7 @@ def build_launcher(source, destination, work, entry='WormRecovery.exe'):
         '/reference:System.IO.Compression.dll','/reference:System.IO.Compression.FileSystem.dll',
         '/reference:System.Windows.Forms.dll','/win32manifest:'+str(repo/'runtime_launcher.manifest'),
         '/resource:'+str(archive)+',runtime.zip','/resource:'+str(manifest)+',runtime-manifest.tsv',
+        '/resource:'+str(optional_archive)+',optional.zip','/resource:'+str(optional_manifest)+',optional-manifest.tsv',
         '/out:'+str(destination),str(repo/'runtime_launcher.cs'),str(config)]
     subprocess.run(command,check=True)
     return destination

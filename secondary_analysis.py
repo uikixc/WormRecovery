@@ -53,6 +53,8 @@ def snapshot_file(path,snapshot,cancel):
 
 
 def _tool(relative):
+    from engine_assets import prepare_optional_engines
+    prepare_optional_engines()
     root = engine_root()
     path = root / relative
     record = manifest().get('files', {}).get(relative)
@@ -233,6 +235,10 @@ def enrich_reviews(cleaner):
     cleaner.log('secondary_dispatch',**cleaner.secondary_dispatch)
     if not candidates or cleaner.cancel.is_set():
         return
+    cleaner.emit('正在准备可选分析组件（仅单独分析待核项时需要）…')
+    from engine_assets import prepare_optional_engines
+    optional=prepare_optional_engines()
+    if hasattr(cleaner,'protected') and optional not in cleaner.protected:cleaner.protected.append(optional)
     for row in candidates:
         row.pop('secondary_analysis',None)
         row.pop('analysis_incomplete_engines',None)

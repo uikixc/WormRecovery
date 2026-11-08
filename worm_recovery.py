@@ -9,14 +9,14 @@ import os, pathlib, re, shutil, struct, subprocess, sys, tempfile, threading
 import time, uuid, winreg, zipfile, xml.etree.ElementTree as ET
 from ctypes import wintypes as W
 import psutil
-from windows_read import open_read,extended_path
+from windows_read import open_read,extended_path,locked_read
 from office_triage import assess_office,is_confirmed
 from office_structure import inspect_package, attach_evidence
 from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_paths,
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.6'
+VERSION = '1.8.7'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -723,12 +723,14 @@ class Cleaner:
         else:self.emit('检测到'+labels.get(kind,'风险项目')+'：'+str(path))
         return record
     def backup(self,path):
+        started=time.perf_counter()
         self.policy.mutation(path);p=pathlib.Path(path)
         if self.protected_path(p):raise PermissionError('所选路径已列入排除范围。')
         before=p.stat();h=digest_file(p);dest=self.quarantine/(h+'-'+uuid.uuid4().hex[:8]+'.quarantined')
         shutil.copy2(p,dest)
         if digest_file(dest)!=h or p.stat().st_size!=before.st_size or p.stat().st_mtime_ns!=before.st_mtime_ns:raise RuntimeError('备份期间源文件发生变化，操作已中止。')
-        self.log('backup',path=str(p),backup=str(dest),sha256=h,attributes=file_attributes(p),mtime_ns=before.st_mtime_ns,size=before.st_size)
+        self.log('backup',path=str(p),backup=str(dest),sha256=h,attributes=file_attributes(p),mtime_ns=before.st_mtime_ns,size=before.st_size,
+                 duration_seconds=round(time.perf_counter()-started,3))
         return h,dest,before
     def stop_pid(self,pid,reason,*,process=None,expected_created=None,expected_exe=None):
         if pid in (0,4,os.getpid()):raise PermissionError('不能终止关键系统进程或当前程序。')
@@ -779,17 +781,33 @@ class Cleaner:
             os.rename(t,p)
         self.log('restored',path=str(p),sha256=digest_file(p))
     def contain(self,apply=False):
-        hits=[]
+        started=time.perf_counter();hits=[];reused=0;checked=0
+        cache=getattr(self,'_containment_cache',None)
         for p in psutil.process_iter(['pid','name','exe','cmdline','create_time']):
+            lease=None
             try:
                 if p.pid==os.getpid() or (p.info['name'] or '').casefold() in CRITICAL_PROCESSES:continue
                 exe=p.info['exe'];args=p.info['cmdline'] or [];cmd=' '.join(args)
                 if not exe:continue
+                key=norm(exe)
+                if cache is not None:
+                    prior=cache.get(key)
+                    if prior is not None:
+                        current=os.stat(extended_path(exe))
+                        identity=(current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns)
+                        if identity==prior[1] and not prior[0].closed:
+                            reused+=1;continue
+                        prior[0].close();del cache[key]
+                    if len(cache)<512:
+                        try:lease=locked_read(exe)
+                        except OSError:pass # No stable lease: perform the original full check.
+                checked+=1
                 # Process containment is independent from file mutation scope.
                 # Reading a live external process image never removes USB samples.
                 bad=bool(is_stub(exe))
                 autoit=False
-                if os.path.isfile(exe) and os.path.getsize(exe)==750320 and digest_file(exe)==AUTOIT_EXE_SHA256 and any(str(a).casefold()=='/autoit3executescript' for a in args[1:]):
+                interpreter=os.path.isfile(exe) and os.path.getsize(exe)==750320 and digest_file(exe)==AUTOIT_EXE_SHA256
+                if interpreter and any(str(a).casefold()=='/autoit3executescript' for a in args[1:]):
                     for arg in args[1:]:
                         script=arg.strip('"')
                         if os.path.isabs(script) and script.casefold().endswith('.a3x') and os.path.isfile(script) and digest_file(script)==AUTOIT_A3X_SHA256:
@@ -800,8 +818,18 @@ class Cleaner:
                 if bad or autoit or content:
                     rec={'pid':p.pid,'exe':exe,'cmdline':cmd,'family':'Synaptics' if bad else 'AutoIt' if autoit else 'Confirmed worm/miner code'};hits.append(rec)
                     if apply:self.stop_pid(p.pid,'Confirmed worm process',process=p,expected_created=p.info.get('create_time'),expected_exe=exe)
+                elif lease is not None and not interpreter:
+                    contextual=any(row.get('kind')=='malware_deployment' and norm(row['path'])==key
+                        for row in [*getattr(self,'findings',[]),*(getattr(self,'initial_findings',None) or [])])
+                    held=os.fstat(lease.fileno());current=os.stat(extended_path(exe))
+                    identity=lambda st:(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns)
+                    if not contextual and held.st_ino and identity(held)==identity(current):
+                        cache[key]=(lease,identity(held));lease=None
             except (psutil.Error,OSError,ValueError) as ex:self.error('process:'+str(p.pid),ex)
-        self.log('process_inspection',apply=apply,processes=hits);return hits
+            finally:
+                if lease is not None:lease.close()
+        self.log('process_inspection',apply=apply,processes=hits,images_checked=checked,images_reused=reused,
+                 duration_seconds=round(time.perf_counter()-started,3));return hits
     def registry(self,apply=False):
         hits=[];hives=[('HKLM',winreg.HKEY_LOCAL_MACHINE)]
         # Inspect loaded user hives without mounting or writing offline hives.
@@ -1224,6 +1252,18 @@ class Cleaner:
             raise ValueError('内容复核未通过，未终止占用进程，原文件已保留。')
         return before
     def repair(self):
+        if self.cancel.is_set():return
+        started=time.perf_counter()
+        event_start=len(self.events)
+        self._containment_cache={}
+        try:return self._repair()
+        finally:
+            for handle,_ in self._containment_cache.values():handle.close()
+            self._containment_cache=None
+            self.log('repair_timing',duration_seconds=round(time.perf_counter()-started,3),
+                     backup_seconds=round(sum(e.get('duration_seconds',0) for e in self.events[event_start:] if e.get('kind')=='backup'),3),
+                     process_inspection_seconds=round(sum(e.get('duration_seconds',0) for e in self.events[event_start:] if e.get('kind')=='process_inspection' and e.get('apply')),3))
+    def _repair(self):
         if self.cancel.is_set():return
         self._error_stage='repair'
         self.initial_findings=copy.deepcopy(self.findings)

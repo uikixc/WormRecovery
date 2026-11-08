@@ -36,29 +36,56 @@ class RuntimeLauncherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='wr-launcher-fixture-') as directory:
             temp=Path(directory);source=temp/'payload';source.mkdir();work=temp/'work'
             fixture=temp/'Fixture.cs'
-            fixture.write_text(r'''using System; using System.IO; using System.Threading;
+            fixture.write_text(r'''using System; using System.IO; using System.Threading; using System.IO.Pipes;
 class Fixture { static int Main(string[] args) {
   Console.OutputEncoding = new System.Text.UTF8Encoding(false);
   Console.WriteLine("fixture:"+args[0]); Console.Out.Flush();
   Console.Error.WriteLine("inert-stderr");
-  if(args[0]=="hold") { for(int i=0;i<200 && !File.Exists(args[1]);i++) Thread.Sleep(50); }
+  if(args[0]=="optional") {
+    using(var p=new NamedPipeClientStream(".",Environment.GetEnvironmentVariable("WORMRECOVERY_ENGINE_PIPE"),PipeDirection.InOut)) {
+      p.Connect(10000);Console.WriteLine(new StreamReader(p).ReadLine());Console.Out.Flush();
+    }
+  }
+  if(args[0]=="hold" || args[0]=="optional") { for(int i=0;i<200 && !File.Exists(args[1]);i++) Thread.Sleep(50); }
   return 0;
 }}''',encoding='utf8')
             subprocess.run([str(COMPILER),'/nologo','/target:exe','/out:'+str(source/'WormRecovery.exe'),str(fixture)],check=True,capture_output=True)
             data=source/'data.bin';data.write_bytes((str(temp)+' inert fixture').encode())
             deep=source/('nested-'+'a'*45)/('nested-'+'b'*45)/('nested-'+'c'*45)/'deep.bin'
             deep.parent.mkdir(parents=True);deep.write_bytes(b'inert long-path payload')
+            extra=source/'_internal/engines/rea/fixture.dat'
+            extra.parent.mkdir(parents=True);extra.write_bytes((str(temp)+' inert optional').encode())
             outer=builder.build_launcher(source,temp/'Portable.exe',work)
             identity=hashlib.sha256((work/'runtime-manifest.tsv').read_bytes()).hexdigest()
             known=ctypes.create_unicode_buffer(32768)
             self.assertEqual(ctypes.windll.shell32.SHGetFolderPathW(None,35,None,0,known),0)
             cache_root=Path(known.value)/'WormRecoveryRuntime'/identity
+            optional_id=hashlib.sha256((work/'optional-manifest.tsv').read_bytes()).hexdigest()
+            optional_root=cache_root.parent/optional_id
             try:
                 for attempt in range(2):
                     result=subprocess.run([str(outer),'space 中文 quote" tail'+chr(92)],capture_output=True,timeout=30)
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertIn(('fixture:space 中文 quote" tail'+chr(92)).encode('utf8'),result.stdout)
                     self.assertIn(b'inert-stderr',result.stderr)
+                self.assertFalse(optional_root.exists())
+                self.assertFalse((cache_root/'_internal/engines/rea').exists())
+                process=subprocess.Popen([str(outer),'optional',str(temp/'optional-done')],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                try:
+                    self.assertIn(b'fixture:optional',process.stdout.readline())
+                    response=process.stdout.readline();self.assertTrue(response.startswith(b'OK	'),response)
+                    optional=optional_root/'_internal/engines/rea/fixture.dat'
+                    self.assertEqual(optional.read_bytes(),extra.read_bytes())
+                    with self.assertRaises(PermissionError):optional.write_bytes(b'tampered')
+                finally:
+                    (temp/'optional-done').touch();stdout,stderr=process.communicate(timeout=20)
+                    self.assertEqual(process.returncode,0,stderr)
+                stamp=optional.stat();original=optional.read_bytes()
+                optional.write_bytes(b'X'+original[1:]);os.utime(optional,ns=(stamp.st_atime_ns,stamp.st_mtime_ns))
+                result=subprocess.run([str(outer),'probe'],capture_output=True,timeout=30)
+                self.assertEqual(result.returncode,0,result.stderr)
+                result=subprocess.run([str(outer),'optional',str(temp/'optional-done')],capture_output=True,timeout=30)
+                self.assertIn(b'ERROR	',result.stdout);self.assertIn(b'verification failed',result.stdout)
                 cached=cache_root/'data.bin';original=cached.read_bytes();stamp=cached.stat()
                 process=subprocess.Popen([str(outer),'hold',str(temp/'done')],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 try:
@@ -80,6 +107,10 @@ class Fixture { static int Main(string[] args) {
                     self.assertEqual(cache_root.resolve().parent,expected)
                     self.assertEqual(cache_root.name,identity)
                     shutil.rmtree('\\\\?\\'+str(cache_root))
+                if optional_root.exists():
+                    self.assertEqual(optional_root.resolve().parent,expected)
+                    self.assertEqual(optional_root.name,optional_id)
+                    shutil.rmtree('\\\\?\\'+str(optional_root))
 
 
 if __name__=='__main__':unittest.main()
