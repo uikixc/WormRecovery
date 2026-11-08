@@ -13,6 +13,7 @@ import struct
 import zipfile
 
 from local_rules import CONFIRMED_CODE_RULES, RULESET_VERSION, scan_bytes
+from png_tail_analysis import MAX_PNG_CARRIER
 
 MAX_INPUT=16*1024*1024
 MAX_CARRIER=4*1024*1024
@@ -208,6 +209,12 @@ def _inspect(data,rules=None,*,mapped_pe=False):
         from tsco_analysis import identify
         tsco=identify(data,pe)
         result.update(tsco)
+        from png_tail_analysis import identify_pe
+        tail_identity=identify_pe(data,pe)
+        result['detections'].extend(tail_identity['detections'])
+        result.setdefault('identifications',[]).extend(tail_identity['identifications'])
+        if tail_identity['identifications']:
+            result['reason']='已识别PNG尾随载荷链的已知配套程序内容；打包组件保留待核，不单凭目录关系判定恶意。'
         for _,size,offset,_ in pe.sections:
             if size==629760 and hashlib.sha256(data[offset:offset+size]).hexdigest()==SYNAPTICS_CODE:
                 result['detections'].append({'signature':'WR_Synaptics_Code_Section','family':'Synaptics',
@@ -229,6 +236,13 @@ def _inspect(data,rules=None,*,mapped_pe=False):
         except (ValueError,zipfile.BadZipFile,NotImplementedError,EOFError) as error:
             result.update(status='incomplete',reason='加密项目解析未完成：'+str(error)[:300])
     elif data.startswith(b'\x89PNG\r\n\x1a\n') and len(data)>128:
+        from png_tail_analysis import inspect_carrier
+        tail=inspect_carrier(data)
+        if tail:
+            result['decodings'].extend(tail.get('decodings',[]))
+            result['detections'].extend(tail.get('detections',[]))
+            result.setdefault('identifications',[]).extend(tail.get('identifications',[]))
+            result.update(status=tail['status'],reason=tail['reason'])
         # 64-byte prefix and RC4 key are recovered from the loader instructions.
         # Reject ordinary images after 64 decoded bytes; do not decrypt all PNGs.
         preview=rc4(data[64:128],PNG_KEY)
@@ -253,7 +267,7 @@ def _inspect(data,rules=None,*,mapped_pe=False):
         # Content identification does not establish a miner/worm classification
         # or authorize quarantine of a carrier containing a research sample.
         result.update(status='identified',source_sha256=hashlib.sha256(data).hexdigest(),
-                      reason='已识别 TSCO 已知载荷内容；挖矿或文档蠕虫归属未证实，保留原件待核。')
+                      reason=result.get('reason') or '已识别 TSCO 已知载荷内容；挖矿或文档蠕虫归属未证实，保留原件待核。')
     elif result.get('diagnostics') and not result['detections']:
         result.update(status='incomplete',reason='；'.join(result['diagnostics']))
     if len(data)==486832 and hashlib.sha256(data).hexdigest()==KNOWN_RUNTIME:

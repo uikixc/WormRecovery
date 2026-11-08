@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.9'
+VERSION = '1.8.10'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -414,7 +414,7 @@ def inspect_file_content(path,st):
     name=os.path.basename(path).casefold();ext=os.path.splitext(name)[1]
     # Every selected file reaches a bounded header probe, even with a misleading
     # extension. Do not follow a name/extension allowlist before reading magic.
-    from family_analysis import MAX_INPUT,MAX_CARRIER,inspect as inspect_family
+    from family_analysis import MAX_INPUT,MAX_CARRIER,MAX_PNG_CARRIER,inspect as inspect_family
     data=None
     with open_read(path) as stream:
         prefix=stream.read(min(128,st.st_size+1))
@@ -428,10 +428,14 @@ def inspect_file_content(path,st):
             encrypted_project=archive_probe.get('encrypted_project',False)
             stream.seek(len(prefix))
         from carrier_probe import png_candidate
+        from png_tail_analysis import probe as png_tail_probe
         program=prefix.startswith(b'MZ') or (ext in EXE_EXTS or name.startswith(('~$cache','._cache_'))) and not (packed_zip or png)
-        carrier=png and png_candidate(prefix) or encrypted_project
+        png_tail=png and png_tail_probe(stream,st.st_size)
+        carrier=png and (png_candidate(prefix) or png_tail) or encrypted_project
         script=ext in ('.au3','.vbs','.js','.ps1','.cmd','.bat','.wsf','.lua')
-        if program and st.st_size<=MAX_INPUT or (carrier or script) and st.st_size<=MAX_CARRIER:
+        carrier_limit=MAX_PNG_CARRIER if png_tail else MAX_CARRIER
+        if (program and st.st_size<=MAX_INPUT or carrier and st.st_size<=carrier_limit
+                or script and st.st_size<=MAX_CARRIER):
             data=prefix+stream.read(max(0,st.st_size+1-len(prefix)))
             if len(data)!=st.st_size:raise ValueError('检查时文件大小发生变化，请重新扫描。')
     result['engine_checks']={'file_header':1}
@@ -460,7 +464,7 @@ def inspect_file_content(path,st):
             add('malware_component',path,sha256=analysis['source_sha256'],family=' / '.join(names),
                 assessment='confirmed_malicious_code',family_analysis=analysis,
                 reason='已确认恶意代码特征：'+'、'.join(hit['signature'] for hit in analysis['detections']),
-                action='处理时复核内容指纹并保留隔离副本；不按名称删除目录。')
+                action='处理时复核内容指纹；不创建备份，不按名称删除目录。')
             return True
         if analysis['status']=='incomplete':
             add('review_binary',path,family_analysis=analysis,reason=analysis['reason'],
@@ -1412,14 +1416,15 @@ class Cleaner:
         summary['offline_analysis']={'versions':assets.get('versions',{}),'ruleset_version':RULESET_VERSION,'assets_available':bool(assets),'scope':'Content screening plus second-opinion analysis of unresolved candidates; no universal safety verdict',
             **build_audit(getattr(self,'engine_checks',{}),getattr(self,'secondary_dispatch',{'status':'not_started','candidates':0}),self.findings)}
         summary['offline_analysis']['family_detection']={'source':'REA-reviewed code combinations compiled into offline rules',
-            'methods':['infection_code_section','xor32_nrv2e','encrypted_project_crc_and_loader_code','png_rc4_and_controller_code','content_proven_companion_correlation'],
+            'methods':['infection_code_section','xor32_nrv2e','encrypted_project_crc_and_loader_code','png_rc4_and_controller_code','png_iend_incrementing_xor','exact_outer_pe_payload_fingerprint','content_proven_companion_correlation'],
             'target_execution':False,'filename_used_as_verdict':False,'maximum_input_bytes':16*1024*1024,
             'large_pe_method':'Full-file YARA-X plus read-only mapped PE structure and code ownership; source identity checked before and after',
             'streamed_bytes':getattr(self,'streamed_bytes',0),
             'streamed_pe_files':getattr(self,'engine_checks',{}).get('family_streamed_pe',0),
             'streamed_script_files':getattr(self,'engine_checks',{}).get('family_streamed_script',0),
             'large_file_incomplete':getattr(self,'engine_checks',{}).get('family_streamed_failed',0),
-            'maximum_carrier_bytes':4*1024*1024,'size_limited_files':getattr(self,'engine_checks',{}).get('family_size_limited',0),
+            'maximum_carrier_bytes':4*1024*1024,'maximum_png_tail_carrier_bytes':__import__('png_tail_analysis').MAX_PNG_CARRIER,
+            'size_limited_files':getattr(self,'engine_checks',{}).get('family_size_limited',0),
             'scope':'Known observed families; bounded decoding is not universal unpacking or a clean certification.'}
         json_save(self.run/'report.json',summary);return summary
 
