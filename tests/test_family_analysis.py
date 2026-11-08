@@ -163,7 +163,7 @@ class FamilyContentTests(unittest.TestCase):
             sample.write_bytes(b'normal replacement')
             with patch.object(c,'contain'),patch.object(c,'registry',return_value=[]),patch.object(c,'system_persistence',return_value={}),\
                  patch.object(c,'firewall'),patch.object(c,'security_settings'),patch.object(c,'close_locks'),\
-                 patch.object(c,'quarantine_file') as quarantine:
+                 patch.object(c,'remove_confirmed_file') as quarantine:
                 c.repair()
             quarantine.assert_not_called();self.assertTrue(c.errors)
             self.assertEqual(sample.read_bytes(),b'normal replacement')

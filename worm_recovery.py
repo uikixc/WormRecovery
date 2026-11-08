@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.8'
+VERSION = '1.8.9'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -555,7 +555,7 @@ class Cleaner:
         default=pathlib.Path(os.environ.get('PROGRAMDATA','C:/ProgramData'))/'WormRecovery'
         self.run=pathlib.Path(report_dir or default)/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
         self.policy.mutation(self.run.parent);self.run.mkdir(parents=True,exist_ok=False)
-        self.quarantine=self.run/'quarantine';self.quarantine.mkdir();self.events=[];self.findings=[];self.errors=[]
+        self.events=[];self.findings=[];self.errors=[]
         tool_scope=pathlib.Path(sys.executable) if getattr(sys,'frozen',False) else HERE
         self.protected=[tool_scope,self.run.parent,*map(pathlib.Path,protected)]
         if getattr(sys,'frozen',False):self.protected.append(application_path())
@@ -636,11 +636,12 @@ class Cleaner:
             if os.path.isfile(source):
                 if file_attributes(source)&0x400:return False
             else:
-                backup=next((event.get('backup') for event in reversed(self.events)
-                    if event.get('kind')=='quarantined' and norm(event['path'])==norm(source)
-                    and event.get('sha256')==peer['sha256']),None)
-                if not backup or not self.retained_original(backup):return False
-                source=backup
+                removed=self.removed_evidence(source,peer['sha256'])
+                if removed is not None:
+                    result=removed.get('family_analysis') or {}
+                    if result.get('status')!='detected':return False
+                    verified.append({'path':source,'sha256':peer['sha256'],'family_analysis':result});continue
+                return False
             if os.path.getsize(source)>MAX_INPUT:return False
             with open_read(source) as stream:data=stream.read(MAX_INPUT+1)
             if hashlib.sha256(data).hexdigest()!=peer['sha256']:return False
@@ -650,7 +651,7 @@ class Cleaner:
         from family_analysis import correlate
         return bool(correlate(verified,[{'path':target,'sha256':KNOWN_RUNTIME,'role':'observed_trueupdate_runtime'}]))
     def recheck_deployment_observations(self):
-        """Use verified quarantine evidence if an exact runtime is regenerated."""
+        """Use this session's verified removal metadata for regenerated runtimes."""
         observed={(norm(row['path']),row.get('sha256')) for row in getattr(self,'family_observations',[])
                   if row.get('role')=='observed_trueupdate_runtime'}
         present={norm(row['path']) for row in self.findings if row.get('kind')=='malware_deployment'}
@@ -722,61 +723,21 @@ class Cleaner:
         if kind=='info_office':self.emit('已核对 Office 组件：'+str(path))
         else:self.emit('检测到'+labels.get(kind,'风险项目')+'：'+str(path))
         return record
-    def retained_original(self,path):
-        roots=[getattr(self,'quarantine',None),*getattr(self,'_retained_roots',[])]
-        return any(root is not None and beneath(path,root) for root in roots)
-    def prepare_original(self,path,expected=None):
-        """Validate the source and select private storage on its own volume."""
-        started=time.perf_counter()
-        self.policy.mutation(path);p=pathlib.Path(path)
+    def prepare_change(self,path,expected=None):
+        """Revalidate the source without creating any file backup."""
+        started=time.perf_counter();self.policy.mutation(path);p=pathlib.Path(path)
         if self.protected_path(p):raise PermissionError('所选路径已列入排除范围。')
         before=p.stat();h=digest_file(p)
         if expected and h!=expected:raise RuntimeError('源文件与检测记录不一致，未终止占用进程。')
-        from repair_storage import private_directory,file_security,private_file,restore_security,QUARANTINE_NAME
-        root=pathlib.Path(volume(p))/QUARANTINE_NAME
-        self.policy.mutation(root);private_directory(root)
-        session=root/self.run.name;self.policy.mutation(session);private_directory(session)
-        if root not in self.protected:self.protected.append(root)
-        if not hasattr(self,'_retained_roots'):self._retained_roots=[]
-        if session not in self._retained_roots:self._retained_roots.append(session)
-        dest=session/(h+'-'+uuid.uuid4().hex+'.quarantined')
+        if before.st_nlink!=1:raise PermissionError('原文件存在多个硬链接，已停止自动处理。')
         attributes=file_attributes(p);self.close_locks(p)
         current=p.stat()
         identity=lambda st:(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns)
-        if identity(current)!=identity(before) or digest_file(p)!=h:raise RuntimeError('移动原件前源文件发生变化，操作已中止。')
-        if current.st_nlink!=1:raise PermissionError('原文件存在多个硬链接，已保留原件并停止自动移动。')
-        descriptor=file_security(p)
-        import base64
-        self.log('original_move_pending',path=str(p),backup=str(dest),sha256=h,size=before.st_size,attributes=attributes,mtime_ns=before.st_mtime_ns,security_descriptor_b64=base64.b64encode(descriptor).decode('ascii'))
-        try:private_file(p)
-        except BaseException:
-            restore_security(p,descriptor);raise
-        return h,dest,before,attributes,started,descriptor
-    def original_retained(self,path,details):
-        h,dest,before,attributes,started,_=details
-        self.log('backup',path=str(path),backup=str(dest),sha256=h,attributes=attributes,mtime_ns=before.st_mtime_ns,size=before.st_size,
-                 method='same_volume_move',copied_bytes=0,duration_seconds=round(time.perf_counter()-started,3))
-    def backup(self,path,expected=None):
-        """Retain the original by same-volume rename, without copying its bytes."""
-        from repair_storage import restore_security
-        p=pathlib.Path(path);details=self.prepare_original(p,expected=expected);h,dest,before,_,_,descriptor=details
-        try:
-            os.rename(extended_path(p),extended_path(dest))
-            self.original_retained(p,details)
-        except BaseException:
-            self.rollback_original(p,dest,descriptor=descriptor)
-            if p.exists() and not dest.exists():restore_security(p,descriptor)
-            raise
-        return h,dest,before
-    def rollback_original(self,path,backup,descriptor=None):
-        p=pathlib.Path(path);back=pathlib.Path(backup)
-        if not p.exists() and back.exists():
-            self.policy.mutation(p);self.policy.mutation(back)
-            os.rename(extended_path(back),extended_path(p))
-            if descriptor is not None:
-                from repair_storage import restore_security
-                restore_security(p,descriptor)
-            self.log('original_move_rolled_back',path=str(p),backup=str(back))
+        if identity(current)!=identity(before) or digest_file(p)!=h:raise RuntimeError('处理前源文件发生变化，操作已中止。')
+        return h,before,attributes,started
+    def removed_evidence(self,path,sha256):
+        return next((event for event in reversed(self.events) if event.get('kind')=='removed'
+                     and norm(event['path'])==norm(path) and event.get('sha256')==sha256),None)
     def stop_pid(self,pid,reason,*,process=None,expected_created=None,expected_exe=None):
         if pid in (0,4,os.getpid()):raise PermissionError('不能终止关键系统进程或当前程序。')
         if process is None or process.pid!=pid or expected_created is None or not expected_exe:
@@ -797,35 +758,49 @@ class Cleaner:
                 self.stop_pid(holder['pid'],'User-authorized release of confirmed infected file '+str(path),
                     process=process,expected_created=holder['created'],expected_exe=process.exe())
             except psutil.NoSuchProcess:pass
-    def quarantine_file(self,path,reason,expected=None):
+    def remove_confirmed_file(self,path,reason,expected=None):
         self.policy.mutation(path);p=pathlib.Path(path)
         if not p.exists():return
-        h,dest,st=self.backup(p,expected=expected)
-        if expected and h!=expected:raise RuntimeError('文件在复核后发生变化，未终止占用进程。')
-        self.log('quarantined',path=str(p),backup=str(dest),sha256=h,reason=reason,method='same_volume_move',copied_bytes=0)
+        h,st,attrs,started=self.prepare_change(p,expected=expected)
+        analysis=None
+        related=any(row.get('kind')=='malware_deployment' and any(norm(peer['path'])==norm(p)
+                    for peer in row.get('related_evidence',[])) for row in [*getattr(self,'findings',[]),*(getattr(self,'initial_findings',None) or [])])
+        if related:
+            from family_analysis import MAX_INPUT,inspect as inspect_family
+            if st.st_size>MAX_INPUT:raise ValueError('关联证据超过处理上限，原文件已保留。')
+            with open_read(p) as stream:data=stream.read(MAX_INPUT+1)
+            if hashlib.sha256(data).hexdigest()!=h:raise RuntimeError('删除前关联内容已改变。')
+            analysis=inspect_family(data)
+            if analysis['status']!='detected':raise ValueError('关联内容复核未确认，原文件已保留。')
+        self.log('file_remove_pending',path=str(p),sha256=h,size=st.st_size,reason=reason,backup_created=False)
+        try:
+            if not kernel.SetFileAttributesW(extended_path(p),(attrs&~1) or 0x80):raise ctypes.WinError(ctypes.get_last_error())
+            os.unlink(extended_path(p))
+        except BaseException:
+            if p.exists():kernel.SetFileAttributesW(extended_path(p),attrs)
+            raise
+        self.log('removed',path=str(p),sha256=h,size=st.st_size,reason=reason,backup_created=False,
+                 family_analysis=analysis,duration_seconds=round(time.perf_counter()-started,3))
     def replace(self,path,stage,expected=None,*,require_absent=False):
         self.policy.mutation(path);self.policy.mutation(stage);p=pathlib.Path(path);t=pathlib.Path(stage)
         if p.exists():
             if require_absent:raise FileExistsError('目标文件已出现，双方均已保留：'+str(p))
-            from repair_storage import restore_security
-            t.stat();details=self.prepare_original(p,expected=expected);h,back,st,oldattrs,_,descriptor=details
+            t.stat();h,st,oldattrs,_=self.prepare_change(p,expected=expected)
+            self.log('file_replace_pending',path=str(p),sha256=h,size=st.st_size,backup_created=False)
             try:
                 if not kernel.SetFileAttributesW(extended_path(p),oldattrs&~1 or 0x80):raise ctypes.WinError(ctypes.get_last_error())
-                if not kernel.ReplaceFileW(extended_path(p),extended_path(t),extended_path(back),0,None,None):
+                if not kernel.ReplaceFileW(extended_path(p),extended_path(t),None,0,None,None):
                     raise ctypes.WinError(ctypes.get_last_error())
             except BaseException:
-                self.rollback_original(p,back,descriptor=descriptor)
-                if p.exists():
-                    if not back.exists():restore_security(p,descriptor)
-                    kernel.SetFileAttributesW(extended_path(p),oldattrs)
+                if p.exists():kernel.SetFileAttributesW(extended_path(p),oldattrs)
                 raise
-            self.original_retained(p,details)
-            restore_security(p,descriptor)
-            kernel.SetFileAttributesW(str(p),(oldattrs&~7) or 0x80);os.utime(p,ns=(st.st_atime_ns,st.st_mtime_ns))
+            if not kernel.SetFileAttributesW(extended_path(p),(oldattrs&~7) or 0x80):raise ctypes.WinError(ctypes.get_last_error())
+            os.utime(p,ns=(st.st_atime_ns,st.st_mtime_ns))
         else:
+            if expected is not None:raise FileNotFoundError('待替换源文件已不存在，恢复文件尚未提交：'+str(p))
             # rename on Windows fails if destination appeared; never overwrite it.
-            os.rename(t,p)
-        self.log('restored',path=str(p),sha256=digest_file(p))
+            os.rename(extended_path(t),extended_path(p))
+        self.log('restored',path=str(p),sha256=digest_file(p),backup_created=False)
     def contain(self,apply=False):
         started=time.perf_counter();hits=[];reused=0;checked=0
         cache=getattr(self,'_containment_cache',None)
@@ -991,7 +966,7 @@ class Cleaner:
                     if z.testzip():continue
                     if 'xl/workbook.xml' not in z.namelist():continue
                     if any(any(t in n.casefold() for t in ('vbaproject','activex','embeddings/','externallinks/')) for n in z.namelist()):continue
-                self.log('historical_original_selected',path=str(p),source=source,sha256=digest_file(source),snapshot=s,warning='Explicit historical recovery can discard edits after this snapshot; pre-repair bytes are retained in quarantine.')
+                self.log('historical_original_selected',path=str(p),source=source,sha256=digest_file(source),snapshot=s,warning='Explicit historical recovery can discard edits after this snapshot; pre-repair bytes are not backed up.')
                 return {'source':source,'sha256':digest_file(source),'mtime_ns':st.st_mtime_ns,'snapshot':s}
             except FileNotFoundError:continue
             except OSError as ex:self.log('snapshot_unavailable',source=source,error=str(ex))
@@ -1245,12 +1220,9 @@ class Cleaner:
             result_hash=digest_file(stage)
             if dest==p:self.replace(p,stage,expected=h)
             else:
-                from repair_storage import file_security
-                descriptor=file_security(p);_,back,_=self.backup(p,expected=h)
-                try:self.replace(dest,stage,require_absent=True)
-                except BaseException:
-                    self.rollback_original(p,back,descriptor=descriptor);raise
-                if digest_file(dest)!=result_hash:raise RuntimeError('文档修复后校验失败。')
+                self.replace(dest,stage,require_absent=True)
+                if digest_file(dest)!=result_hash:raise RuntimeError('文档修复后校验失败，源文件已保留。')
+                self.remove_confirmed_file(p,'repaired Office source with changed extension',expected=h)
                 os.utime(dest,ns=(source_stat.st_atime_ns,source_stat.st_mtime_ns))
                 if not kernel.SetFileAttributesW(str(dest),(source_attrs&~7) or 0x80):raise ctypes.WinError(ctypes.get_last_error())
             if history:os.utime(dest,ns=(source_stat.st_atime_ns,history['mtime_ns']))
@@ -1284,10 +1256,8 @@ class Cleaner:
         self.policy.check(companion)
         if os.path.isfile(companion):
             return not file_attributes(companion)&0x400 and digest_file(companion)==AUTOIT_A3X_SHA256
-        backup=next((event.get('backup') for event in reversed(self.events)
-            if event.get('kind')=='quarantined' and norm(event['path'])==norm(companion)
-            and event.get('sha256')==AUTOIT_A3X_SHA256),None)
-        return bool(backup and self.retained_original(backup) and digest_file(backup)==AUTOIT_A3X_SHA256)
+        if self.removed_evidence(companion,AUTOIT_A3X_SHA256) is not None:return True
+        return False
     def revalidate_finding(self,record,path):
         """Require current byte evidence before any application lock release."""
         before=digest_file(path)
@@ -1313,7 +1283,7 @@ class Cleaner:
             for handle,_ in self._containment_cache.values():handle.close()
             self._containment_cache=None
             self.log('repair_timing',duration_seconds=round(time.perf_counter()-started,3),
-                     backup_seconds=round(sum(e.get('duration_seconds',0) for e in self.events[event_start:] if e.get('kind')=='backup'),3),
+                     backup_seconds=0,backup_created=False,
                      process_inspection_seconds=round(sum(e.get('duration_seconds',0) for e in self.events[event_start:] if e.get('kind')=='process_inspection' and e.get('apply')),3))
     def _repair(self):
         if self.cancel.is_set():return
@@ -1339,37 +1309,37 @@ class Cleaner:
                 elif kind=='malicious_shortcut':
                     if not shortcut(p).get('malicious'):raise ValueError('快捷方式已发生变化，请重新检测。')
                     self.shortcut_startup_approved(p)
-                    self.quarantine_file(p,'confirmed AutoIt shortcut',expected=expected)
+                    self.remove_confirmed_file(p,'confirmed AutoIt shortcut',expected=expected)
                     candidate=p.with_suffix('')
                     if candidate.is_dir() and not self.payload_path(candidate) and not beneath(candidate,os.environ.get('WINDIR','C:/Windows')):
                         self.policy.mutation(candidate);a=file_attributes(candidate)
                         if a&6:self.log('attributes_backup',path=str(candidate),attributes=a);kernel.SetFileAttributesW(str(candidate),(a&~6) or 16)
                 elif kind=='worm_payload':
                     if not is_stub(p):raise ValueError('载荷指纹已发生变化，请重新检测。')
-                    self.quarantine_file(p,kind,expected=expected)
+                    self.remove_confirmed_file(p,kind,expected=expected)
                 elif kind=='worm_script':
                     if digest_file(p)!=AUTOIT_A3X_SHA256:raise ValueError('脚本已发生变化，请重新检测。')
-                    self.quarantine_file(p,kind,expected=expected)
+                    self.remove_confirmed_file(p,kind,expected=expected)
                 elif kind in ('worm_runtime','worm_hook'):
                     expected=AUTOIT_EXE_SHA256 if kind=='worm_runtime' else HOOK_SHA256
                     if digest_file(p)!=expected:raise ValueError('组件指纹已发生变化，请重新检测。')
                     if kind=='worm_runtime' and not self.confirmed_autoit_runtime(rec):raise ValueError('恶意配套脚本证据发生变化，解释器已保留。')
-                    self.quarantine_file(p,kind,expected=expected)
+                    self.remove_confirmed_file(p,kind,expected=expected)
                 elif kind=='worm_residue':
                     if digest_file(p) not in QUARANTINE_LINK_HASHES:raise ValueError('残留文件指纹已改变，请重新检测。')
-                    self.quarantine_file(p,'confirmed family quarantine-link residue',expected=expected)
+                    self.remove_confirmed_file(p,'confirmed family quarantine-link residue',expected=expected)
                 elif kind=='malware_component':
                     if digest_file(p)!=rec['sha256']:raise ValueError('恶意组件内容已改变，请重新检测。')
                     fresh=inspect_file_content(p,p.stat())
                     if not any(r['kind']=='malware_component' and r['sha256']==rec['sha256'] for r in fresh['findings']):
                         raise ValueError('恶意代码特征复核未通过，原文件已保留。')
-                    self.quarantine_file(p,'confirmed malicious code component',expected=expected)
+                    self.remove_confirmed_file(p,'confirmed malicious code component',expected=expected)
                 elif kind=='malware_deployment':
                     # A legitimate signed runtime is not deletion authority on
                     # its own. Recheck all peer hashes before processing starts;
-                    # peers already quarantined retain their exact backup proof.
+                    # peers already removed retain verified hash/content metadata.
                     if not self.confirmed_deployment(rec):raise ValueError('关联加载链已改变，运行时已保留。')
-                    self.quarantine_file(p,'content-proven malicious deployment runtime',expected=expected)
+                    self.remove_confirmed_file(p,'content-proven malicious deployment runtime',expected=expected)
                 root=payload_root(p)
                 if root:residue_roots.add(root)
             except Exception as ex:self.error(p,ex)

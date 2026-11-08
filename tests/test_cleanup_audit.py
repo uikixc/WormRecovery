@@ -118,7 +118,7 @@ def inert_cleaner():
     cleaner.registry=MagicMock(return_value=[]);cleaner.system_persistence=MagicMock(return_value={})
     cleaner.firewall=MagicMock(return_value=[]);cleaner.contain=MagicMock(return_value=[])
     cleaner.close_locks=MagicMock();cleaner.scan=MagicMock(return_value=[])
-    cleaner.quarantine_file=MagicMock();cleaner.replace=MagicMock()
+    cleaner.remove_confirmed_file=MagicMock();cleaner.replace=MagicMock()
     return cleaner
 
 
@@ -132,7 +132,7 @@ class RepairBoundaryTests(unittest.TestCase):
                 with self.subTest(kind=kind):
                     c=inert_cleaner();c.findings=[{'kind':kind,'path':str(path)}]
                     c.repair()
-                    c.close_locks.assert_not_called();c.quarantine_file.assert_not_called()
+                    c.close_locks.assert_not_called();c.remove_confirmed_file.assert_not_called()
                     self.assertTrue(c.errors)
                     self.assertEqual(path.read_bytes(),b'innocent replacement bytes')
 
@@ -147,7 +147,7 @@ class RepairBoundaryTests(unittest.TestCase):
             c.contain.side_effect=lambda apply:actions.append(('contain',apply)) or []
             c.repair()
             c.restore_executable.assert_called_once_with(path,expected='fixture hash')
-            c.quarantine_file.assert_not_called();c.close_locks.assert_not_called()
+            c.remove_confirmed_file.assert_not_called();c.close_locks.assert_not_called()
             self.assertLess(actions.index(('system',True)),actions.index(('contain',True)))
             self.assertEqual(actions.count(('contain',True)),2)
 
@@ -177,12 +177,12 @@ class RepairBoundaryTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),b'inert wrapper')
             self.assertEqual(list(Path(directory).glob('.wormrepair-*')),[])
 
-    def test_backup_of_changed_file_does_not_release_app_locks(self):
+    def test_removal_of_changed_file_does_not_release_app_locks(self):
         with TemporaryDirectory() as directory:
             path=Path(directory)/'file.bin';path.write_bytes(b'inert replacement')
-            c=inert_cleaner();c.backup=MagicMock(return_value=('changed',Path(directory)/'backup',path.stat()))
+            c=inert_cleaner()
             with self.assertRaises(RuntimeError):
-                recovery.Cleaner.quarantine_file(c,path,'fixture',expected='scanned')
+                recovery.Cleaner.remove_confirmed_file(c,path,'fixture',expected='scanned')
             c.close_locks.assert_not_called();self.assertTrue(path.exists())
 
     def test_malformed_large_program_is_review_but_plain_large_script_is_scanned(self):
@@ -201,26 +201,26 @@ class RepairBoundaryTests(unittest.TestCase):
         c=inert_cleaner();c.engine_checks={'family_streamed_failed':1}
         result=c.verify();self.assertFalse(result['known_family_clear']);self.assertEqual(result['large_file_incomplete'],1)
 
-    def test_regenerated_runtime_requires_verified_quarantine_companion_bytes(self):
+    def test_regenerated_runtime_requires_verified_removal_metadata(self):
         import hashlib
         with TemporaryDirectory() as directory:
             root=Path(directory);runtime=root/'fixture.exe';runtime.write_bytes(b'inert runtime')
-            c=inert_cleaner();c.quarantine=root/'quarantine';c.quarantine.mkdir()
+            c=inert_cleaner()
             expected=hashlib.sha256(runtime.read_bytes()).hexdigest();peers=[];analyses={}
             for suffix,signature in (('.dat','WR_Encrypted_Project_Loader'),('.png','WR_Miner_Controller_Code')):
                 missing=runtime.with_suffix(suffix);data=('inert companion '+suffix).encode()
-                sha=hashlib.sha256(data).hexdigest();backup=c.quarantine/(suffix[1:]+'.backup');backup.write_bytes(data)
-                c.events.append({'kind':'quarantined','path':str(missing),'sha256':sha,'backup':str(backup)})
+                sha=hashlib.sha256(data).hexdigest()
                 peers.append({'path':str(missing),'sha256':sha})
                 analyses[data]={'status':'detected','detections':[{'signature':signature}],
                                 'decodings':[{'method':'png_prefix64_rc4'}] if suffix=='.png' else []}
+                c.events.append({'kind':'removed','path':str(missing),'sha256':sha,'family_analysis':analyses[data]})
             c.initial_findings=[{'kind':'malware_deployment','path':str(runtime),'sha256':expected,'related_evidence':peers}]
             c.family_observations=[{'path':str(runtime),'sha256':expected,'role':'observed_trueupdate_runtime'}]
             with patch('family_analysis.KNOWN_RUNTIME',expected),patch('family_analysis.inspect',side_effect=lambda data:analyses[data]):
                 c.recheck_deployment_observations()
                 self.assertEqual(len(c.findings),1)
                 self.assertEqual(c.findings[0]['kind'],'malware_deployment')
-                c.findings=[];backup.write_bytes(b'tampered backup')
+                c.findings=[];c.events[-1]['sha256']='changed'
                 c.recheck_deployment_observations()
                 self.assertEqual([row['kind'] for row in c.findings],['review_binary'])
 
@@ -374,12 +374,11 @@ class CarrierGateAndRuntimeTests(unittest.TestCase):
             (root/'AutoIt.a3x').write_bytes(script)
             result=recovery.inspect_file_content(path,path.stat())
             self.assertEqual([r['kind'] for r in result['findings']],['worm_runtime'])
-            c=inert_cleaner();c.quarantine=root/'quarantine';c.quarantine.mkdir()
-            record=result['findings'][0];backup=c.quarantine/'script.backup';backup.write_bytes(script)
+            c=inert_cleaner();record=result['findings'][0]
             (root/'AutoIt.a3x').unlink()
-            c.events.append({'kind':'quarantined','path':str(root/'AutoIt.a3x'),'sha256':script_pin,'backup':str(backup)})
+            c.events.append({'kind':'removed','path':str(root/'AutoIt.a3x'),'sha256':script_pin,'backup_created':False})
             self.assertTrue(c.confirmed_autoit_runtime(record))
-            backup.write_bytes(b'changed');self.assertFalse(c.confirmed_autoit_runtime(record))
+            c.events[-1]['sha256']='changed';self.assertFalse(c.confirmed_autoit_runtime(record))
 
 
 class StructuralRepairXmlTests(unittest.TestCase):

@@ -382,7 +382,7 @@ class ModernWindow:
         if mode=='clean':
             if not ctypes.windll.shell32.IsUserAnAdmin():
                 messagebox.showerror('需要管理员权限','请以管理员身份运行。',parent=self.root);return
-            text='系统将备份已确认的感染文件，并执行原位修复。\n\n将关闭占用相关文件的应用，未保存内容可能丢失；存在可验证的同路径历史原件时优先恢复，当前内容将保留备份。'
+            text='系统将修复已确认的感染文件，并直接删除已确认的恶意载荷，不创建文件备份或隔离副本。处理成功后无法由本工具撤销。\n\n将关闭占用相关文件的应用，未保存内容可能丢失；存在可验证的同路径历史原件时优先恢复。'
             if not messagebox.askokcancel('开始原位恢复',text,parent=self.root):return
         selected=self.scope.get().strip()
         scope_mode=self.scope_mode.get()
@@ -398,7 +398,7 @@ class ModernWindow:
             self.render_results()
             for metric in self.metrics.values():metric.set('0')
         self.status.set('正在检测' if mode=='scan' else '正在补充分析' if mode=='review' else '正在修复')
-        self.detail.set('正在检测并记录证据，完成后即可处理确认项；补充引擎需单独启动。' if mode=='scan' else '仅分析现有待核项，可以停止；停止后仍可处理已确认感染。' if mode=='review' else '正在备份、验证并修复感染文件。')
+        self.detail.set('正在检测并记录证据，完成后即可处理确认项；补充引擎需单独启动。' if mode=='scan' else '仅分析现有待核项，可以停止；停止后仍可处理已确认感染。' if mode=='review' else '正在验证并修复感染文件，不创建文件备份。')
         self.set_busy(True)
         def output(text):self.queue.put((generation,'log',text))
         def worker():

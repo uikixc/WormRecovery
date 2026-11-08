@@ -71,10 +71,10 @@ class ResidueTests(unittest.TestCase):
     def test_external_runtime_is_contained_without_mutating_sample(self):
         c=self.cleaner();c.policy=SimpleNamespace(check=MagicMock(side_effect=PermissionError('preserved device')))
         p=SimpleNamespace(pid=123456,info={'name':'fixture.exe','exe':'E:/._cache_GoogleChrome.exe','cmdline':['E:/._cache_GoogleChrome.exe','/AutoIt3ExecuteScript','C:/GoogleChrome/GoogleChrome.a3x']})
-        c.stop_pid=MagicMock();c.quarantine_file=MagicMock()
+        c.stop_pid=MagicMock();c.remove_confirmed_file=MagicMock()
         with patch.object(w.psutil,'process_iter',return_value=[p]),patch.object(w,'is_stub',return_value=False),patch.object(w.os.path,'isfile',return_value=True),patch.object(w.os.path,'getsize',return_value=750320),patch.object(w,'digest_file',side_effect=lambda path:w.AUTOIT_EXE_SHA256 if str(path).endswith('.exe') else w.AUTOIT_A3X_SHA256):
             self.assertEqual(len(c.contain(True)),1)
-        c.stop_pid.assert_called_once();c.quarantine_file.assert_not_called();c.policy.check.assert_not_called()
+        c.stop_pid.assert_called_once();c.remove_confirmed_file.assert_not_called();c.policy.check.assert_not_called()
 
     def test_runtime_name_alone_does_not_authorize_termination(self):
         c=self.cleaner();c.stop_pid=MagicMock()
