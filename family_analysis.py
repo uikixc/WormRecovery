@@ -211,6 +211,8 @@ def _inspect(data,rules=None,*,mapped_pe=False):
         result.update(tsco)
         from png_tail_analysis import identify_pe
         tail_identity=identify_pe(data,pe)
+        if tail_identity.get('role'):
+            result.update(role=tail_identity['role'],source_sha256=tail_identity['source_sha256'])
         result['detections'].extend(tail_identity['detections'])
         result.setdefault('identifications',[]).extend(tail_identity['identifications'])
         if tail_identity['identifications']:

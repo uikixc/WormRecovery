@@ -37,6 +37,40 @@ class FakeCleaner:
 
 
 class ModernUITests(unittest.TestCase):
+    def test_observed_deployment_is_visible_and_explicitly_approved_separately(self):
+        a=self.app;a.launch('scan');self.wait()
+        members=[{'path':'C:/fixture/image.png','sha256':'inert','role':'packed_carrier'},
+                 {'path':'C:/fixture/XPSPLOG.dll','sha256':'inert','role':'observed_loader'},
+                 {'path':'C:/fixture/random.exe','sha256':'inert','role':'signed_host'}]
+        a.cleaner.findings=[{'kind':'review_deployment','path':member['path'],'deployment_group':'fixture',
+                            'deployment_members':members} for member in members]
+        a.result_records=list(a.cleaner.findings);a.select_filter('review');a.set_busy(False)
+        self.assertNotIn('disabled',a.clean_button.state())
+        self.assertEqual(a.tree.item('0','values')[0],'整组待处理')
+        a.tree.selection_set('0');a.selected()
+        self.assertIn('random.exe',a.selected_path.get());self.assertIn('image.png',a.selected_path.get())
+        with patch.object(modern_ui.ctypes.windll.shell32,'IsUserAnAdmin',return_value=True), \
+             patch.object(modern_ui.messagebox,'askokcancel',return_value=True), \
+             patch.object(modern_ui.messagebox,'askyesnocancel',return_value=True) as approval:
+            a.launch('clean');self.wait()
+        self.assertEqual(a.cleaner.approved_deployment_groups,{'fixture'})
+        self.assertIn('XPSPLOG.dll',approval.call_args.args[1])
+        self.assertIn('不备份',approval.call_args.args[1])
+
+    def test_declining_or_cancelling_deployment_never_approves_members(self):
+        a=self.app
+        for answer in (False,None):
+            a.launch('scan');self.wait()
+            a.cleaner.findings=[{'kind':'review_deployment','path':'C:/fixture/inert','deployment_group':'fixture',
+                                'deployment_members':[{'path':'C:/fixture/inert','sha256':'inert','role':'observed_loader'}]}]
+            c=a.cleaner
+            with patch.object(modern_ui.ctypes.windll.shell32,'IsUserAnAdmin',return_value=True), \
+                 patch.object(modern_ui.messagebox,'askokcancel',return_value=True), \
+                 patch.object(modern_ui.messagebox,'askyesnocancel',return_value=answer):
+                a.launch('clean');self.wait()
+            self.assertEqual(getattr(c,'approved_deployment_groups',set()),set())
+            if answer is None:self.assertEqual(c.events,[])
+
     def test_unresponsive_update_check_does_not_hold_window_close(self):
         release=threading.Event();started=threading.Event()
         def check(version):

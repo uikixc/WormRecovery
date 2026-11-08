@@ -229,7 +229,8 @@ def defer_reviews(cleaner):
 
 
 def enrich_reviews(cleaner):
-    candidates = [row for row in cleaner.findings if row.get('kind', '').startswith('review_')]
+    candidates = [row for row in cleaner.findings if row.get('kind', '').startswith('review_')
+                  and row.get('kind')!='review_deployment']
     cleaner.secondary_dispatch={'candidates':len(candidates),'status':'cancelled' if cleaner.cancel.is_set() else 'not_needed' if not candidates else 'dispatched',
         'reason':'没有未决候选项；已确认家族和已核对组件未重复调用二次引擎。' if not candidates else '仅对未决候选项启动二次分析。'}
     cleaner.log('secondary_dispatch',**cleaner.secondary_dispatch)

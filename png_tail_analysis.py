@@ -24,6 +24,8 @@ KNOWN_PAYLOADS = {
 }
 LOADER_BYTES = 4812816
 LOADER_PREFIX_SHA256 = '19962e185a6b2dfc6db0e082cb3c2cc2621bc1b3a1ddc68154482b9451ac14f5'
+HOST_BYTES = 149320
+HOST_SHA256 = '6d6ba2bc9ad414837826f7278bc3e0116f1aeda02d0c2284ed65819f5d9180a8'
 
 
 def _xor(data, seed, index=0):
@@ -62,6 +64,8 @@ def probe(stream, size):
 def identify_pe(data, pe):
     """Only the exact outer image can inherit its own payload identity."""
     result = {'detections': [], 'identifications': []}
+    if len(data) == HOST_BYTES and hashlib.sha256(data).hexdigest() == HOST_SHA256:
+        result.update(role='observed_png_tail_host', source_sha256=HOST_SHA256)
     if pe.machine != 0x14c or not pe.code_ranges:
         return result
     offset = struct.unpack_from('<I', data, 60)[0]

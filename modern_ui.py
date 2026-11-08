@@ -23,10 +23,11 @@ LABELS={
     'malware_component':'恶意代码载荷', 'malware_deployment':'恶意加载部署',
     'worm_script':'恶意 AutoIt 脚本', 'worm_runtime':'病毒缓存',
     'worm_hook':'病毒组件', 'worm_residue':'已确认家族残留', 'review_office':'Office 活动内容', 'info_office':'已核对的 Office 组件','info_document':'已分析的文档资源',
-    'review_autoit':'AutoIt 脚本','review_script':'脚本行为','review_binary':'程序行为'}
+    'review_autoit':'AutoIt 脚本','review_script':'脚本行为','review_binary':'程序行为','review_deployment':'关联部署残留'}
 
 
 def review_state(record):
+    if record.get('kind')=='review_deployment':return '整组待处理'
     decision=record.get('decision',{})
     if decision.get('classification')=='suspicious':return '高风险行为'
     secondary=record.get('secondary_analysis',{})
@@ -334,6 +335,9 @@ class ModernWindow:
                     text+='\n已校验加密项目及其内存加载代码。'
             if record.get('related_evidence'):
                 text+='\n关联证据：'+str(len(record['related_evidence']))+' 个内容已确认的同目录文件。'
+            if record.get('deployment_members'):
+                text+='\n关联部署未完整处置；确认框可选择整组处理，不会等待补充引擎。'
+                text+='\n'+'\n'.join(member['role']+'：'+member['path'] for member in record['deployment_members'])
             details=record.get('error_details',{})
             if details.get('source_bytes_read'):text+='\n文件字节：已成功读取，后续分析未完成。'
             decision=record.get('decision',{})
@@ -368,6 +372,7 @@ class ModernWindow:
 
     def has_confirmed(self):
         if not self.cleaner:return False
+        if __import__('deployment_review').groups(self.cleaner.findings):return True
         if any(is_confirmed(r) for r in self.cleaner.findings):return True
         for event in self.cleaner.events:
             if event['kind']=='process_inspection' and event.get('processes'):return True
@@ -379,11 +384,21 @@ class ModernWindow:
     def launch(self,mode):
         if self.busy:return
         if mode in ('clean','review') and not self.scan_ready:return
+        approved_groups=set()
         if mode=='clean':
             if not ctypes.windll.shell32.IsUserAnAdmin():
                 messagebox.showerror('需要管理员权限','请以管理员身份运行。',parent=self.root);return
             text='系统将修复已确认的感染文件，并直接删除已确认的恶意载荷，不创建文件备份或隔离副本。处理成功后无法由本工具撤销。\n\n将关闭占用相关文件的应用，未保存内容可能丢失；存在可验证的同路径历史原件时优先恢复。'
             if not messagebox.askokcancel('开始原位恢复',text,parent=self.root):return
+            from deployment_review import groups
+            deployments=groups(self.cleaner.findings)
+            if deployments:
+                listed='\n'.join(member['path'] for members in deployments.values() for member in members)
+                answer=messagebox.askyesnocancel('关联部署需要单独确认',
+                    '扫描发现以下已知配套部署。部分组件独立恶意行为尚未证实，签名宿主也列入本组。\n\n'+listed+
+                    '\n\n是：同时删除列出的关联部署文件（不备份）；否：只处理确认感染，整组继续列为未解除风险；取消：停止本次处理。\n无关文件不处理。',parent=self.root)
+                if answer is None:return
+                if answer:approved_groups=set(deployments)
         selected=self.scope.get().strip()
         scope_mode=self.scope_mode.get()
         deep_analysis=self.deep_analysis.get()
@@ -423,6 +438,7 @@ class ModernWindow:
                     execute(c,'review',c.review)
                 else:
                     c=self.cleaner
+                    c.approved_deployment_groups=approved_groups
                     c.deep_analysis=deep_analysis
                     c.cancel.clear();c.force_close=True;c.restore_history=True
                     if self.stop_requested.is_set():c.cancel.set()
@@ -513,6 +529,7 @@ class ModernWindow:
                     self.report_button.configure(state='normal')
                     confirmed=sum(is_confirmed(r) for r in c.findings)
                     review_count=sum(r['kind'].startswith('review_') for r in c.findings)
+                    deployment_count=len(__import__('deployment_review').groups(c.findings))
                     info_count=sum(r['kind'].startswith('info_') for r in c.findings)
                     data_loss=sum(bool(r.get('data_integrity_issue')) for r in c.findings)
                     failures=sum(row.get('scope')=='repair_failed' for row in c.errors)
@@ -523,11 +540,11 @@ class ModernWindow:
                         self.detail.set('扫描或分析未完成；已发现的确认感染可以处理，处理前逐项重新校验。未扫描和待核内容不视为安全。' if self.scan_ready else '已完成的文件事务已保存；复核未完成，不能判定清理完成。')
                     elif payload in ('scan','review'):
                         self.status.set('检测完成' if payload=='scan' else '补充分析完成')
-                        self.detail.set('确认感染 %s 项，未确认文件 %s 项，分析说明 %s 项；'%(confirmed,review_count,info_count)+error_text+'。')
+                        self.detail.set('确认感染 %s 项，未确认文件 %s 项，关联部署待处理 %s 组，分析说明 %s 项；'%(confirmed,review_count,deployment_count,info_count)+error_text+'。')
                     else:
                         complete=(getattr(c,'verification',None) or {}).get('known_family_clear',False)
                         self.status.set('修复与复核完成' if complete else '已执行修复，仍有确认感染' if confirmed else '已执行修复，存在未完成检查')
-                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；分析说明 %s 项；'%(confirmed,review_count,info_count)+error_text+'。')
+                        self.detail.set('确认残留 %s 项；未确认文件 %s 项；关联部署未解除风险 %s 组；分析说明 %s 项；'%(confirmed,review_count,deployment_count,info_count)+error_text+'。')
                     if data_loss and not c.cancel.is_set():self.detail.set(self.detail.get()+' 其中 %s 份文件正文缺失，需要历史原件或备份。'%data_loss)
                     self.append_log('报告：'+str(c.run/'report.json'))
                     from engine_audit import dispatch_message

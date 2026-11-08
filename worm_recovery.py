@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.10'
+VERSION = '1.8.11'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
@@ -670,6 +670,75 @@ class Cleaner:
                 record['confirmation_basis']='current_runtime_and_verified_pre_repair_companions'
                 self.add(kind,path,**record);present.add(norm(path))
             except (OSError,ValueError,KeyError) as ex:self.error(original['path'],ex)
+    def review_deployment_groups(self):
+        from deployment_review import correlate,groups
+        rows=correlate(self.findings,getattr(self,'family_observations',[]))
+        partial_paths=set()
+        for identity,members in groups(getattr(self,'initial_findings',None) or []).items():
+            if any(not os.path.isfile(member['path']) and
+                   (self.removed_evidence(member['path'],member['sha256']) or {}).get('deployment_group')==identity
+                   for member in members):
+                partial_paths.update(norm(member['path']) for member in members)
+        # Removing a host can leave a smaller fresh loader/image group. Keep
+        # the original approved identity while retrying this session's work.
+        rows=[row for row in rows if norm(row['path']) not in partial_paths]
+        paths={norm(row['path']) for row in rows}
+        self.findings=[row for row in self.findings if not (norm(row['path']) in paths and row['kind'] in ('review_binary','review_deployment'))]
+        self.findings.extend(rows)
+        # Keep failed/partial groups visible during this repair session even
+        # when removal of one member prevents a new full-group correlation.
+        present={norm(row['path']) for row in self.findings if row.get('kind')=='review_deployment'}
+        for row in getattr(self,'initial_findings',None) or []:
+            if row.get('kind')!='review_deployment' or norm(row['path']) in present:continue
+            if not os.path.isfile(row['path']):continue
+            record=copy.deepcopy(row);record['partial_deployment']=True
+            self.findings=[current for current in self.findings
+                           if not (norm(current['path'])==norm(row['path']) and current['kind']=='review_binary')]
+            self.findings.append(record);present.add(norm(row['path']))
+    def repair_reviewed_deployments(self):
+        from deployment_review import groups,group_id,correlate
+        from family_analysis import MAX_INPUT
+        approved=set(getattr(self,'approved_deployment_groups',()))
+        for identity,members in groups(self.findings).items():
+            if identity not in approved:continue
+            try:
+                if group_id(members)!=identity:raise ValueError('关联部署记录已改变。')
+                fresh=[];observations=[];remaining=[]
+                for member in members:
+                    path=pathlib.Path(member['path'])
+                    self.policy.check(path)
+                    if self.protected_path(path):raise PermissionError('关联部署包含受保护路径。')
+                    if not path.exists():
+                        removed=self.removed_evidence(path,member['sha256'])
+                        if removed is None or removed.get('deployment_group')!=identity:
+                            raise ValueError('关联成员缺失且没有本次会话的校验删除记录。')
+                        continue
+                    if file_attributes(path)&0x400 or path.stat().st_nlink!=1 or path.stat().st_size>MAX_INPUT:
+                        raise ValueError('关联成员为链接或超出复核上限。')
+                    if digest_file(path)!=member['sha256']:raise ValueError('关联成员检测后已改变。')
+                    result=inspect_file_content(path,path.stat());fresh.extend(result['findings'])
+                    observations.extend(result.get('family_observations',[]));remaining.append(member)
+                if len(remaining)==len(members):
+                    if identity not in groups(correlate(fresh,observations)):
+                        raise ValueError('关联内容复核未通过。')
+                elif not any(e.get('deployment_group')==identity and e.get('kind')=='removed' for e in self.events):
+                    raise ValueError('不接受跨会话的缺失成员作为删除权限。')
+                self.log('deployment_approved',deployment_group=identity,members=members,
+                         basis='explicit_user_approval_of_observed_companions',malicious_code_proof=False)
+                for member in remaining:
+                    if self.cancel.is_set():break
+                    # A changed remaining member stops the group before the
+                    # next deletion; each operation also rechecks source identity.
+                    for peer in remaining:
+                        if not os.path.isfile(peer['path']):
+                            removed=self.removed_evidence(peer['path'],peer['sha256'])
+                            if removed is None or removed.get('deployment_group')!=identity:
+                                raise ValueError('处理期间关联成员缺失，停止本组。')
+                        elif digest_file(peer['path'])!=peer['sha256']:
+                            raise ValueError('处理期间关联成员已改变，停止本组。')
+                    self.remove_confirmed_file(member['path'],'explicitly approved observed deployment member',
+                                               expected=member['sha256'],deployment_group=identity)
+            except Exception as ex:self.error(members[0]['path'],ex)
     def startup_approved(self,base,prefix,name,branches,source):
         for branch in branches:
             sub=(prefix+'\\' if prefix else '')+r'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'+'\\'+branch
@@ -762,7 +831,7 @@ class Cleaner:
                 self.stop_pid(holder['pid'],'User-authorized release of confirmed infected file '+str(path),
                     process=process,expected_created=holder['created'],expected_exe=process.exe())
             except psutil.NoSuchProcess:pass
-    def remove_confirmed_file(self,path,reason,expected=None):
+    def remove_confirmed_file(self,path,reason,expected=None,deployment_group=None):
         self.policy.mutation(path);p=pathlib.Path(path)
         if not p.exists():return
         h,st,attrs,started=self.prepare_change(p,expected=expected)
@@ -776,7 +845,7 @@ class Cleaner:
             if hashlib.sha256(data).hexdigest()!=h:raise RuntimeError('删除前关联内容已改变。')
             analysis=inspect_family(data)
             if analysis['status']!='detected':raise ValueError('关联内容复核未确认，原文件已保留。')
-        self.log('file_remove_pending',path=str(p),sha256=h,size=st.st_size,reason=reason,backup_created=False)
+        self.log('file_remove_pending',path=str(p),sha256=h,size=st.st_size,reason=reason,backup_created=False,deployment_group=deployment_group)
         try:
             if not kernel.SetFileAttributesW(extended_path(p),(attrs&~1) or 0x80):raise ctypes.WinError(ctypes.get_last_error())
             os.unlink(extended_path(p))
@@ -784,7 +853,7 @@ class Cleaner:
             if p.exists():kernel.SetFileAttributesW(extended_path(p),attrs)
             raise
         self.log('removed',path=str(p),sha256=h,size=st.st_size,reason=reason,backup_created=False,
-                 family_analysis=analysis,duration_seconds=round(time.perf_counter()-started,3))
+                 family_analysis=analysis,deployment_group=deployment_group,duration_seconds=round(time.perf_counter()-started,3))
     def replace(self,path,stage,expected=None,*,require_absent=False):
         self.policy.mutation(path);self.policy.mutation(stage);p=pathlib.Path(path);t=pathlib.Path(stage)
         if p.exists():
@@ -1128,6 +1197,8 @@ class Cleaner:
             for row in correlate(self.findings,self.family_observations):
                 kind=row.pop('kind');path=row.pop('path');self.add(kind,path,**row)
             self.recheck_deployment_observations()
+        self.review_deployment_groups()
+        if not self.cancel.is_set():
             from secondary_analysis import defer_reviews, enrich_reviews
             if getattr(self,'secondary_enabled',False):enrich_reviews(self)
             else:defer_reviews(self)
@@ -1297,6 +1368,7 @@ class Cleaner:
         self.persistence_snapshot=copy.deepcopy(self.system_persistence(False))
         self.registry(True);self.system_persistence(True);self.firewall(True);self.contain(True)
         self.log('containment_scope',reason='Persistence disabled before process containment; subsequent process checks reduce but cannot atomically prevent regeneration.')
+        self.repair_reviewed_deployments()
         residue_roots=set()
         for rec in list(self.findings):
             if self.cancel.is_set():break
@@ -1362,6 +1434,7 @@ class Cleaner:
                 'review_count':sum(r['kind'].startswith('review_') for r in self.findings),
                 'assessment':'复扫已停止；现有检测结果已保留，不能判定清理完成。'}
             self.verification['unresolved_review_count']=self.verification['review_count']
+            self.verification['unresolved_deployment_groups']=__import__('deployment_review').groups(self.findings)
             self.log('verification_complete',result=self.verification);self.save();return self.verification
         before_errors=sum(row.get('occurrences',1) for row in self.errors);roots=list(self.scan_roots)
         workers=getattr(self,'scan_workers',None)
@@ -1395,6 +1468,7 @@ class Cleaner:
         self.verification['skipped_count']=len(self.skipped)
         self.verification['informational_count']=sum(x['kind'].startswith('info_') for x in remaining)
         self.verification['unresolved_review_count']=self.verification['review_count']
+        self.verification['unresolved_deployment_groups']=__import__('deployment_review').groups(remaining)
         self.verification['known_family_clear']=self.verification['known_family_clear'] and not self.verification['review_count']
         self.verification['assessment']='未检出已知威胁，检测覆盖范围存在限制。' if self.verification['known_family_clear'] else '存在未解决项目或未完成检查，不能判定清理完成。'
         self.verification['unverified_areas']=['压缩档内部文件','离线用户配置单元','未分配盘符或未挂载的卷','排除目录与未解析或范围外的链接目标','未识别的恶意软件家族']
@@ -1472,6 +1546,8 @@ def cli_main():
     parser=argparse.ArgumentParser(description='WormRecovery 文件安全检测与原位恢复')
     parser.add_argument('--scan',action='store_true',help='只扫描，不修复')
     parser.add_argument('--clean',action='store_true',help='扫描并修复确认感染项')
+    parser.add_argument('--include-observed-deployments',action='store_true',
+                        help='与--clean合用：明确授权同时删除报告中精确匹配的关联部署成员（含签名宿主），不创建备份')
     parser.add_argument('--root',action='append',help='手动指定扫描位置；选择外接设备中的位置时包含同设备全部盘符')
     parser.add_argument('--scope',choices=['internal','removable'],default='internal',help='internal：本机全盘；removable：可移动设备')
     parser.add_argument('--workers',type=int,choices=range(1,9),metavar='1-8',help='只读文件扫描线程数；默认按物理磁盘自动选择')
@@ -1482,6 +1558,7 @@ def cli_main():
     parser.add_argument('--restore-history',action='store_true',default=True,help=argparse.SUPPRESS)
     parser.add_argument('--exclude',action='append',default=[],help='额外保护目录')
     args=parser.parse_args()
+    if args.include_observed_deployments and not args.clean:parser.error('--include-observed-deployments 必须与 --clean 合用')
     if not args.scan and not args.clean:return gui_main()
     if args.clean and not ctypes.windll.shell32.IsUserAnAdmin():raise PermissionError('修复需要以管理员身份运行')
     scope=resolve_scan_scope(args.scope,args.root)
@@ -1496,6 +1573,8 @@ def cli_main():
         else:cleaner.scan(scope['roots'],workers=args.workers)
     execute(cleaner,'scan',inspect_only)
     if args.clean:
+        if args.include_observed_deployments:
+            cleaner.approved_deployment_groups=set(__import__('deployment_review').groups(cleaner.findings))
         def repair_and_verify():cleaner.repair();cleaner.verify()
         execute(cleaner,'repair',repair_and_verify)
     from diagnostic_client import retry
