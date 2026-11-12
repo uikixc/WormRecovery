@@ -26,10 +26,97 @@ LOADER_BYTES = 4812816
 LOADER_PREFIX_SHA256 = '19962e185a6b2dfc6db0e082cb3c2cc2621bc1b3a1ddc68154482b9451ac14f5'
 HOST_BYTES = 149320
 HOST_SHA256 = '6d6ba2bc9ad414837826f7278bc3e0116f1aeda02d0c2284ed65819f5d9180a8'
+# R9 verified both deployments share their mapped bytes. Only timestamp,
+# checksum and bytes outside the mapped image are omitted. All remaining
+# headers, entry, directories, section layout, code and data must agree.
+NORMALIZED_IMAGES = {
+    '687387bf143765dc030b1ff3e65dcc04c966bf86f67b1d967471d879b964533f': {
+        'mapped_bytes': 364544,
+        'reference_sha256': '4f67662ae285337b17e537147e4783a6f307b25d61b362e7908b2595c4188f2a',
+        **KNOWN_PAYLOADS['4f67662ae285337b17e537147e4783a6f307b25d61b362e7908b2595c4188f2a']},
+    'aa3c1c8fc9383057eae37f34cb7b8a2f4db450f1a2c9998cf3f8d24dad09007b': {
+        'mapped_bytes': 5194240,
+        'reference_sha256': '1f27d3a445205cedb55481d34d2a4c281606156aa6a84e9ee9ae39699383b2f3',
+        **KNOWN_PAYLOADS['1f27d3a445205cedb55481d34d2a4c281606156aa6a84e9ee9ae39699383b2f3']},
+    '2d0888a30de66211ca097aa25a7d1422d524dbeedb693ebcd6622fa8bca970a9': {
+        'mapped_bytes': 4812800,
+        'reference_sha256': 'b161853e56f31aaa9a4ad4292953a43d5529e262136126da94f4a05277de033b',
+        'confirmed': False, 'signature': 'WR_PNG_Tail_Observed_Loader',
+        'family': 'PNG-Tail-Observed-Loader'},
+}
+# Byte-verified entry and three separated R9 sites. They identify only an
+# observed code combination, not the unresolved consumer or API semantics.
+LOADER_ENTRY_RVA = 0x689023
+LOADER_CODE_ANCHORS = (
+    (0x689023, bytes.fromhex('559cbdb24c8f5bf7c505063a00f7d58dac2d5f942dbb550f85e947c5ff')),
+    (0x2DD830, bytes.fromhex('c7442408401e2830')),
+    (0x5C628B, bytes.fromhex('e877b31000')),
+    (0x6D1607, bytes.fromhex('894c24006834fa953ee9f8b40500')),
+)
+_XOR_TABLES = tuple(bytes(value ^ key for value in range(256)) for key in range(256))
 
 
 def _xor(data, seed, index=0):
-    return bytes(value ^ ((seed + index + i) & 255) for i, value in enumerate(data))
+    if len(data) < 1024:
+        return bytes(value ^ ((seed + index + i) & 255) for i, value in enumerate(data))
+    # The key repeats every 256 bytes. translate performs each lane in C and
+    # keeps allocation bounded by the admitted carrier; no target code runs.
+    output = bytearray(len(data))
+    for lane in range(256):
+        output[lane::256] = data[lane::256].translate(_XOR_TABLES[(seed + index + lane) & 255])
+    return bytes(output)
+
+
+def normalized_image(data, pe):
+    """Hash the outer mapped image, normalizing only two metadata fields."""
+    end = max([pe.headers] + [raw + size for _, size, raw, _ in pe.sections if size])
+    if end not in {spec['mapped_bytes'] for spec in NORMALIZED_IMAGES.values()} or end > len(data):
+        return None
+    offset = struct.unpack_from('<I', data, 60)[0]
+    timestamp, checksum = offset + 8, offset + 88
+    view = memoryview(data)
+    try:
+        fingerprint = hashlib.sha256(view[:timestamp])
+        fingerprint.update(bytes(4))
+        fingerprint.update(view[timestamp + 4:checksum])
+        fingerprint.update(bytes(4))
+        fingerprint.update(view[checksum + 4:end])
+        digest = fingerprint.hexdigest()
+        spec = NORMALIZED_IMAGES.get(digest)
+        if not spec or spec['mapped_bytes'] != end:
+            return None
+        hit = {key: value for key, value in spec.items() if key not in ('bytes', 'confirmed')}
+        hit.update(basis='normalized_outer_mapped_pe_content', normalized_sha256=digest,
+                   sha256=hashlib.sha256(data).hexdigest(), bytes=len(data),
+                   code_scope='outer_mapped_pe_except_timestamp_checksum',
+                   normalized_fields=['coff_timestamp', 'optional_header_checksum'],
+                   excluded_overlay_bytes=len(data) - end)
+        return spec['confirmed'], hit
+    finally:
+        view.release()
+
+
+def loader_code_combination(data, pe):
+    """Keep changed bodies as review-only evidence, outside exact groups."""
+    if pe.entry != LOADER_ENTRY_RVA:
+        return None
+    matches = []
+    for rva, anchor in LOADER_CODE_ANCHORS:
+        try:
+            offset = pe.rva(rva, len(anchor))
+        except ValueError:
+            return None
+        if not any(start <= offset and offset + len(anchor) <= end for start, end in pe.code_ranges):
+            return None
+        if data[offset:offset + len(anchor)] != anchor:
+            return None
+        matches.append({'rva': rva, 'file_offset': offset, 'bytes': len(anchor)})
+    return {'signature': 'WR_PNG_Tail_Loader_Code_Combination',
+            'family': 'PNG-Tail-Observed-Loader-Code',
+            'basis': 'active_entry_and_three_separated_executable_r9_anchors',
+            'code_scope': 'four_outer_executable_ranges', 'pattern_hits': matches,
+            'sha256': hashlib.sha256(data).hexdigest(),
+            'consumer_chain_proven': False, 'automatic_cleanup': False}
 
 
 def probe(stream, size):
@@ -85,6 +172,15 @@ def identify_pe(data, pe):
             'basis': 'exact_observed_loader_except_four_byte_trailer',
             'sha256': hashlib.sha256(data).hexdigest(),
             'code_scope': 'exact_outer_pe_image_except_trailer'})
+    if not result['detections'] and not result['identifications']:
+        normalized = normalized_image(data, pe)
+        if normalized:
+            confirmed, hit = normalized
+            result['detections' if confirmed else 'identifications'].append(hit)
+        else:
+            combination = loader_code_combination(data, pe)
+            if combination:
+                result['identifications'].append(combination)
     return result
 
 
@@ -124,4 +220,4 @@ def inspect_carrier(data):
         'payload_offset': start, 'seed': seed, 'decoded_bytes': len(decoded),
         'decoded_sha256': hashlib.sha256(decoded).hexdigest(),
         'code_matches': identity['detections'], 'identifications': identity['identifications']}],
-        'reason': '已验证PNG尾随编码PE载荷；已知恶意内容按完整指纹确认，其余配套或未知内容保留待核。'}
+        'reason': '已验证PNG尾随编码PE载荷；已知恶意内容按完整或规范化映像指纹确认，其余配套或未知内容保留待核。'}

@@ -16,7 +16,7 @@ from persistence_inventory import (INVENTORY_SCRIPT, select_confirmed, registry_
     disable_task_script, disable_service_script, reconcile_snapshot)
 from worm_residue import QUARANTINE_LINK_HASHES, payload_root, exact_script_root, exact_startup_root
 
-VERSION = '1.8.11'
+VERSION = '1.8.12'
 WINDOWLESS = sys.stdout is None
 
 def ensure_standard_streams():
